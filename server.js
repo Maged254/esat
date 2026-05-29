@@ -160,7 +160,8 @@ async function setupDB() {
       ON CONFLICT (email) DO NOTHING
     `, [hash]);
 
-    console.log('Database setup complete');
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_picture TEXT");
+    console.log("Database setup complete");
   } catch(e) {
     console.error('DB setup error:', e.message);
   } finally {

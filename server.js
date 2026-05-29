@@ -7,7 +7,7 @@ const cors = require('cors');
 
 const app = express();
 app.use(cors({ origin: '*' }));
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL.split('?')[0],

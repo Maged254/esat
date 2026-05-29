@@ -409,3 +409,18 @@ app.put('/api/users/:id', auth, async (req, res) => {
     res.json(rows[0]);
   } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });
+
+// Change own password
+app.post('/api/auth/change-password', auth, async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!currentPassword || !newPassword || newPassword.length < 8)
+    return res.status(400).json({ error: 'Invalid password data' });
+  try {
+    const { rows } = await pool.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
+    if (!(await bcrypt.compare(currentPassword, rows[0].password_hash)))
+      return res.status(401).json({ error: 'Current password incorrect' });
+    const hash = await bcrypt.hash(newPassword, 10);
+    await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, req.user.id]);
+    res.json({ message: 'Password updated' });
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});

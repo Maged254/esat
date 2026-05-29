@@ -321,7 +321,7 @@ app.get('/api/ncr', auth, async (req, res) => {
   try {
     const { rows } = await pool.query(`SELECT n.*,e.full_name as employee_name,e.employee_number,p.name as ppe_name,p.category FROM ncr_items n JOIN employees e ON e.id=n.employee_id JOIN ppe_items p ON p.id=n.ppe_item_id WHERE n.status!='resolved' ORDER BY n.created_at DESC`);
     res.json(rows);
-  } catch(e) { res.status(500).json({ error: 'Server error' }); }
+  } catch(e) { console.error("PUT users error:", e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/ncr/stats', auth, async (req, res) => {
@@ -409,7 +409,7 @@ app.put('/api/users/:id', auth, async (req, res) => {
     }
     const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture FROM users WHERE id=$1', [req.params.id]);
     res.json(rows[0]);
-  } catch(e) { res.status(500).json({ error: 'Server error' }); }
+  } catch(e) { console.error("PUT users error:", e.message); res.status(500).json({ error: e.message }); }
 });
 
 // Change own password
@@ -424,5 +424,5 @@ app.post('/api/auth/change-password', auth, async (req, res) => {
     const hash = await bcrypt.hash(newPassword, 10);
     await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, req.user.id]);
     res.json({ message: 'Password updated' });
-  } catch(e) { res.status(500).json({ error: 'Server error' }); }
+  } catch(e) { console.error("PUT users error:", e.message); res.status(500).json({ error: e.message }); }
 });

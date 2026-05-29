@@ -161,6 +161,7 @@ async function setupDB() {
     `, [hash]);
 
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_picture TEXT");
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()");
     console.log("Database setup complete");
   } catch(e) {
     console.error('DB setup error:', e.message);

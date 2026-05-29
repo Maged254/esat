@@ -197,7 +197,7 @@ app.post('/api/auth/login', async (req, res) => {
 
 // Me
 app.get('/api/auth/me', auth, async (req, res) => {
-  const { rows } = await pool.query('SELECT id,full_name,email,role FROM users WHERE id=$1', [req.user.id]);
+  const { rows } = await pool.query('SELECT id,full_name,email,role,profile_picture FROM users WHERE id=$1', [req.user.id]);
   res.json(rows[0]);
 });
 

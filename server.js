@@ -364,3 +364,48 @@ const PORT = 8080;
 setupDB().then(() => {
   app.listen(PORT, () => console.log(`ESAT running on port ${PORT}`));
 });
+
+// ── User Management Routes ───────────────────────────────────
+
+// GET all users (admin only)
+app.get('/api/users', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, created_at FROM users ORDER BY created_at DESC');
+  res.json(rows);
+});
+
+// POST create new user (admin only)
+app.post('/api/users', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { full_name, email, password, role } = req.body;
+  if (!full_name || !email || !password || !role) return res.status(400).json({ error: 'All fields required' });
+  try {
+    const hash = await bcrypt.hash(password, 10);
+    const { rows } = await pool.query(
+      'INSERT INTO users (full_name, email, password_hash, role) VALUES ($1,$2,$3,$4) RETURNING id, full_name, email, role, is_active',
+      [full_name, email, hash, role]
+    );
+    res.status(201).json(rows[0]);
+  } catch(e) {
+    if (e.code === '23505') return res.status(409).json({ error: 'Email already exists' });
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// PUT update user (admin only)
+app.put('/api/users/:id', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { full_name, email, role, is_active, password } = req.body;
+  try {
+    if (password) {
+      const hash = await bcrypt.hash(password, 10);
+      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, password_hash=$5, updated_at=NOW() WHERE id=$6',
+        [full_name, email, role, is_active, hash, req.params.id]);
+    } else {
+      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, updated_at=NOW() WHERE id=$5',
+        [full_name, email, role, is_active, req.params.id]);
+    }
+    const { rows } = await pool.query('SELECT id, full_name, email, role, is_active FROM users WHERE id=$1', [req.params.id]);
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: 'Server error' }); }
+});

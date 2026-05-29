@@ -30,6 +30,7 @@ async function setupDB() {
         password_hash VARCHAR(255) NOT NULL,
         role VARCHAR(30) NOT NULL DEFAULT 'ehs_officer',
         is_active BOOLEAN DEFAULT TRUE,
+        profile_picture TEXT,
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
 
@@ -370,7 +371,7 @@ setupDB().then(() => {
 // GET all users (admin only)
 app.get('/api/users', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, created_at FROM users ORDER BY created_at DESC');
+  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, created_at FROM users ORDER BY created_at DESC');
   res.json(rows);
 });
 
@@ -395,17 +396,17 @@ app.post('/api/users', auth, async (req, res) => {
 // PUT update user (admin only)
 app.put('/api/users/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  const { full_name, email, role, is_active, password } = req.body;
+  const { full_name, email, role, is_active, password, profile_picture } = req.body;
   try {
     if (password) {
       const hash = await bcrypt.hash(password, 10);
-      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, password_hash=$5, updated_at=NOW() WHERE id=$6',
-        [full_name, email, role, is_active, hash, req.params.id]);
+      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, password_hash=$5, profile_picture=$6, updated_at=NOW() WHERE id=$7',
+        [full_name, email, role, is_active, hash, profile_picture || null, req.params.id]);
     } else {
-      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, updated_at=NOW() WHERE id=$5',
-        [full_name, email, role, is_active, req.params.id]);
+      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, profile_picture=$5, updated_at=NOW() WHERE id=$6',
+        [full_name, email, role, is_active, profile_picture || null, req.params.id]);
     }
-    const { rows } = await pool.query('SELECT id, full_name, email, role, is_active FROM users WHERE id=$1', [req.params.id]);
+    const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture FROM users WHERE id=$1', [req.params.id]);
     res.json(rows[0]);
   } catch(e) { res.status(500).json({ error: 'Server error' }); }
 });

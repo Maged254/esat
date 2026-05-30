@@ -228,7 +228,7 @@ app.get('/api/dashboard', auth, async (req, res) => {
 // Employees
 app.get('/api/employees', auth, async (req, res) => {
   try {
-    const { status, search, national_id, project, client } = req.query;
+    const { status, search, national_id, project, client, san } = req.query;
     let q = `SELECT e.*, MAX(a.audit_date) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) as days_since_audit FROM employees e LEFT JOIN audits a ON a.employee_id=e.id WHERE 1=1`;
     const params = [];
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
@@ -236,6 +236,8 @@ app.get('/api/employees', auth, async (req, res) => {
     if (national_id) { params.push(`%${national_id}%`); q += ` AND e.national_id ILIKE $${params.length}`; }
     if (project) { params.push(project); q += ` AND e.project=$${params.length}`; }
     if (client) { params.push(client); q += ` AND e.client=$${params.length}`; }
+    if (san === 'yes') { q += ` AND (e.san = true OR e.san IS NULL)`; }
+    if (san === 'no') { q += ` AND e.san = false`; }
     q += ` GROUP BY e.id ORDER BY e.full_name`;
     const { rows } = await pool.query(q, params);
     res.json(rows);

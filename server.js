@@ -265,7 +265,10 @@ app.get('/api/employees/:id/ppe-assignments', auth, async (req, res) => {
 });
 
 app.post('/api/employees', auth, async (req, res) => {
-  const { employee_number, full_name, national_id, job_title, department, project, client, organization, resource_type } = req.body;
+  if (req.user.role === 'ehs_officer') return res.status(403).json({ error: 'Not authorized' });
+  let { employee_number, full_name, national_id, job_title, department, project, client, organization, resource_type } = req.body;
+  resource_type = resource_type?.toLowerCase();
+
   try {
     const { rows } = await pool.query(`INSERT INTO employees (employee_number,full_name,national_id,job_title,department,project,client,organization,resource_type) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`, [employee_number, full_name, national_id, job_title, department, project, client, organization, resource_type]);
     res.status(201).json(rows[0]);

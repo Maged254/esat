@@ -346,6 +346,22 @@ app.get('/api/audits/stats', auth, async (req, res) => {
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
+app.get('/api/audits/leaderboard', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT u.id, u.full_name, u.role,
+        COUNT(a.id) as total_audits,
+        COUNT(a.id) FILTER (WHERE date_trunc('month', a.audit_date) = date_trunc('month', NOW())) as this_month
+      FROM users u
+      LEFT JOIN audits a ON a.audited_by = u.id
+      WHERE u.is_active = true
+      GROUP BY u.id
+      ORDER BY total_audits DESC
+    `);
+    res.json(rows);
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
 app.get('/api/audits/:id', auth, async (req, res) => {
   try {
     const { rows: [audit] } = await pool.query(`
@@ -427,23 +443,6 @@ app.post('/api/ncr/purchase-requests', auth, async (req, res) => {
 app.put('/api/ncr/purchase-requests/:id/send', auth, async (req, res) => {
   const { rows } = await pool.query(`UPDATE purchase_requests SET status='sent', updated_at=NOW() WHERE id=$1 RETURNING *`, [req.params.id]);
   res.json(rows[0]);
-});
-
-// Auditor leaderboard
-app.get('/api/audits/leaderboard', auth, async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT u.id, u.full_name, u.role,
-        COUNT(a.id) as total_audits,
-        COUNT(a.id) FILTER (WHERE date_trunc('month', a.audit_date) = date_trunc('month', NOW())) as this_month
-      FROM users u
-      LEFT JOIN audits a ON a.audited_by = u.id
-      WHERE u.is_active = true
-      GROUP BY u.id
-      ORDER BY total_audits DESC
-    `);
-    res.json(rows);
-  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
 // Start

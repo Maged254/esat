@@ -279,6 +279,13 @@ app.post('/api/employees', auth, async (req, res) => {
   }
 });
 
+// Delete employee (admin only)
+app.delete('/api/employees/:id', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  await pool.query('DELETE FROM employees WHERE id=$1', [req.params.id]);
+  res.json({ message: 'Deleted' });
+});
+
 // PPE Items
 app.get('/api/ppe', auth, async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM ppe_items WHERE is_active=true ORDER BY sort_order');

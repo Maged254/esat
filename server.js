@@ -448,8 +448,20 @@ app.get('/api/ncr/stats', auth, async (req, res) => {
 
 app.put('/api/ncr/:id/status', auth, async (req, res) => {
   const { status } = req.body;
-  const { rows } = await pool.query(`UPDATE ncr_items SET status=$1, resolved_at=CASE WHEN $1='resolved' THEN NOW() ELSE NULL END, updated_at=NOW() WHERE id=$2 RETURNING *`, [status, req.params.id]);
-  res.json(rows[0]);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: [ncr] } = await client.query(
+      `UPDATE ncr_items SET status=$1, resolved_at=CASE WHEN $1='resolved' THEN NOW() ELSE NULL END, updated_at=NOW() WHERE id=$2 RETURNING *`,
+      [status, req.params.id]
+    );
+    if (status === 'purchase_requested') {
+      await client.query(`UPDATE ppe_requests SET status='purchase_requested', updated_at=NOW() WHERE ncr_item_id=$1`, [req.params.id]);
+    }
+    await client.query('COMMIT');
+    res.json(ncr);
+  } catch(e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: 'Server error' }); }
+  finally { client.release(); }
 });
 
 app.get('/api/ncr/purchase-requests', auth, async (req, res) => {

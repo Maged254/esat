@@ -321,6 +321,23 @@ app.get('/api/audits', auth, async (req, res) => {
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
+app.get('/api/audits/:id', auth, async (req, res) => {
+  try {
+    const { rows: [audit] } = await pool.query(`
+      SELECT a.*,e.full_name as employee_name,e.employee_number,e.national_id,e.department,e.project,e.job_title,e.client,e.resource_type,u.full_name as audited_by_name
+      FROM audits a JOIN employees e ON e.id=a.employee_id JOIN users u ON u.id=a.audited_by
+      WHERE a.id=$1
+    `, [req.params.id]);
+    if (!audit) return res.status(404).json({ error: 'Not found' });
+    const { rows: items } = await pool.query(`
+      SELECT ai.*,p.name as ppe_name,p.category,p.has_size,p.size_type
+      FROM audit_items ai JOIN ppe_items p ON p.id=ai.ppe_item_id
+      WHERE ai.audit_id=$1 ORDER BY p.sort_order
+    `, [req.params.id]);
+    res.json({ ...audit, items });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
 app.post('/api/audits', auth, async (req, res) => {
   const { employee_id, audit_date, notes, items, audited_by_override } = req.body;
   const client = await pool.connect();

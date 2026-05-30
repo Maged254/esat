@@ -237,8 +237,8 @@ app.get('/api/employees', auth, async (req, res) => {
     if (national_id) { params.push(`%${national_id}%`); q += ` AND e.national_id ILIKE $${params.length}`; }
     if (project) { params.push(project); q += ` AND e.project=$${params.length}`; }
     if (client) { params.push(client); q += ` AND e.client=$${params.length}`; }
-    if (san === 'yes') { q += ` AND (e.san = true OR e.san IS NULL)`; }
-    if (san === 'no') { q += ` AND e.san = false`; }
+    if (san === 'yes') { q += ` AND (e.san IS NULL OR e.san = TRUE)`; }
+    if (san === 'no') { q += ` AND e.san = FALSE`; }
     q += ` GROUP BY e.id ORDER BY e.full_name`;
     const { rows } = await pool.query(q, params);
     res.json(rows);

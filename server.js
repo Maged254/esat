@@ -161,6 +161,7 @@ async function setupDB() {
     `, [hash]);
 
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_picture TEXT");
+    await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS san BOOLEAN DEFAULT TRUE");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()");
     console.log("Database setup complete");
   } catch(e) {
@@ -280,6 +281,14 @@ app.post('/api/employees', auth, async (req, res) => {
     if (e.code === '23505') return res.status(409).json({ error: 'Employee number exists' });
     res.status(500).json({ error: 'Server error' });
   }
+});
+
+// Toggle SAN (admin only)
+app.put('/api/employees/:id/san', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { san } = req.body;
+  const { rows } = await pool.query('UPDATE employees SET san=$1, updated_at=NOW() WHERE id=$2 RETURNING *', [san, req.params.id]);
+  res.json(rows[0]);
 });
 
 // Delete employee (admin only)

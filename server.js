@@ -309,14 +309,20 @@ app.get('/api/ppe', auth, async (req, res) => {
 // Audits
 app.get('/api/audits', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT a.*,e.full_name as employee_name,e.employee_number,e.national_id,e.department,e.project,e.organization,u.full_name as audited_by_name,
+    const { search, national_id, resource_type, project, client, status } = req.query;
+    let q = `SELECT a.*,e.full_name as employee_name,e.employee_number,e.national_id,e.department,e.project,e.client,e.organization,e.resource_type,u.full_name as audited_by_name,
         COUNT(ai.id) as total_items, COUNT(CASE WHEN ai.condition!='good' THEN 1 END) as issues_count
       FROM audits a JOIN employees e ON e.id=a.employee_id JOIN users u ON u.id=a.audited_by
-      LEFT JOIN audit_items ai ON ai.audit_id=a.id
-      GROUP BY a.id,e.full_name,e.employee_number,e.national_id,e.department,e.project,e.organization,u.full_name
-      ORDER BY a.audit_date DESC
-    `);
+      LEFT JOIN audit_items ai ON ai.audit_id=a.id WHERE 1=1`;
+    const params = [];
+    if (search) { params.push(`%${search}%`); q += ` AND e.full_name ILIKE $${params.length}`; }
+    if (national_id) { params.push(`%${national_id}%`); q += ` AND e.national_id ILIKE $${params.length}`; }
+    if (resource_type) { params.push(resource_type); q += ` AND e.resource_type=$${params.length}`; }
+    if (project) { params.push(project); q += ` AND e.project=$${params.length}`; }
+    if (client) { params.push(client); q += ` AND e.client=$${params.length}`; }
+    if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
+    q += ` GROUP BY a.id,e.full_name,e.employee_number,e.national_id,e.department,e.project,e.client,e.organization,e.resource_type,u.full_name ORDER BY a.audit_date DESC`;
+    const { rows } = await pool.query(q, params);
     res.json(rows);
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });

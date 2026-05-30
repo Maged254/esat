@@ -327,6 +327,22 @@ app.get('/api/audits', auth, async (req, res) => {
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
+app.get('/api/audits/stats', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        COUNT(*) as total,
+        COUNT(*) FILTER (WHERE overall_status='compliant') as compliant,
+        COUNT(*) FILTER (WHERE overall_status='partial') as partial,
+        COUNT(*) FILTER (WHERE overall_status='non_compliant') as non_compliant,
+        COUNT(*) FILTER (WHERE date_trunc('month', audit_date) = date_trunc('month', NOW())) as this_month,
+        COUNT(*) FILTER (WHERE date_trunc('month', audit_date) = date_trunc('month', NOW() - INTERVAL '1 month')) as last_month
+      FROM audits
+    `);
+    res.json(rows[0]);
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
 app.get('/api/audits/:id', auth, async (req, res) => {
   try {
     const { rows: [audit] } = await pool.query(`

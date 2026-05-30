@@ -271,7 +271,7 @@ app.post('/api/employees', auth, async (req, res) => {
   employment_status = employment_status?.toLowerCase();
 
   try {
-    const { rows } = await pool.query(`INSERT INTO employees (employee_number,full_name,national_id,job_title,department,project,client,organization,resource_type) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`, [employee_number, full_name, national_id, job_title, department, project, client, organization, resource_type]);
+    const { rows } = await pool.query(`INSERT INTO employees (employee_number,full_name,national_id,job_title,department,project,client,organization,resource_type,employment_status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`, [employee_number, full_name, national_id, job_title, department, project, client, organization, resource_type, employment_status || 'active']);
     res.status(201).json(rows[0]);
   } catch(e) {
     if (e.code === '23505') return res.status(409).json({ error: 'Employee number exists' });

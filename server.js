@@ -310,11 +310,11 @@ app.get('/api/ppe', auth, async (req, res) => {
 app.get('/api/audits', auth, async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT a.*,e.full_name as employee_name,e.employee_number,e.national_id,e.department,e.project,u.full_name as audited_by_name,
+      SELECT a.*,e.full_name as employee_name,e.employee_number,e.national_id,e.department,e.project,e.organization,u.full_name as audited_by_name,
         COUNT(ai.id) as total_items, COUNT(CASE WHEN ai.condition!='good' THEN 1 END) as issues_count
       FROM audits a JOIN employees e ON e.id=a.employee_id JOIN users u ON u.id=a.audited_by
       LEFT JOIN audit_items ai ON ai.audit_id=a.id
-      GROUP BY a.id,e.full_name,e.employee_number,e.national_id,e.department,e.project,u.full_name
+      GROUP BY a.id,e.full_name,e.employee_number,e.national_id,e.department,e.project,e.organization,u.full_name
       ORDER BY a.audit_date DESC
     `);
     res.json(rows);
@@ -324,7 +324,7 @@ app.get('/api/audits', auth, async (req, res) => {
 app.get('/api/audits/:id', auth, async (req, res) => {
   try {
     const { rows: [audit] } = await pool.query(`
-      SELECT a.*,e.full_name as employee_name,e.employee_number,e.national_id,e.department,e.project,e.job_title,e.client,e.resource_type,u.full_name as audited_by_name
+      SELECT a.*,e.full_name as employee_name,e.employee_number,e.national_id,e.department,e.project,e.job_title,e.client,e.organization,e.resource_type,u.full_name as audited_by_name
       FROM audits a JOIN employees e ON e.id=a.employee_id JOIN users u ON u.id=a.audited_by
       WHERE a.id=$1
     `, [req.params.id]);

@@ -429,6 +429,23 @@ app.put('/api/ncr/purchase-requests/:id/send', auth, async (req, res) => {
   res.json(rows[0]);
 });
 
+// Auditor leaderboard
+app.get('/api/audits/leaderboard', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT u.id, u.full_name, u.role,
+        COUNT(a.id) as total_audits,
+        COUNT(a.id) FILTER (WHERE date_trunc('month', a.audit_date) = date_trunc('month', NOW())) as this_month
+      FROM users u
+      LEFT JOIN audits a ON a.audited_by = u.id
+      WHERE u.is_active = true
+      GROUP BY u.id
+      ORDER BY total_audits DESC
+    `);
+    res.json(rows);
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
 // Start
 const PORT = 8080;
 setupDB().then(() => {

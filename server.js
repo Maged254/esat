@@ -115,6 +115,21 @@ async function setupDB() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       );
 
+      CREATE TABLE IF NOT EXISTS ppe_requests (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        ncr_item_id UUID REFERENCES ncr_items(id) ON DELETE CASCADE,
+        employee_id UUID NOT NULL REFERENCES employees(id),
+        ppe_item_id UUID NOT NULL REFERENCES ppe_items(id),
+        size_value VARCHAR(10),
+        status VARCHAR(30) DEFAULT 'pending',
+        date_flagged TIMESTAMPTZ DEFAULT NOW(),
+        date_ordered TIMESTAMPTZ,
+        date_available TIMESTAMPTZ,
+        date_distributed TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
       CREATE TABLE IF NOT EXISTS employee_ppe_assignments (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         employee_id UUID NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
@@ -287,6 +302,24 @@ app.post('/api/employees', auth, async (req, res) => {
   }
 });
 
+// Update employee status (admin only)
+app.put('/api/employees/:id/status', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { employment_status, exit_date } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('UPDATE employees SET employment_status=$1, exit_date=$2, updated_at=NOW() WHERE id=$3', [employment_status, exit_date || null, req.params.id]);
+    if (employment_status === 'exit') {
+      await client.query(`UPDATE ppe_requests SET status='canceled', updated_at=NOW() WHERE employee_id=$1 AND status NOT IN ('distributed','canceled')`, [req.params.id]);
+    }
+    await client.query('COMMIT');
+    const { rows } = await pool.query('SELECT * FROM employees WHERE id=$1', [req.params.id]);
+    res.json(rows[0]);
+  } catch(e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: 'Server error' }); }
+  finally { client.release(); }
+});
+
 // Toggle SAN (admin only)
 app.put('/api/employees/:id/san', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
@@ -443,6 +476,45 @@ app.post('/api/ncr/purchase-requests', auth, async (req, res) => {
 app.put('/api/ncr/purchase-requests/:id/send', auth, async (req, res) => {
   const { rows } = await pool.query(`UPDATE purchase_requests SET status='sent', updated_at=NOW() WHERE id=$1 RETURNING *`, [req.params.id]);
   res.json(rows[0]);
+});
+
+// PPE Request Tracker
+app.get('/api/ppe-requests', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT r.*,
+        e.full_name as employee_name, e.employee_number, e.employment_status,
+        p.name as ppe_name, p.category
+      FROM ppe_requests r
+      JOIN employees e ON e.id=r.employee_id
+      JOIN ppe_items p ON p.id=r.ppe_item_id
+      ORDER BY r.date_flagged DESC
+    `);
+    res.json(rows);
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
+app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
+  if (req.user.role !== 'scm_officer' && req.user.role !== 'admin') return res.status(403).json({ error: 'SCM Officer only' });
+  const { status } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    let dateField = '';
+    if (status === 'ordered') dateField = ', date_ordered=NOW()';
+    if (status === 'available') dateField = ', date_available=NOW()';
+    if (status === 'distributed') dateField = ', date_distributed=NOW()';
+    const { rows: [req2] } = await client.query(
+      `UPDATE ppe_requests SET status=$1${dateField}, updated_at=NOW() WHERE id=$2 RETURNING *`,
+      [status, req.params.id]
+    );
+    if (status === 'distributed' && req2.ncr_item_id) {
+      await client.query(`UPDATE ncr_items SET status='resolved', resolved_at=NOW(), updated_at=NOW() WHERE id=$1`, [req2.ncr_item_id]);
+    }
+    await client.query('COMMIT');
+    res.json(req2);
+  } catch(e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: 'Server error' }); }
+  finally { client.release(); }
 });
 
 // Start

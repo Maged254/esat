@@ -232,7 +232,6 @@ app.get('/api/employees', auth, async (req, res) => {
     let q = `SELECT e.*, MAX(a.audit_date) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) as days_since_audit FROM employees e LEFT JOIN audits a ON a.employee_id=e.id WHERE 1=1`;
     const params = [];
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
-    if (audited_by) { params.push(audited_by); q += ` AND a.audited_by=$${params.length}`; }
     if (search) { params.push(`%${search}%`); q += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length})`; }
     if (national_id) { params.push(`%${national_id}%`); q += ` AND e.national_id ILIKE $${params.length}`; }
     if (project) { params.push(project); q += ` AND e.project=$${params.length}`; }

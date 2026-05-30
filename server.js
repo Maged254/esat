@@ -460,7 +460,7 @@ app.put('/api/ncr/:id/status', auth, async (req, res) => {
     }
     await client.query('COMMIT');
     res.json(ncr);
-  } catch(e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: 'Server error' }); }
+  } catch(e) { await client.query('ROLLBACK'); console.error('NCR status error:', e.message); res.status(500).json({ error: e.message }); }
   finally { client.release(); }
 });
 

@@ -314,7 +314,7 @@ app.get('/api/audits', auth, async (req, res) => {
         COUNT(ai.id) as total_items, COUNT(CASE WHEN ai.condition!='good' THEN 1 END) as issues_count
       FROM audits a JOIN employees e ON e.id=a.employee_id JOIN users u ON u.id=a.audited_by
       LEFT JOIN audit_items ai ON ai.audit_id=a.id
-      GROUP BY a.id,e.full_name,e.employee_number,e.department,e.project,u.full_name
+      GROUP BY a.id,e.full_name,e.employee_number,e.national_id,e.department,e.project,u.full_name
       ORDER BY a.audit_date DESC
     `);
     res.json(rows);

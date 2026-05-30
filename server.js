@@ -322,14 +322,14 @@ app.get('/api/audits', auth, async (req, res) => {
 });
 
 app.post('/api/audits', auth, async (req, res) => {
-  const { employee_id, audit_date, notes, items } = req.body;
+  const { employee_id, audit_date, notes, items, audited_by_override } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const hasIssues = items.some(i => i.condition !== 'good');
     const allBad = items.every(i => i.condition !== 'good');
     const overall_status = !hasIssues ? 'compliant' : allBad ? 'non_compliant' : 'partial';
-    const { rows: [audit] } = await client.query(`INSERT INTO audits (employee_id,audited_by,audit_date,overall_status,notes) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [employee_id, req.user.id, audit_date || new Date(), overall_status, notes]);
+    const { rows: [audit] } = await client.query(`INSERT INTO audits (employee_id,audited_by,audit_date,overall_status,notes) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [employee_id, audited_by_override || req.user.id, audit_date || new Date(), overall_status, notes]);
     for (const item of items) {
       const { rows: [ai] } = await client.query(`INSERT INTO audit_items (audit_id,ppe_item_id,condition,size_value,comment) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [audit.id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null]);
       if (item.condition !== 'good') {

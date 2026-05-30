@@ -162,6 +162,7 @@ async function setupDB() {
 
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_picture TEXT");
     await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS san BOOLEAN DEFAULT TRUE");
+    await client.query("UPDATE employees SET san = TRUE WHERE san IS NULL");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()");
     console.log("Database setup complete");
   } catch(e) {

@@ -249,7 +249,7 @@ app.get('/api/dashboard', auth, async (req, res) => {
       pool.query(`SELECT COUNT(*) FILTER (WHERE status!='resolved') as open, COUNT(*) FILTER (WHERE status='pending') as pending FROM ncr_items`),
       pool.query(`SELECT p.category, COUNT(*) as count FROM ncr_items n JOIN ppe_items p ON p.id=n.ppe_item_id WHERE n.status!='resolved' GROUP BY p.category ORDER BY count DESC`),
       pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE overall_status='compliant') as compliant FROM audits WHERE audit_date >= date_trunc('month',NOW())`),
-      pool.query(`SELECT a.id,a.audit_date,a.overall_status,e.full_name as employee_name,e.employee_number,e.department,e.project,u.full_name as audited_by_name,COUNT(ai.id) as total_items,COUNT(CASE WHEN ai.condition!='good' THEN 1 END) as issues_count FROM audits a JOIN employees e ON e.id=a.employee_id JOIN users u ON u.id=a.audited_by LEFT JOIN audit_items ai ON ai.audit_id=a.id GROUP BY a.id,e.full_name,e.employee_number,e.department,e.project,u.full_name ORDER BY a.created_at DESC LIMIT 5`)
+      pool.query(`SELECT a.id,a.audit_date,a.overall_status,e.full_name as employee_name,e.employee_number,e.national_id,e.department,e.project,u.full_name as audited_by_name,COUNT(ai.id) as total_items,COUNT(CASE WHEN ai.condition!='good' THEN 1 END) as issues_count FROM audits a JOIN employees e ON e.id=a.employee_id JOIN users u ON u.id=a.audited_by LEFT JOIN audit_items ai ON ai.audit_id=a.id GROUP BY a.id,e.full_name,e.employee_number,e.national_id,e.department,e.project,u.full_name ORDER BY a.created_at DESC LIMIT 5`)
     ]);
     const c = comp.rows[0];
     res.json({

@@ -509,6 +509,16 @@ app.put('/api/ncr/purchase-requests/:id/send', auth, async (req, res) => {
   res.json(rows[0]);
 });
 
+// Delete NCR item (admin only)
+app.delete('/api/ncr/:id', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    await pool.query('DELETE FROM ppe_requests WHERE ncr_item_id=$1', [req.params.id]);
+    await pool.query('DELETE FROM ncr_items WHERE id=$1', [req.params.id]);
+    res.json({ message: 'Deleted' });
+  } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
+});
+
 // PPE Request Tracker
 app.get('/api/ppe-requests', auth, async (req, res) => {
   try {

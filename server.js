@@ -478,7 +478,7 @@ app.get('/api/ncr', auth, async (req, res) => {
 });
 
 app.get('/api/ncr/stats', auth, async (req, res) => {
-  const { rows } = await pool.query(`SELECT COUNT(*) FILTER (WHERE status='pending') as pending, COUNT(*) FILTER (WHERE status='ordered') as ordered, COUNT(*) FILTER (WHERE status='resolved' AND resolved_at >= date_trunc('month',NOW())) as resolved_this_month, COUNT(*) FILTER (WHERE status!='resolved') as total_open FROM ncr_items`);
+  const { rows } = await pool.query(`SELECT COUNT(*) FILTER (WHERE status='pending') as pending, COUNT(*) FILTER (WHERE status='ehs_purchase_requested') as ordered, COUNT(*) FILTER (WHERE status IN ('resolved','distributed') AND updated_at >= date_trunc('month',NOW())) as resolved_this_month, COUNT(*) FILTER (WHERE status NOT IN ('resolved','distributed','canceled')) as total_open FROM ncr_items`);
   res.json(rows[0]);
 });
 
@@ -584,8 +584,12 @@ app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
       'UPDATE ppe_requests SET status=$1' + extraFields + ', updated_at=NOW() WHERE id=$2 RETURNING *',
       extraParams
     );
-    if (status === 'distributed' && r.ncr_item_id) {
-      await client.query('UPDATE ncr_items SET status=$1, resolved_at=NOW(), updated_at=NOW() WHERE id=$2', ['resolved', r.ncr_item_id]);
+    if (r.ncr_item_id) {
+      if (status === 'distributed') {
+        await client.query('UPDATE ncr_items SET status=$1, resolved_at=NOW(), updated_at=NOW() WHERE id=$2', ['resolved', r.ncr_item_id]);
+      } else {
+        await client.query('UPDATE ncr_items SET status=$1, updated_at=NOW() WHERE id=$2', [status, r.ncr_item_id]);
+      }
     }
     await client.query('COMMIT');
     res.json(r);

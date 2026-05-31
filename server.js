@@ -545,6 +545,15 @@ app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
   finally { client.release(); }
 });
 
+// Fix missing dates on existing PPE requests (admin only)
+app.post('/api/admin/fix-ppe-dates', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    await pool.query("UPDATE ppe_requests SET date_purchase_requested=updated_at WHERE status='ehs_purchase_requested' AND date_purchase_requested IS NULL");
+    res.json({ message: 'Dates fixed' });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // One-time backfill NCR items to PPE requests (admin only)
 app.post('/api/admin/backfill-ppe-requests', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });

@@ -545,6 +545,23 @@ app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
   finally { client.release(); }
 });
 
+// One-time backfill NCR items to PPE requests (admin only)
+app.post('/api/admin/backfill-ppe-requests', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    const { rows } = await pool.query(`
+      INSERT INTO ppe_requests (ncr_item_id, employee_id, ppe_item_id, size_value, status, date_flagged)
+      SELECT n.id, n.employee_id, n.ppe_item_id, n.size_value,
+        CASE WHEN n.status='purchase_requested' THEN 'ehs_purchase_requested' ELSE 'pending' END,
+        n.created_at
+      FROM ncr_items n
+      WHERE NOT EXISTS (SELECT 1 FROM ppe_requests p WHERE p.ncr_item_id = n.id)
+      RETURNING id
+    `);
+    res.json({ backfilled: rows.length });
+  } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
+});
+
 // Start
 const PORT = 8080;
 setupDB().then(() => {

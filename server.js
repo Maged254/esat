@@ -529,6 +529,16 @@ app.put('/api/ncr/purchase-requests/:id/send', auth, async (req, res) => {
   res.json(rows[0]);
 });
 
+// Fix old statuses to new naming convention
+app.post('/api/admin/fix-statuses', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    await pool.query("UPDATE ppe_requests SET status='ehs_purchase_requested' WHERE status IN ('purchase_requested','ordered')");
+    await pool.query("UPDATE ncr_items SET status='ehs_purchase_requested' WHERE status IN ('purchase_requested','ordered')");
+    res.json({ message: 'Statuses fixed' });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // Delete NCR item (admin only)
 app.delete('/api/ncr/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });

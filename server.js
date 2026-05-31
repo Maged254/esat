@@ -574,7 +574,17 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
       LEFT JOIN users u2 ON u2.id=r.ordered_by
       LEFT JOIN users u3 ON u3.id=r.available_by
       LEFT JOIN users u4 ON u4.id=r.distributed_by
-      ORDER BY r.date_flagged DESC
+      ORDER BY
+        CASE r.status
+          WHEN 'pending' THEN 1
+          WHEN 'ehs_purchase_requested' THEN 2
+          WHEN 'scm_ordered' THEN 3
+          WHEN 'warehouse_available' THEN 4
+          WHEN 'distributed' THEN 5
+          WHEN 'canceled' THEN 6
+          ELSE 7
+        END,
+        r.date_flagged DESC
     `);
     res.json(rows);
   } catch(e) { console.error('PPE requests error:', e.message); res.status(500).json({ error: e.message }); }

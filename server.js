@@ -395,6 +395,26 @@ app.get('/api/audits/stats', auth, async (req, res) => {
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
+app.delete('/api/audits/:id', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: auditItems } = await client.query('SELECT id FROM audit_items WHERE audit_id=$1', [req.params.id]);
+    for (const ai of auditItems) {
+      const { rows: ncrs } = await client.query('SELECT id FROM ncr_items WHERE audit_item_id=$1', [ai.id]);
+      for (const ncr of ncrs) {
+        await client.query('DELETE FROM ppe_requests WHERE ncr_item_id=$1', [ncr.id]);
+      }
+      await client.query('DELETE FROM ncr_items WHERE audit_item_id=$1', [ai.id]);
+    }
+    await client.query('DELETE FROM audits WHERE id=$1', [req.params.id]);
+    await client.query('COMMIT');
+    res.json({ message: 'Deleted' });
+  } catch(e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: e.message }); }
+  finally { client.release(); }
+});
+
 app.get('/api/audits/leaderboard', auth, async (req, res) => {
   try {
     const { rows } = await pool.query(`

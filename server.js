@@ -575,7 +575,7 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
       ORDER BY r.date_flagged DESC
     `);
     res.json(rows);
-  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+  } catch(e) { console.error('PPE requests error:', e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {

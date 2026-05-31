@@ -178,6 +178,14 @@ async function setupDB() {
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_picture TEXT");
     await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS san BOOLEAN DEFAULT TRUE");
     await client.query("UPDATE employees SET san = TRUE WHERE san IS NULL");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_purchase_requested TIMESTAMPTZ");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_ordered TIMESTAMPTZ");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_available TIMESTAMPTZ");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_distributed TIMESTAMPTZ");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_purchase_requested TIMESTAMPTZ");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_ordered TIMESTAMPTZ");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_available TIMESTAMPTZ");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_distributed TIMESTAMPTZ");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()");
     console.log("Database setup complete");
   } catch(e) {
@@ -510,25 +518,30 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
 });
 
 app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
-  if (req.user.role !== 'scm_officer' && req.user.role !== 'admin') return res.status(403).json({ error: 'SCM Officer only' });
   const { status } = req.body;
+  const allowedRoles = ['admin', 'scm_officer', 'ehs_manager'];
+  if (!allowedRoles.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  if (req.user.role === 'scm_officer' && ['pending', 'ehs_purchase_requested'].includes(status)) {
+    return res.status(403).json({ error: 'SCM Officer can only update from EHS Purchase Requested onwards' });
+  }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    let dateField = '';
-    if (status === 'ordered') dateField = ', date_ordered=NOW()';
-    if (status === 'available') dateField = ', date_available=NOW()';
-    if (status === 'distributed') dateField = ', date_distributed=NOW()';
-    const { rows: [req2] } = await client.query(
-      `UPDATE ppe_requests SET status=$1${dateField}, updated_at=NOW() WHERE id=$2 RETURNING *`,
+    let extraFields = '';
+    if (status === 'ehs_purchase_requested') extraFields = ', date_purchase_requested=NOW()';
+    if (status === 'scm_ordered') extraFields = ', date_ordered=NOW()';
+    if (status === 'warehouse_available') extraFields = ', date_available=NOW()';
+    if (status === 'distributed') extraFields = ', date_distributed=NOW()';
+    const { rows: [r] } = await client.query(
+      'UPDATE ppe_requests SET status=$1' + extraFields + ', updated_at=NOW() WHERE id=$2 RETURNING *',
       [status, req.params.id]
     );
-    if (status === 'distributed' && req2.ncr_item_id) {
-      await client.query(`UPDATE ncr_items SET status='resolved', resolved_at=NOW(), updated_at=NOW() WHERE id=$1`, [req2.ncr_item_id]);
+    if (status === 'distributed' && r.ncr_item_id) {
+      await client.query('UPDATE ncr_items SET status=$1, resolved_at=NOW(), updated_at=NOW() WHERE id=$2', ['resolved', r.ncr_item_id]);
     }
     await client.query('COMMIT');
-    res.json(req2);
-  } catch(e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: 'Server error' }); }
+    res.json(r);
+  } catch(e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: e.message }); }
   finally { client.release(); }
 });
 

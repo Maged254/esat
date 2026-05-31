@@ -463,7 +463,7 @@ app.post('/api/audits', auth, async (req, res) => {
       const { rows: [ai] } = await client.query(`INSERT INTO audit_items (audit_id,ppe_item_id,condition,size_value,comment) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [audit.id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null]);
       if (item.condition !== 'good') {
         const { rows: [ncr] } = await client.query('INSERT INTO ncr_items (audit_item_id,employee_id,ppe_item_id,condition,size_value,comment) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [ai.id, employee_id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null]);
-        await client.query('INSERT INTO ppe_requests (ncr_item_id,employee_id,ppe_item_id,size_value,status) VALUES ($1,$2,$3,$4,$5)', [ncr.id, employee_id, item.ppe_item_id, item.size_value || null, 'pending']);
+        await client.query('INSERT INTO ppe_requests (ncr_item_id,employee_id,ppe_item_id,size_value,status,flagged_by) VALUES ($1,$2,$3,$4,$5,$6)', [ncr.id, employee_id, item.ppe_item_id, item.size_value || null, 'pending', req.user.id]);
       }
     }
     await client.query('COMMIT');
@@ -559,6 +559,7 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
       SELECT r.*,
         e.full_name as employee_name, e.employee_number, e.employment_status,
         p.name as ppe_name, p.category,
+        u0.full_name as flagged_by_name,
         u1.full_name as purchase_requested_by_name,
         u2.full_name as ordered_by_name,
         u3.full_name as available_by_name,
@@ -566,6 +567,7 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
       FROM ppe_requests r
       JOIN employees e ON e.id=r.employee_id
       JOIN ppe_items p ON p.id=r.ppe_item_id
+      LEFT JOIN users u0 ON u0.id=r.flagged_by
       LEFT JOIN users u1 ON u1.id=r.purchase_requested_by
       LEFT JOIN users u2 ON u2.id=r.ordered_by
       LEFT JOIN users u3 ON u3.id=r.available_by

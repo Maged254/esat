@@ -284,7 +284,7 @@ app.get('/api/employees', auth, async (req, res) => {
 app.get('/api/employees/overdue', auth, async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT e.id as employee_id, e.employee_number, e.full_name, e.department, e.project, e.employment_status,
+      SELECT e.id as employee_id, e.employee_number, e.national_id, e.full_name, e.department, e.project, e.employment_status,
         MAX(a.audit_date) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) as days_since_audit
       FROM employees e LEFT JOIN audits a ON a.employee_id=e.id
       WHERE e.employment_status='active'

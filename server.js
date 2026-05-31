@@ -181,6 +181,7 @@ async function setupDB() {
     await client.query("ALTER TABLE ppe_requests ALTER COLUMN status TYPE VARCHAR(50)");
     await client.query("UPDATE employees SET san = TRUE WHERE san IS NULL");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_purchase_requested TIMESTAMPTZ");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS flagged_by UUID");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_ordered TIMESTAMPTZ");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_available TIMESTAMPTZ");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_distributed TIMESTAMPTZ");
@@ -189,6 +190,7 @@ async function setupDB() {
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS available_by UUID REFERENCES users(id)");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS distributed_by UUID REFERENCES users(id)");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_purchase_requested TIMESTAMPTZ");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS flagged_by UUID");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_ordered TIMESTAMPTZ");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_available TIMESTAMPTZ");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_distributed TIMESTAMPTZ");

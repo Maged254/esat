@@ -452,7 +452,7 @@ app.put('/api/ncr/:id/status', auth, async (req, res) => {
   try {
     await client.query('BEGIN');
     const { rows: [ncr] } = await client.query(
-      `UPDATE ncr_items SET status=$1, resolved_at=CASE WHEN $1='resolved' THEN NOW() ELSE NULL END, updated_at=NOW() WHERE id=$2 RETURNING *`,
+      `UPDATE ncr_items SET status=$1, resolved_at=CASE WHEN $1::text='resolved' THEN NOW() ELSE NULL END, updated_at=NOW() WHERE id=$2 RETURNING *`,
       [status, req.params.id]
     );
     if (status === 'purchase_requested') {

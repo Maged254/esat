@@ -177,6 +177,8 @@ async function setupDB() {
 
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_picture TEXT");
     await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS san BOOLEAN DEFAULT TRUE");
+    await client.query("ALTER TABLE ncr_items ALTER COLUMN status TYPE VARCHAR(50)");
+    await client.query("ALTER TABLE ppe_requests ALTER COLUMN status TYPE VARCHAR(50)");
     await client.query("UPDATE employees SET san = TRUE WHERE san IS NULL");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_purchase_requested TIMESTAMPTZ");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_ordered TIMESTAMPTZ");

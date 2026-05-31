@@ -475,7 +475,7 @@ app.post('/api/audits', auth, async (req, res) => {
 // NCR
 app.get('/api/ncr', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query(`SELECT n.*,e.full_name as employee_name,e.employee_number,p.name as ppe_name,p.category FROM ncr_items n JOIN employees e ON e.id=n.employee_id JOIN ppe_items p ON p.id=n.ppe_item_id WHERE n.status!='resolved' ORDER BY n.created_at DESC`);
+    const { rows } = await pool.query(`SELECT n.*,e.full_name as employee_name,e.employee_number,p.name as ppe_name,p.category,u.full_name as audited_by_name FROM ncr_items n JOIN employees e ON e.id=n.employee_id JOIN ppe_items p ON p.id=n.ppe_item_id LEFT JOIN audit_items ai ON ai.id=n.audit_item_id LEFT JOIN audits a ON a.id=ai.audit_id LEFT JOIN users u ON u.id=a.audited_by WHERE n.status!='resolved' ORDER BY n.created_at DESC`);
     res.json(rows);
   } catch(e) { console.error("PUT users error:", e.message); res.status(500).json({ error: e.message }); }
 });
@@ -498,7 +498,7 @@ app.put('/api/ncr/:id/status', auth, async (req, res) => {
     }
     const ncr = updateQ.rows[0];
     if (status === 'ehs_purchase_requested') {
-      await client.query('UPDATE ppe_requests SET status=$1, date_purchase_requested=NOW(), updated_at=NOW() WHERE ncr_item_id=$2', ['ehs_purchase_requested', req.params.id]);
+      await client.query('UPDATE ppe_requests SET status=$1, date_purchase_requested=NOW(), purchase_requested_by=$2, updated_at=NOW() WHERE ncr_item_id=$3', ['ehs_purchase_requested', req.user.id, req.params.id]);
     }
     await client.query('COMMIT');
     res.json(ncr);

@@ -533,10 +533,10 @@ app.put('/api/ncr/purchase-requests/:id/send', auth, async (req, res) => {
 app.post('/api/admin/fix-statuses', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   try {
-    await pool.query("UPDATE ppe_requests SET status='ehs_purchase_requested' WHERE status IN ('purchase_requested','ordered')");
-    await pool.query("UPDATE ncr_items SET status='ehs_purchase_requested' WHERE status IN ('purchase_requested','ordered')");
-    res.json({ message: 'Statuses fixed' });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+    const r1 = await pool.query("UPDATE ppe_requests SET status='ehs_purchase_requested' WHERE status IN ('purchase_requested','ordered') RETURNING id");
+    const r2 = await pool.query("UPDATE ncr_items SET status='ehs_purchase_requested' WHERE status IN ('purchase_requested','ordered') RETURNING id");
+    res.json({ ppe_fixed: r1.rowCount, ncr_fixed: r2.rowCount });
+  } catch(e) { console.error('fix-statuses error:', e.message); res.status(500).json({ error: e.message }); }
 });
 
 // Delete NCR item (admin only)

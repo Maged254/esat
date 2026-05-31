@@ -462,7 +462,8 @@ app.post('/api/audits', auth, async (req, res) => {
     for (const item of items) {
       const { rows: [ai] } = await client.query(`INSERT INTO audit_items (audit_id,ppe_item_id,condition,size_value,comment) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [audit.id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null]);
       if (item.condition !== 'good') {
-        await client.query(`INSERT INTO ncr_items (audit_item_id,employee_id,ppe_item_id,condition,size_value,comment) VALUES ($1,$2,$3,$4,$5,$6)`, [ai.id, employee_id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null]);
+        const { rows: [ncr] } = await client.query('INSERT INTO ncr_items (audit_item_id,employee_id,ppe_item_id,condition,size_value,comment) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [ai.id, employee_id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null]);
+        await client.query('INSERT INTO ppe_requests (ncr_item_id,employee_id,ppe_item_id,size_value,status) VALUES ($1,$2,$3,$4,$5)', [ncr.id, employee_id, item.ppe_item_id, item.size_value || null, 'pending']);
       }
     }
     await client.query('COMMIT');

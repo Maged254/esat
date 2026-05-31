@@ -497,8 +497,8 @@ app.put('/api/ncr/:id/status', auth, async (req, res) => {
       updateQ = await client.query('UPDATE ncr_items SET status=$1, resolved_at=NULL, updated_at=NOW() WHERE id=$2 RETURNING *', [status, req.params.id]);
     }
     const ncr = updateQ.rows[0];
-    if (status === 'purchase_requested') {
-      await client.query('UPDATE ppe_requests SET status=$1, updated_at=NOW() WHERE ncr_item_id=$2', ['purchase_requested', req.params.id]);
+    if (status === 'ehs_purchase_requested') {
+      await client.query('UPDATE ppe_requests SET status=$1, date_purchase_requested=NOW(), updated_at=NOW() WHERE ncr_item_id=$2', ['ehs_purchase_requested', req.params.id]);
     }
     await client.query('COMMIT');
     res.json(ncr);

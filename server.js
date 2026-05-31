@@ -182,10 +182,18 @@ async function setupDB() {
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_ordered TIMESTAMPTZ");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_available TIMESTAMPTZ");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_distributed TIMESTAMPTZ");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS purchase_requested_by UUID REFERENCES users(id)");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS ordered_by UUID REFERENCES users(id)");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS available_by UUID REFERENCES users(id)");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS distributed_by UUID REFERENCES users(id)");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_purchase_requested TIMESTAMPTZ");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_ordered TIMESTAMPTZ");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_available TIMESTAMPTZ");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS date_distributed TIMESTAMPTZ");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS purchase_requested_by UUID REFERENCES users(id)");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS ordered_by UUID REFERENCES users(id)");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS available_by UUID REFERENCES users(id)");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS distributed_by UUID REFERENCES users(id)");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()");
     console.log("Database setup complete");
   } catch(e) {
@@ -507,10 +515,18 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
     const { rows } = await pool.query(`
       SELECT r.*,
         e.full_name as employee_name, e.employee_number, e.employment_status,
-        p.name as ppe_name, p.category
+        p.name as ppe_name, p.category,
+        u1.full_name as purchase_requested_by_name,
+        u2.full_name as ordered_by_name,
+        u3.full_name as available_by_name,
+        u4.full_name as distributed_by_name
       FROM ppe_requests r
       JOIN employees e ON e.id=r.employee_id
       JOIN ppe_items p ON p.id=r.ppe_item_id
+      LEFT JOIN users u1 ON u1.id=r.purchase_requested_by
+      LEFT JOIN users u2 ON u2.id=r.ordered_by
+      LEFT JOIN users u3 ON u3.id=r.available_by
+      LEFT JOIN users u4 ON u4.id=r.distributed_by
       ORDER BY r.date_flagged DESC
     `);
     res.json(rows);
@@ -528,13 +544,15 @@ app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
   try {
     await client.query('BEGIN');
     let extraFields = '';
-    if (status === 'ehs_purchase_requested') extraFields = ', date_purchase_requested=NOW()';
-    if (status === 'scm_ordered') extraFields = ', date_ordered=NOW()';
-    if (status === 'warehouse_available') extraFields = ', date_available=NOW()';
-    if (status === 'distributed') extraFields = ', date_distributed=NOW()';
+    let extraParams = [status, req.params.id];
+    if (status === 'ehs_purchase_requested') extraFields = ', date_purchase_requested=NOW(), purchase_requested_by=$3';
+    if (status === 'scm_ordered') extraFields = ', date_ordered=NOW(), ordered_by=$3';
+    if (status === 'warehouse_available') extraFields = ', date_available=NOW(), available_by=$3';
+    if (status === 'distributed') extraFields = ', date_distributed=NOW(), distributed_by=$3';
+    if (extraFields.includes('$3')) extraParams.push(req.user.id);
     const { rows: [r] } = await client.query(
       'UPDATE ppe_requests SET status=$1' + extraFields + ', updated_at=NOW() WHERE id=$2 RETURNING *',
-      [status, req.params.id]
+      extraParams
     );
     if (status === 'distributed' && r.ncr_item_id) {
       await client.query('UPDATE ncr_items SET status=$1, resolved_at=NOW(), updated_at=NOW() WHERE id=$2', ['resolved', r.ncr_item_id]);

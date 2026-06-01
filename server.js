@@ -243,7 +243,7 @@ app.get('/api/auth/me', auth, async (req, res) => {
 // Dashboard
 app.get('/api/dashboard', auth, async (req, res) => {
   try {
-    const [emp, overdue, ncr, ncrCat, comp, recent, delays] = await Promise.all([
+    const [emp, overdue, ncr, ncrCat, comp, delays, recent] = await Promise.all([
       pool.query(`SELECT COUNT(*) FILTER (WHERE employment_status='active') as active, COUNT(*) FILTER (WHERE employment_status='exit' AND exit_date >= date_trunc('year',NOW())) as exits_this_year FROM employees`),
       pool.query(`SELECT COUNT(*) as overdue FROM employees e LEFT JOIN (SELECT employee_id, MAX(audit_date) as last_audit FROM audits GROUP BY employee_id) a ON e.id=a.employee_id WHERE e.employment_status='active' AND (a.last_audit IS NULL OR CURRENT_DATE - a.last_audit > 30)`),
       pool.query(`SELECT COUNT(*) FILTER (WHERE status!='resolved') as open, COUNT(*) FILTER (WHERE status='pending') as pending FROM ncr_items`),

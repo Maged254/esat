@@ -616,7 +616,7 @@ app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
     );
     if (r.ncr_item_id) {
       if (status === 'distributed') {
-        await client.query('UPDATE ncr_items SET status=$1, resolved_at=NOW(), updated_at=NOW() WHERE id=$2', ['resolved', r.ncr_item_id]);
+        await client.query('UPDATE ncr_items SET status=$1, resolved_at=NOW(), updated_at=NOW() WHERE id=$2', ['distributed', r.ncr_item_id]);
       } else {
         await client.query('UPDATE ncr_items SET status=$1, updated_at=NOW() WHERE id=$2', [status, r.ncr_item_id]);
       }

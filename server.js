@@ -366,6 +366,7 @@ app.put('/api/employees/:id/status', auth, async (req, res) => {
     await client.query('UPDATE employees SET employment_status=$1, exit_date=$2, updated_at=NOW() WHERE id=$3', [employment_status, exit_date || null, req.params.id]);
     if (employment_status === 'exit') {
       await client.query(`UPDATE ppe_requests SET status='canceled', updated_at=NOW() WHERE employee_id=$1 AND status NOT IN ('distributed','canceled')`, [req.params.id]);
+      await client.query(`UPDATE ncr_items SET status='canceled', updated_at=NOW() WHERE employee_id=$1 AND status NOT IN ('resolved','canceled')`, [req.params.id]);
     }
     await client.query('COMMIT');
     const { rows } = await pool.query('SELECT * FROM employees WHERE id=$1', [req.params.id]);

@@ -725,6 +725,53 @@ setupDB().then(() => {
 // ── User Management Routes ───────────────────────────────────
 
 // GET all users (admin only)
+
+app.get('/api/graphs', auth, async (req, res) => {
+  try {
+    const [ppeByEmployee, auditsByMonth, ncrByMonth] = await Promise.all([
+      pool.query(`
+        SELECT e.full_name as employee_name, COUNT(r.id) as ppe_count
+        FROM employees e
+        JOIN ppe_requests r ON r.employee_id = e.id
+        WHERE r.status NOT IN ('distributed','resolved','canceled')
+        AND e.employment_status = 'active'
+        GROUP BY e.id, e.full_name
+        ORDER BY ppe_count DESC
+        LIMIT 20
+      `),
+      pool.query(`
+        SELECT TO_CHAR(DATE_TRUNC('month', audit_date), 'Mon YYYY') as month,
+               DATE_TRUNC('month', audit_date) as month_date,
+               COUNT(*) as count
+        FROM audits
+        WHERE audit_date >= NOW() - INTERVAL '6 months'
+        GROUP BY month_date, month
+        ORDER BY month_date ASC
+      `),
+      pool.query(`
+        SELECT TO_CHAR(DATE_TRUNC('month', created_at), 'Mon YYYY') as month,
+               DATE_TRUNC('month', created_at) as month_date,
+               COUNT(*) as created,
+               COUNT(*) FILTER (WHERE status IN ('resolved','distributed')) as resolved
+        FROM ncr_items
+        WHERE created_at >= NOW() - INTERVAL '6 months'
+        GROUP BY month_date, month
+        ORDER BY month_date ASC
+      `)
+    ]);
+
+    const counts = ppeByEmployee.rows.map(r => parseInt(r.ppe_count));
+    const avg = counts.length > 0 ? Math.round(counts.reduce((a,b) => a+b, 0) / counts.length) : 0;
+
+    res.json({
+      ppe_by_employee: ppeByEmployee.rows.map(r => ({ name: r.employee_name, count: parseInt(r.ppe_count) })),
+      ppe_average: avg,
+      audits_by_month: auditsByMonth.rows.map(r => ({ month: r.month, count: parseInt(r.count) })),
+      ncr_by_month: ncrByMonth.rows.map(r => ({ month: r.month, created: parseInt(r.created), resolved: parseInt(r.resolved) }))
+    });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
 app.get('/api/users', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, created_at FROM users ORDER BY created_at DESC');

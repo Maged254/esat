@@ -243,12 +243,22 @@ app.get('/api/auth/me', auth, async (req, res) => {
 // Dashboard
 app.get('/api/dashboard', auth, async (req, res) => {
   try {
-    const [emp, overdue, ncr, ncrCat, comp, recent] = await Promise.all([
+    const [emp, overdue, ncr, ncrCat, comp, recent, delays] = await Promise.all([
       pool.query(`SELECT COUNT(*) FILTER (WHERE employment_status='active') as active, COUNT(*) FILTER (WHERE employment_status='exit' AND exit_date >= date_trunc('year',NOW())) as exits_this_year FROM employees`),
       pool.query(`SELECT COUNT(*) as overdue FROM employees e LEFT JOIN (SELECT employee_id, MAX(audit_date) as last_audit FROM audits GROUP BY employee_id) a ON e.id=a.employee_id WHERE e.employment_status='active' AND (a.last_audit IS NULL OR CURRENT_DATE - a.last_audit > 30)`),
       pool.query(`SELECT COUNT(*) FILTER (WHERE status!='resolved') as open, COUNT(*) FILTER (WHERE status='pending') as pending FROM ncr_items`),
       pool.query(`SELECT p.name as ppe_name, p.category, COUNT(*) as count FROM ncr_items n JOIN ppe_items p ON p.id=n.ppe_item_id WHERE n.status!='resolved' AND n.status!='canceled' GROUP BY p.name, p.category ORDER BY count DESC LIMIT 10`),
       pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE overall_status='compliant') as compliant FROM audits WHERE audit_date >= date_trunc('month',NOW())`),
+      pool.query(`
+        SELECT
+          MAX(CASE WHEN status='pending' THEN CURRENT_DATE - date_flagged::date END) as ehs_delay,
+          MAX(CASE WHEN status='ehs_purchase_requested' THEN CURRENT_DATE - date_purchase_requested::date END) as scm_delay,
+          MAX(CASE WHEN status='scm_ordered' THEN CURRENT_DATE - date_ordered::date END) as suppliers_delay,
+          MAX(CASE WHEN status='warehouse_available' THEN CURRENT_DATE - date_available::date END) as projects_delay,
+          MAX(CASE WHEN status NOT IN ('distributed','resolved','canceled') THEN CURRENT_DATE - date_flagged::date END) as total_delay
+        FROM ppe_requests
+        WHERE status NOT IN ('distributed','resolved','canceled')
+      `),
       pool.query(`SELECT a.id,a.audit_date,a.overall_status,e.full_name as employee_name,e.employee_number,e.national_id,e.department,e.project,u.full_name as audited_by_name,COUNT(ai.id) as total_items,COUNT(CASE WHEN ai.condition!='good' THEN 1 END) as issues_count FROM audits a JOIN employees e ON e.id=a.employee_id JOIN users u ON u.id=a.audited_by LEFT JOIN audit_items ai ON ai.audit_id=a.id GROUP BY a.id,e.full_name,e.employee_number,e.national_id,e.department,e.project,u.full_name ORDER BY a.created_at DESC LIMIT 5`)
     ]);
     const c = comp.rows[0];
@@ -257,6 +267,13 @@ app.get('/api/dashboard', auth, async (req, res) => {
       overdue: parseInt(overdue.rows[0].overdue),
       ncr: { open: parseInt(ncr.rows[0].open), pending: parseInt(ncr.rows[0].pending), by_category: ncrCat.rows },
       compliance_rate: c.total > 0 ? Math.round((c.compliant / c.total) * 100) : null,
+      delays: {
+        ehs: parseInt(delays.rows[0].ehs_delay) || 0,
+        scm: parseInt(delays.rows[0].scm_delay) || 0,
+        suppliers: parseInt(delays.rows[0].suppliers_delay) || 0,
+        projects: parseInt(delays.rows[0].projects_delay) || 0,
+        total: parseInt(delays.rows[0].total_delay) || 0
+      },
       recent_audits: recent.rows
     });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }

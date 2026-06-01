@@ -543,7 +543,8 @@ app.post('/api/admin/fix-statuses', auth, async (req, res) => {
   try {
     const r1 = await pool.query("UPDATE ppe_requests SET status='ehs_purchase_requested' WHERE status IN ('purchase_requested','ordered') RETURNING id");
     const r2 = await pool.query("UPDATE ncr_items SET status='ehs_purchase_requested' WHERE status IN ('purchase_requested','ordered') RETURNING id");
-    res.json({ ppe_fixed: r1.rowCount, ncr_fixed: r2.rowCount });
+    const r3 = await pool.query("UPDATE ncr_items SET status='distributed' WHERE status='resolved' RETURNING id");
+    res.json({ ppe_fixed: r1.rowCount, ncr_fixed: r2.rowCount, resolved_fixed: r3.rowCount });
   } catch(e) { console.error('fix-statuses error:', e.message); res.status(500).json({ error: e.message }); }
 });
 

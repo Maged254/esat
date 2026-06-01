@@ -334,6 +334,17 @@ app.post('/api/employees', auth, async (req, res) => {
   employment_status = employment_status?.toLowerCase();
 
   try {
+    // Upsert: if national_id exists, update instead of insert
+    if (national_id) {
+      const existing = await pool.query('SELECT id FROM employees WHERE national_id=$1', [national_id]);
+      if (existing.rows.length > 0) {
+        const { rows } = await pool.query(
+          `UPDATE employees SET full_name=$1, job_title=$2, department=$3, project=$4, client=$5, organization=$6, resource_type=$7, employment_status=$8 WHERE national_id=$9 RETURNING *`,
+          [full_name, job_title, department, project, client, organization, resource_type, employment_status || 'active', national_id]
+        );
+        return res.json(rows[0]);
+      }
+    }
     const { rows } = await pool.query(`INSERT INTO employees (employee_number,full_name,national_id,job_title,department,project,client,organization,resource_type,employment_status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`, [employee_number, full_name, national_id, job_title, department, project, client, organization, resource_type, employment_status || 'active']);
     res.status(201).json(rows[0]);
   } catch(e) {

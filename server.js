@@ -230,7 +230,8 @@ app.post('/api/auth/login', async (req, res) => {
     if (!rows[0] || !(await bcrypt.compare(password, rows[0].password_hash)))
       return res.status(401).json({ error: 'Invalid credentials' });
     const isSync = rows[0].email === 'sync@egypro.com';
-    const token = jwt.sign({ id: rows[0].id, email: rows[0].email, role: rows[0].role, name: rows[0].full_name }, JWT_SECRET, { expiresIn: isSync ? '365d' : '8h' });
+    const tokenOptions = isSync ? {} : { expiresIn: '8h' };
+    const token = jwt.sign({ id: rows[0].id, email: rows[0].email, role: rows[0].role, name: rows[0].full_name }, JWT_SECRET, tokenOptions);
     res.json({ token, user: { id: rows[0].id, name: rows[0].full_name, email: rows[0].email, role: rows[0].role } });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });

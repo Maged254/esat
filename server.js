@@ -499,8 +499,15 @@ app.post('/api/audits', auth, async (req, res) => {
     for (const item of items) {
       const { rows: [ai] } = await client.query(`INSERT INTO audit_items (audit_id,ppe_item_id,condition,size_value,comment) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [audit.id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null]);
       if (item.condition !== 'good') {
-        const { rows: [ncr] } = await client.query('INSERT INTO ncr_items (audit_item_id,employee_id,ppe_item_id,condition,size_value,comment) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [ai.id, employee_id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null]);
-        await client.query('INSERT INTO ppe_requests (ncr_item_id,employee_id,ppe_item_id,size_value,status,flagged_by) VALUES ($1,$2,$3,$4,$5,$6)', [ncr.id, employee_id, item.ppe_item_id, item.size_value || null, 'pending', req.user.id]);
+        // Skip if open PPE request already exists for this employee + PPE item
+        const { rows: existing } = await client.query(
+          `SELECT id FROM ppe_requests WHERE employee_id=$1 AND ppe_item_id=$2 AND status NOT IN ('distributed','resolved','canceled')`,
+          [employee_id, item.ppe_item_id]
+        );
+        if (existing.length === 0) {
+          const { rows: [ncr] } = await client.query('INSERT INTO ncr_items (audit_item_id,employee_id,ppe_item_id,condition,size_value,comment) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [ai.id, employee_id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null]);
+          await client.query('INSERT INTO ppe_requests (ncr_item_id,employee_id,ppe_item_id,size_value,status,flagged_by) VALUES ($1,$2,$3,$4,$5,$6)', [ncr.id, employee_id, item.ppe_item_id, item.size_value || null, 'pending', req.user.id]);
+        }
       }
     }
     await client.query('COMMIT');

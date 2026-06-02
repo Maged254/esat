@@ -601,8 +601,13 @@ app.delete('/api/ncr/:id', auth, async (req, res) => {
 
 app.delete('/api/ppe/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  await pool.query('DELETE FROM ppe_items WHERE id=$1', [req.params.id]);
-  res.json({ success: true });
+  try {
+    await pool.query('DELETE FROM ppe_items WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch (e) {
+    if (e.code === '23503') return res.status(400).json({ error: 'Cannot delete: this PPE item is referenced in existing audits. Set it to Inactive instead.' });
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/ppe', auth, async (req, res) => {

@@ -386,8 +386,13 @@ app.put('/api/employees/:id/san', auth, async (req, res) => {
 // Delete employee (admin only)
 app.delete('/api/employees/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  await pool.query('DELETE FROM employees WHERE id=$1', [req.params.id]);
-  res.json({ message: 'Deleted' });
+  try {
+    await pool.query('DELETE FROM employees WHERE id=$1', [req.params.id]);
+    res.json({ message: 'Deleted' });
+  } catch (e) {
+    if (e.code === '23503') return res.status(400).json({ error: 'Cannot delete: employee has existing audits or records. Deactivate them instead.' });
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // PPE Items

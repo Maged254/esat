@@ -136,6 +136,11 @@ async function setupDB() {
         ppe_item_id UUID NOT NULL REFERENCES ppe_items(id) ON DELETE CASCADE,
         UNIQUE(employee_id, ppe_item_id)
       );
+      CREATE TABLE IF NOT EXISTS sync_log (
+        id SERIAL PRIMARY KEY,
+        synced_at TIMESTAMPTZ DEFAULT NOW(),
+        triggered_by TEXT
+      );
     `);
 
     // Seed PPE items if empty
@@ -739,6 +744,19 @@ app.post('/api/admin/backfill-ppe-requests', auth, async (req, res) => {
     `);
     res.json({ backfilled: rows.length });
   } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
+});
+
+
+// Sync log
+app.post('/api/sync-log', auth, async (req, res) => {
+  const { triggered_by } = req.body;
+  await pool.query('INSERT INTO sync_log (triggered_by) VALUES ($1)', [triggered_by || 'power_automate']);
+  res.json({ ok: true });
+});
+
+app.get('/api/sync-log/latest', auth, async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM sync_log ORDER BY synced_at DESC LIMIT 1');
+  res.json(rows[0] || null);
 });
 
 // Start

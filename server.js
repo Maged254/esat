@@ -384,6 +384,14 @@ app.put('/api/employees/:id/san', auth, async (req, res) => {
 });
 
 // Delete employee (admin only)
+app.delete('/api/employees/all/purge', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    await pool.query('DELETE FROM employees');
+    res.json({ message: 'All employees deleted' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.delete('/api/employees/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   try {

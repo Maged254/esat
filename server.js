@@ -470,7 +470,7 @@ app.delete('/api/audits/:id', auth, async (req, res) => {
 app.get('/api/audits/leaderboard', auth, async (req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT u.id, u.full_name, u.role,
+      SELECT u.id, u.full_name, u.role, u.profile_picture,
         COUNT(a.id) as total_audits,
         COUNT(a.id) FILTER (WHERE date_trunc('month', a.audit_date) = date_trunc('month', NOW())) as this_month
       FROM users u

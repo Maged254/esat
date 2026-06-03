@@ -541,7 +541,7 @@ app.post('/api/audits', auth, async (req, res) => {
     const { rows: [audit] } = await client.query(`INSERT INTO audits (employee_id,audited_by,audit_date,overall_status,notes) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [employee_id, audited_by_override || req.user.id, audit_date || new Date(), overall_status, notes]);
     for (const item of items) {
       const { rows: [ai] } = await client.query(`INSERT INTO audit_items (audit_id,ppe_item_id,condition,size_value,comment) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [audit.id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null]);
-      if (item.condition !== 'good') {
+      if (item.condition === 'not_good') {
         // Skip if open PPE request already exists for this employee + PPE item
         const { rows: existing } = await client.query(
           `SELECT id FROM ppe_requests WHERE employee_id=$1 AND ppe_item_id=$2 AND status NOT IN ('distributed','resolved','canceled')`,

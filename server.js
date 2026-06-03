@@ -334,6 +334,30 @@ app.get('/api/employees/:id/ppe-assignments', auth, async (req, res) => {
   res.json(rows);
 });
 
+
+app.put('/api/employees/:id/ppe-assignments', auth, async (req, res) => {
+  if (!['admin','ehs_manager'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  const { ppe_item_ids } = req.body; // array of UUIDs
+  const employeeId = req.params.id;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM employee_ppe_assignments WHERE employee_id=$1', [employeeId]);
+    if (ppe_item_ids && ppe_item_ids.length > 0) {
+      for (const ppeId of ppe_item_ids) {
+        await client.query('INSERT INTO employee_ppe_assignments (employee_id, ppe_item_id) VALUES ($1,$2)', [employeeId, ppeId]);
+      }
+    }
+    await client.query('COMMIT');
+    res.json({ success: true });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: e.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.post('/api/employees', auth, async (req, res) => {
   if (req.user.role === 'ehs_officer') return res.status(403).json({ error: 'Not authorized' });
   let { employee_number, full_name, national_id, job_title, department, project, client, organization, resource_type, employment_status } = req.body;

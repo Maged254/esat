@@ -840,7 +840,7 @@ app.get('/api/graphs', auth, async (req, res) => {
 });
 
 app.get('/api/users', auth, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
   const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, created_at FROM users ORDER BY created_at DESC');
   res.json(rows);
 });

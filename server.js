@@ -786,7 +786,76 @@ app.get('/api/sync-log/latest', auth, async (req, res) => {
 // Start
 const PORT = 8080;
 setupDB().then(() => {
-  app.listen(PORT, () => console.log(`ESAT running on port ${PORT}`));
+  
+// ── Cloudinary Setup ────────────────────────────────────────
+const cloudinary = require('cloudinary').v2;
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage() });
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+// ── Upload Audit Document ────────────────────────────────────
+app.post('/api/audit-documents/upload', authenticateToken, upload.single('file'), async (req, res) => {
+  try {
+    const { audit_id, employee_id, field_name, national_id, employee_name, audit_date } = req.body;
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+
+    const safeName = employee_name.replace(/[^a-zA-Z0-9]/g, '-');
+    const folder = `esat/${national_id}_${safeName}/${audit_date}`;
+    const safeField = field_name.replace(/ /g, '_');
+    const publicId = `${folder}/${safeField}`;
+
+    const result = await new Promise((resolve, reject) => {
+      cloudinary.uploader.upload_stream(
+        { public_id: publicId, overwrite: true, resource_type: 'image' },
+        (error, result) => { if (error) reject(error); else resolve(result); }
+      )(req.file.buffer);
+    });
+
+    await pool.query(
+      `INSERT INTO audit_documents (audit_id, employee_id, field_name, cloudinary_url, cloudinary_public_id)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [audit_id, employee_id, field_name, result.secure_url, result.public_id]
+    );
+
+    res.json({ url: result.secure_url, public_id: result.public_id });
+  } catch (err) {
+    console.error('Upload error:', err);
+    res.status(500).json({ message: 'Upload failed', error: err.message });
+  }
+});
+
+// ── Get Audit Documents ──────────────────────────────────────
+app.get('/api/audit-documents/:audit_id', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM audit_documents WHERE audit_id = $1 ORDER BY uploaded_at ASC`,
+      [req.params.audit_id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ message: 'Failed to fetch documents' });
+  }
+});
+
+// ── Delete Audit Document ────────────────────────────────────
+app.delete('/api/audit-documents/:id', authenticateToken, async (req, res) => {
+  try {
+    const doc = await pool.query(`SELECT * FROM audit_documents WHERE id = $1`, [req.params.id]);
+    if (!doc.rows.length) return res.status(404).json({ message: 'Not found' });
+    await cloudinary.uploader.destroy(doc.rows[0].cloudinary_public_id);
+    await pool.query(`DELETE FROM audit_documents WHERE id = $1`, [req.params.id]);
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    res.status(500).json({ message: 'Delete failed' });
+  }
+});
+
+app.listen(PORT, () => console.log(`ESAT running on port ${PORT}`));
 });
 
 // ── User Management Routes ───────────────────────────────────

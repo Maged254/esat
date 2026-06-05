@@ -799,7 +799,7 @@ cloudinary.config({
 });
 
 // ── Upload Audit Document ────────────────────────────────────
-app.post('/api/audit-documents/upload', authenticateToken, upload.single('file'), async (req, res) => {
+app.post('/api/audit-documents/upload', auth, upload.single('file'), async (req, res) => {
   try {
     const { audit_id, employee_id, field_name, national_id, employee_name, audit_date } = req.body;
     if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
@@ -830,7 +830,7 @@ app.post('/api/audit-documents/upload', authenticateToken, upload.single('file')
 });
 
 // ── Get Audit Documents ──────────────────────────────────────
-app.get('/api/audit-documents/:audit_id', authenticateToken, async (req, res) => {
+app.get('/api/audit-documents/:audit_id', auth, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT * FROM audit_documents WHERE audit_id = $1 ORDER BY uploaded_at ASC`,
@@ -843,7 +843,7 @@ app.get('/api/audit-documents/:audit_id', authenticateToken, async (req, res) =>
 });
 
 // ── Delete Audit Document ────────────────────────────────────
-app.delete('/api/audit-documents/:id', authenticateToken, async (req, res) => {
+app.delete('/api/audit-documents/:id', auth, async (req, res) => {
   try {
     const doc = await pool.query(`SELECT * FROM audit_documents WHERE id = $1`, [req.params.id]);
     if (!doc.rows.length) return res.status(404).json({ message: 'Not found' });

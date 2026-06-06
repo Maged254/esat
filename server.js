@@ -810,10 +810,11 @@ app.post('/api/audit-documents/upload', auth, upload.single('file'), async (req,
     const publicId = `${folder}/${safeField}`;
 
     const result = await new Promise((resolve, reject) => {
-      cloudinary.uploader.upload_stream(
-        { public_id: publicId, overwrite: true, resource_type: 'image' },
+      const stream = cloudinary.uploader.upload_stream(
+        { public_id: publicId, overwrite: true, resource_type: 'auto' },
         (error, result) => { if (error) reject(error); else resolve(result); }
-      )(req.file.buffer);
+      );
+      stream.end(req.file.buffer);
     });
 
     await pool.query(

@@ -454,7 +454,7 @@ app.get('/api/audits', auth, async (req, res) => {
     if (client) { params.push(client); q += ` AND e.client=$${params.length}`; }
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
     if (audited_by) { params.push(audited_by); q += ` AND a.audited_by=$${params.length}`; }
-    q += ` GROUP BY a.id,e.full_name,e.employee_number,e.national_id,e.department,e.project,e.client,e.organization,e.resource_type,u.full_name ORDER BY a.audit_date DESC`;
+    q += ` GROUP BY a.id,e.full_name,e.employee_number,e.national_id,e.department,e.project,e.client,e.organization,e.resource_type,u.full_name ORDER BY a.created_at DESC`;
     const { rows } = await pool.query(q, params);
     res.json(rows);
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }

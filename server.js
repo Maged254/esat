@@ -807,7 +807,7 @@ app.post('/api/audit-documents/upload', auth, upload.single('file'), async (req,
     const safeName = employee_name.replace(/[^a-zA-Z0-9]/g, '-');
     const folder = `esat/${national_id}_${safeName}/${audit_date}`;
     const safeField = field_name.replace(/ /g, '_');
-    const publicId = `${folder}/${safeField}`;
+    const publicId = `${folder}/${audit_date}_${safeField}`;
 
     const result = await new Promise((resolve, reject) => {
       const stream = cloudinary.uploader.upload_stream(

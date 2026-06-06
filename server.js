@@ -830,6 +830,22 @@ app.post('/api/audit-documents/upload', auth, upload.single('file'), async (req,
   }
 });
 
+
+// ── Download Audit Document (proxy) ─────────────────────────
+app.get('/api/audit-documents/:id/download', auth, async (req, res) => {
+  try {
+    const doc = await pool.query('SELECT * FROM audit_documents WHERE id = $1', [req.params.id]);
+    if (!doc.rows.length) return res.status(404).json({ message: 'Not found' });
+    const url = doc.rows[0].cloudinary_url;
+    const filename = url.split('/').pop().split('?')[0];
+    const https = require('https');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    https.get(url, (stream) => stream.pipe(res));
+  } catch (err) {
+    res.status(500).json({ message: 'Download failed' });
+  }
+});
+
 // ── Get Audit Documents ──────────────────────────────────────
 app.get('/api/audit-documents/:audit_id', auth, async (req, res) => {
   try {

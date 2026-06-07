@@ -821,7 +821,8 @@ app.post('/api/audit-documents/upload', auth, upload.single('file'), async (req,
 
     await pool.query(
       `INSERT INTO audit_documents (audit_id, employee_id, field_name, cloudinary_url, cloudinary_public_id)
-       VALUES ($1, $2, $3, $4, $5)`,
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (audit_id, field_name) DO UPDATE SET cloudinary_url=EXCLUDED.cloudinary_url, cloudinary_public_id=EXCLUDED.cloudinary_public_id`,
       [audit_id, employee_id, field_name, result.secure_url, result.public_id]
     );
 

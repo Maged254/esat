@@ -312,11 +312,13 @@ app.get('/api/employees/overdue', auth, async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT e.id as employee_id, e.employee_number, e.national_id, e.full_name, e.department, e.project, e.employment_status,
-        MAX(a.audit_date) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) as days_since_audit
+        MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) as last_audit_date,
+        CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) as days_since_audit
       FROM employees e LEFT JOIN audits a ON a.employee_id=e.id
-      WHERE e.employment_status='active'
+      WHERE e.employment_status='active' AND e.san=TRUE
       GROUP BY e.id
-      HAVING MAX(a.audit_date) IS NULL OR CURRENT_DATE - MAX(a.audit_date) > 30
+      HAVING MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) IS NULL
+        OR CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) > 30
       ORDER BY days_since_audit DESC NULLS FIRST
     `);
     res.json(rows);
@@ -454,7 +456,7 @@ app.get('/api/audits', auth, async (req, res) => {
     if (client) { params.push(client); q += ` AND e.client=$${params.length}`; }
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
     if (audited_by) { params.push(audited_by); q += ` AND a.audited_by=$${params.length}`; }
-    q += ` GROUP BY a.id,e.full_name,e.employee_number,e.national_id,e.department,e.project,e.client,e.organization,e.resource_type,u.full_name ORDER BY a.created_at DESC`;
+    q += ` GROUP BY a.id,e.full_name,e.employee_number,e.national_id,e.department,e.project,e.client,e.organization,e.resource_type,u.full_name,a.employee_present ORDER BY a.created_at DESC`;
     const { rows } = await pool.query(q, params);
     res.json(rows);
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
@@ -531,14 +533,14 @@ app.get('/api/audits/:id', auth, async (req, res) => {
 });
 
 app.post('/api/audits', auth, async (req, res) => {
-  const { employee_id, audit_date, notes, items, audited_by_override } = req.body;
+  const { employee_id, audit_date, notes, items, audited_by_override, employee_present } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const hasIssues = items.some(i => i.condition !== 'good');
     const allBad = items.every(i => i.condition !== 'good');
     const overall_status = !hasIssues ? 'compliant' : allBad ? 'non_compliant' : 'partial';
-    const { rows: [audit] } = await client.query(`INSERT INTO audits (employee_id,audited_by,audit_date,overall_status,notes) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [employee_id, audited_by_override || req.user.id, audit_date || new Date(), overall_status, notes]);
+    const { rows: [audit] } = await client.query(`INSERT INTO audits (employee_id,audited_by,audit_date,overall_status,notes,employee_present) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`, [employee_id, audited_by_override || req.user.id, audit_date || new Date(), overall_status, notes, employee_present !== false]);
     for (const item of items) {
       const { rows: [ai] } = await client.query(`INSERT INTO audit_items (audit_id,ppe_item_id,condition,size_value,comment) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [audit.id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null]);
       if (item.condition === 'not_good') {

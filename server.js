@@ -151,6 +151,9 @@ async function setupDB() {
       );
     `);
 
+    // Ensure project_access column exists on users
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS project_access TEXT[] DEFAULT '{}'");
+
     // Ensure distribution columns exist on ppe_requests
     await client.query('ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS distribution_method VARCHAR(50)');
     await client.query('ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS courier_tracking_number VARCHAR(200)');
@@ -237,6 +240,14 @@ const auth = (req, res, next) => {
   } catch { res.status(401).json({ error: 'Invalid token' }); }
 };
 
+// ── Project access helper ────────────────────────────────────
+const RESTRICTED_ROLES = ['ehs_officer', 'supervisor', 'scm_officer'];
+const getProjectFilter = (user) => {
+  if (!RESTRICTED_ROLES.includes(user.role)) return null; // unrestricted
+  const projects = user.project_access || [];
+  return projects; // empty array = sees nothing
+};
+
 // ── Routes ───────────────────────────────────────────────────
 
 // Health
@@ -251,7 +262,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     const isSync = rows[0].email === 'sync@egypro.com';
     const tokenOptions = isSync ? {} : { expiresIn: '8h' };
-    const token = jwt.sign({ id: rows[0].id, email: rows[0].email, role: rows[0].role, name: rows[0].full_name }, JWT_SECRET, tokenOptions);
+    const token = jwt.sign({ id: rows[0].id, email: rows[0].email, role: rows[0].role, name: rows[0].full_name, project_access: rows[0].project_access || [] }, JWT_SECRET, tokenOptions);
     res.json({ token, user: { id: rows[0].id, name: rows[0].full_name, email: rows[0].email, role: rows[0].role } });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
@@ -317,6 +328,11 @@ app.get('/api/employees', auth, async (req, res) => {
     if (job_title) { params.push(`%${job_title}%`); q += ` AND e.job_title ILIKE $${params.length}`; }
     if (department) { params.push(department); q += ` AND e.department=$${params.length}`; }
     if (resource_type) { params.push(resource_type); q += ` AND e.resource_type=$${params.length}`; }
+    const empProjects = getProjectFilter(req.user);
+    if (empProjects !== null) {
+      if (empProjects.length === 0) { return res.json([]); }
+      params.push(empProjects); q += ` AND e.project = ANY($${params.length})`;
+    }
     q += ` GROUP BY e.id ORDER BY e.full_name`;
     const { rows } = await pool.query(q, params);
     res.json(rows);
@@ -471,6 +487,11 @@ app.get('/api/audits', auth, async (req, res) => {
     if (client) { params.push(client); q += ` AND e.client=$${params.length}`; }
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
     if (audited_by) { params.push(audited_by); q += ` AND a.audited_by=$${params.length}`; }
+    const auditProjects = getProjectFilter(req.user);
+    if (auditProjects !== null) {
+      if (auditProjects.length === 0) { return res.json([]); }
+      params.push(auditProjects); q += ` AND e.project = ANY($${params.length})`;
+    }
     q += ` GROUP BY a.id,e.full_name,e.employee_number,e.national_id,e.department,e.project,e.client,e.organization,e.resource_type,u.full_name,a.employee_present ORDER BY a.created_at DESC`;
     const { rows } = await pool.query(q, params);
     res.json(rows);
@@ -579,7 +600,18 @@ app.post('/api/audits', auth, async (req, res) => {
 // NCR
 app.get('/api/ncr', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query(`SELECT n.*,e.full_name as employee_name,e.employee_number,e.national_id as employee_national_id,e.project,p.name as ppe_name,p.category,u.full_name as audited_by_name FROM ncr_items n JOIN employees e ON e.id=n.employee_id JOIN ppe_items p ON p.id=n.ppe_item_id LEFT JOIN audit_items ai ON ai.id=n.audit_item_id LEFT JOIN audits a ON a.id=ai.audit_id LEFT JOIN users u ON u.id=a.audited_by ORDER BY n.created_at DESC`);
+    let ncrRows;
+    const ncrProjects = getProjectFilter(req.user);
+    if (ncrProjects !== null && ncrProjects.length === 0) {
+      ncrRows = [];
+    } else {
+      let ncrQ = `SELECT n.*,e.full_name as employee_name,e.employee_number,e.national_id as employee_national_id,e.project,p.name as ppe_name,p.category,u.full_name as audited_by_name FROM ncr_items n JOIN employees e ON e.id=n.employee_id JOIN ppe_items p ON p.id=n.ppe_item_id LEFT JOIN audit_items ai ON ai.id=n.audit_item_id LEFT JOIN audits a ON a.id=ai.audit_id LEFT JOIN users u ON u.id=a.audited_by WHERE 1=1`;
+      const ncrParams = [];
+      if (ncrProjects !== null) { ncrParams.push(ncrProjects); ncrQ += ` AND e.project = ANY($${ncrParams.length})`; }
+      ncrQ += ` ORDER BY n.created_at DESC`;
+      const { rows: _ncrRows } = await pool.query(ncrQ, ncrParams);
+      ncrRows = _ncrRows;
+    }
     res.json(rows);
   } catch(e) { console.error("PUT users error:", e.message); res.status(500).json({ error: e.message }); }
 });
@@ -726,7 +758,13 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
         END,
         r.date_flagged DESC
     `);
-    res.json(rows);
+    const ppeProjects = getProjectFilter(req.user);
+    let filteredRows = rows;
+    if (ppeProjects !== null) {
+      if (ppeProjects.length === 0) filteredRows = [];
+      else filteredRows = rows.filter(r => ppeProjects.includes(r.project));
+    }
+    res.json(filteredRows);
   } catch(e) { console.error('PPE requests error:', e.message); res.status(500).json({ error: e.message }); }
 });
 
@@ -1025,7 +1063,7 @@ app.get('/api/graphs', auth, async (req, res) => {
 
 app.get('/api/users', auth, async (req, res) => {
   if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
-  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, created_at FROM users ORDER BY created_at DESC');
+  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, created_at FROM users ORDER BY created_at DESC');
   res.json(rows);
 });
 
@@ -1050,17 +1088,17 @@ app.post('/api/users', auth, async (req, res) => {
 // PUT update user (admin only)
 app.put('/api/users/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  const { full_name, email, role, is_active, password, profile_picture } = req.body;
+  const { full_name, email, role, is_active, password, profile_picture, project_access } = req.body;
   try {
     if (password) {
       const hash = await bcrypt.hash(password, 10);
-      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, password_hash=$5, profile_picture=$6, updated_at=NOW() WHERE id=$7',
-        [full_name, email, role, is_active, hash, profile_picture || null, req.params.id]);
+      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, password_hash=$5, profile_picture=$6, project_access=$7, updated_at=NOW() WHERE id=$8',
+        [full_name, email, role, is_active, hash, profile_picture || null, project_access || [], req.params.id]);
     } else {
-      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, profile_picture=$5, updated_at=NOW() WHERE id=$6',
-        [full_name, email, role, is_active, profile_picture || null, req.params.id]);
+      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, profile_picture=$5, project_access=$6, updated_at=NOW() WHERE id=$7',
+        [full_name, email, role, is_active, profile_picture || null, project_access || [], req.params.id]);
     }
-    const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture FROM users WHERE id=$1', [req.params.id]);
+    const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access FROM users WHERE id=$1', [req.params.id]);
     res.json(rows[0]);
   } catch(e) { console.error("PUT users error:", e.message); res.status(500).json({ error: e.message }); }
 });

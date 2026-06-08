@@ -136,6 +136,14 @@ async function setupDB() {
         ppe_item_id UUID NOT NULL REFERENCES ppe_items(id) ON DELETE CASCADE,
         UNIQUE(employee_id, ppe_item_id)
       );
+      
+      CREATE TABLE IF NOT EXISTS locations (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL UNIQUE,
+        active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
       CREATE TABLE IF NOT EXISTS sync_log (
         id SERIAL PRIMARY KEY,
         synced_at TIMESTAMPTZ DEFAULT NOW(),
@@ -518,8 +526,8 @@ app.get('/api/audits/leaderboard', auth, async (req, res) => {
 app.get('/api/audits/:id', auth, async (req, res) => {
   try {
     const { rows: [audit] } = await pool.query(`
-      SELECT a.*,e.full_name as employee_name,e.employee_number,e.national_id,e.department,e.project,e.job_title,e.client,e.organization,e.resource_type,u.full_name as audited_by_name
-      FROM audits a JOIN employees e ON e.id=a.employee_id JOIN users u ON u.id=a.audited_by
+      SELECT a.*,e.full_name as employee_name,e.employee_number,e.national_id,e.department,e.project,e.job_title,e.client,e.organization,e.resource_type,u.full_name as audited_by_name,l.name as location_name
+      FROM audits a JOIN employees e ON e.id=a.employee_id JOIN users u ON u.id=a.audited_by LEFT JOIN locations l ON l.id=a.location_id
       WHERE a.id=$1
     `, [req.params.id]);
     if (!audit) return res.status(404).json({ error: 'Not found' });
@@ -533,14 +541,14 @@ app.get('/api/audits/:id', auth, async (req, res) => {
 });
 
 app.post('/api/audits', auth, async (req, res) => {
-  const { employee_id, audit_date, notes, items, audited_by_override, employee_present } = req.body;
+  const { employee_id, audit_date, notes, items, audited_by_override, employee_present, location_id } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const hasIssues = items.some(i => i.condition !== 'good');
     const allBad = items.every(i => i.condition !== 'good');
     const overall_status = !hasIssues ? 'compliant' : allBad ? 'non_compliant' : 'partial';
-    const { rows: [audit] } = await client.query(`INSERT INTO audits (employee_id,audited_by,audit_date,overall_status,notes,employee_present) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`, [employee_id, audited_by_override || req.user.id, audit_date || new Date(), overall_status, notes, employee_present !== false]);
+    const { rows: [audit] } = await client.query(`INSERT INTO audits (employee_id,audited_by,audit_date,overall_status,notes,employee_present,location_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`, [employee_id, audited_by_override || req.user.id, audit_date || new Date(), overall_status, notes, employee_present !== false, location_id || null]);
     for (const item of items) {
       const { rows: [ai] } = await client.query(`INSERT INTO audit_items (audit_id,ppe_item_id,condition,size_value,comment) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [audit.id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null]);
       if (item.condition === 'not_good') {
@@ -787,6 +795,56 @@ app.get('/api/sync-log/latest', auth, async (req, res) => {
 
 // Start
 const PORT = 8080;
+
+// ── Locations ──────────────────────────────────────────────
+app.get('/api/locations', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM locations WHERE active=TRUE ORDER BY name ASC');
+    res.json(rows);
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
+app.post('/api/locations', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { name } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Name required' });
+  try {
+    const { rows: [loc] } = await pool.query(
+      'INSERT INTO locations (name) VALUES ($1) RETURNING *', [name.trim()]
+    );
+    res.json(loc);
+  } catch(e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Location already exists' });
+    console.error(e); res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.put('/api/locations/:id', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { name, active } = req.body;
+  try {
+    const { rows: [loc] } = await pool.query(
+      'UPDATE locations SET name=COALESCE($1,name), active=COALESCE($2,active) WHERE id=$3 RETURNING *',
+      [name?.trim() || null, active !== undefined ? active : null, req.params.id]
+    );
+    if (!loc) return res.status(404).json({ error: 'Not found' });
+    res.json(loc);
+  } catch(e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'Location name already exists' });
+    console.error(e); res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.delete('/api/locations/:id', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    const { rows } = await pool.query('SELECT COUNT(*) FROM audits WHERE location_id=$1', [req.params.id]);
+    if (parseInt(rows[0].count) > 0) return res.status(400).json({ error: 'Cannot delete: location is used in existing audits. Deactivate it instead.' });
+    await pool.query('DELETE FROM locations WHERE id=$1', [req.params.id]);
+    res.json({ success: true });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
 setupDB().then(() => {
   
 // ── Cloudinary Setup ────────────────────────────────────────

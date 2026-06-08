@@ -845,6 +845,27 @@ app.delete('/api/locations/:id', auth, async (req, res) => {
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
+
+app.post('/api/admin/seed-locations', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    await pool.query(`
+      INSERT INTO locations (name) VALUES
+        ('Bomet'),('Chogoria'),('Coast Hola'),('Dadaab'),('Eldoret'),
+        ('Elwak'),('Embu'),('Garissa'),('Karatina'),('Kericho'),
+        ('Kitale'),('Lodwar'),('Makutano'),('Mandera'),('Marsabit 1'),
+        ('Marsabit 2'),('Maua'),('Meru'),('Modogashe'),('Moyale'),
+        ('Murang''a'),('Mutu'),('Mwea'),('Mwingi'),('Nairobi'),
+        ('Nakuru'),('Nanyuki'),('Narok'),('Naivasha'),('North Horr'),
+        ('Nyahururu'),('Nyeri'),('Takaba'),('Thika'),('Wajir 1'),
+        ('Wajir 2')
+      ON CONFLICT (name) DO NOTHING
+    `);
+    const { rows } = await pool.query('SELECT COUNT(*) FROM locations');
+    res.json({ success: true, count: rows[0].count });
+  } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
+});
+
 setupDB().then(() => {
   
 // ── Cloudinary Setup ────────────────────────────────────────

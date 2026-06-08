@@ -151,6 +151,9 @@ async function setupDB() {
       );
     `);
 
+    // Ensure location_id column exists on audits
+    await client.query('ALTER TABLE audits ADD COLUMN IF NOT EXISTS location_id INTEGER REFERENCES locations(id)');
+
     // Seed PPE items if empty
     const { rowCount } = await client.query('SELECT id FROM ppe_items LIMIT 1');
     if (rowCount === 0) {

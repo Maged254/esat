@@ -745,14 +745,12 @@ app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
     if (status === 'ehs_purchase_requested') extraFields = ', date_purchase_requested=NOW(), purchase_requested_by=$3';
     if (status === 'scm_ordered') extraFields = ', date_ordered=NOW(), ordered_by=$3';
     if (status === 'warehouse_available') extraFields = ', date_available=NOW(), available_by=$3, date_ordered=COALESCE(date_ordered,NOW()), ordered_by=COALESCE(ordered_by,$3)';
+    if (extraFields.includes('$3')) extraParams.push(req.user.id);
     if (status === 'distributed') {
       extraFields = ', date_distributed=NOW(), distributed_by=$3, date_available=COALESCE(date_available,NOW()), available_by=COALESCE(available_by,$3), date_ordered=COALESCE(date_ordered,NOW()), ordered_by=COALESCE(ordered_by,$3)';
-      if (distribution_method) extraFields += ', distribution_method=$4';
-      if (distribution_method && courier_tracking_number) extraFields += ', courier_tracking_number=$5';
+      if (distribution_method) { extraFields += ', distribution_method=$4'; extraParams.push(distribution_method); }
+      if (distribution_method && courier_tracking_number) { extraFields += ', courier_tracking_number=$5'; extraParams.push(courier_tracking_number); }
     }
-    if (extraFields.includes('$4') && !extraParams.includes(distribution_method)) extraParams.push(distribution_method);
-    if (extraFields.includes('$5') && !extraParams.includes(courier_tracking_number)) extraParams.push(courier_tracking_number);
-    if (extraFields.includes('$3')) extraParams.push(req.user.id);
     const { rows: [r] } = await client.query(
       'UPDATE ppe_requests SET status=$1' + extraFields + ', updated_at=NOW() WHERE id=$2 RETURNING *',
       extraParams

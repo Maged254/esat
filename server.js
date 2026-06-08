@@ -151,6 +151,10 @@ async function setupDB() {
       );
     `);
 
+    // Ensure distribution columns exist on ppe_requests
+    await client.query('ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS distribution_method VARCHAR(50)');
+    await client.query('ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS courier_tracking_number VARCHAR(200)');
+
     // Ensure location_id column exists on audits
     await client.query('ALTER TABLE audits ADD COLUMN IF NOT EXISTS location_id INTEGER REFERENCES locations(id)');
 
@@ -727,7 +731,7 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
 });
 
 app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
-  const { status } = req.body;
+  const { status, distribution_method, courier_tracking_number } = req.body;
   const allowedRoles = ['admin', 'scm_officer', 'ehs_manager'];
   if (!allowedRoles.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
   if (req.user.role === 'scm_officer' && ['pending', 'ehs_purchase_requested'].includes(status)) {
@@ -741,7 +745,13 @@ app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
     if (status === 'ehs_purchase_requested') extraFields = ', date_purchase_requested=NOW(), purchase_requested_by=$3';
     if (status === 'scm_ordered') extraFields = ', date_ordered=NOW(), ordered_by=$3';
     if (status === 'warehouse_available') extraFields = ', date_available=NOW(), available_by=$3, date_ordered=COALESCE(date_ordered,NOW()), ordered_by=COALESCE(ordered_by,$3)';
-    if (status === 'distributed') extraFields = ', date_distributed=NOW(), distributed_by=$3, date_available=COALESCE(date_available,NOW()), available_by=COALESCE(available_by,$3), date_ordered=COALESCE(date_ordered,NOW()), ordered_by=COALESCE(ordered_by,$3)';
+    if (status === 'distributed') {
+      extraFields = ', date_distributed=NOW(), distributed_by=$3, date_available=COALESCE(date_available,NOW()), available_by=COALESCE(available_by,$3), date_ordered=COALESCE(date_ordered,NOW()), ordered_by=COALESCE(ordered_by,$3)';
+      if (distribution_method) extraFields += ', distribution_method=$4';
+      if (distribution_method && courier_tracking_number) extraFields += ', courier_tracking_number=$5';
+    }
+    if (extraFields.includes('$4') && !extraParams.includes(distribution_method)) extraParams.push(distribution_method);
+    if (extraFields.includes('$5') && !extraParams.includes(courier_tracking_number)) extraParams.push(courier_tracking_number);
     if (extraFields.includes('$3')) extraParams.push(req.user.id);
     const { rows: [r] } = await client.query(
       'UPDATE ppe_requests SET status=$1' + extraFields + ', updated_at=NOW() WHERE id=$2 RETURNING *',

@@ -698,10 +698,13 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
         u1.full_name as purchase_requested_by_name,
         u2.full_name as ordered_by_name,
         u3.full_name as available_by_name,
-        u4.full_name as distributed_by_name
+        u4.full_name as distributed_by_name,
+        l.name as location_name
       FROM ppe_requests r
       JOIN employees e ON e.id=r.employee_id
       JOIN ppe_items p ON p.id=r.ppe_item_id
+      LEFT JOIN audits a ON a.id=(SELECT ai2.audit_id FROM audit_items ai2 JOIN ncr_items n2 ON n2.audit_item_id=ai2.id WHERE n2.id=r.ncr_item_id LIMIT 1)
+      LEFT JOIN locations l ON l.id=a.location_id
       LEFT JOIN users u0 ON u0.id=r.flagged_by
       LEFT JOIN users u1 ON u1.id=r.purchase_requested_by
       LEFT JOIN users u2 ON u2.id=r.ordered_by

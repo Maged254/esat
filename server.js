@@ -547,6 +547,7 @@ app.get('/api/audits/leaderboard', auth, async (req, res) => {
       LEFT JOIN audits a ON a.audited_by = u.id
       WHERE u.is_active = true
         AND u.email NOT IN ('admin@egypro.com', 'sync@egypro.com')
+        AND u.role != 'scm_officer'
       GROUP BY u.id
       ORDER BY total_audits DESC
     `);

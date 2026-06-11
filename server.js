@@ -615,8 +615,8 @@ app.get('/api/ncr', auth, async (req, res) => {
       const { rows: _ncrRows } = await pool.query(ncrQ, ncrParams);
       ncrRows = _ncrRows;
     }
-    res.json(rows);
-  } catch(e) { console.error("PUT users error:", e.message); res.status(500).json({ error: e.message }); }
+    res.json(ncrRows);
+  } catch(e) { console.error('NCR error:', e.message); res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/ncr/stats', auth, async (req, res) => {

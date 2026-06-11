@@ -151,6 +151,9 @@ async function setupDB() {
       );
     `);
 
+    // Ensure quantity column exists on audit_items
+    await client.query('ALTER TABLE audit_items ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 1');
+
     // Ensure project_access column exists on users
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS project_access TEXT[] DEFAULT '{}'");
 
@@ -578,7 +581,7 @@ app.post('/api/audits', auth, async (req, res) => {
     const overall_status = !hasIssues ? 'compliant' : allBad ? 'non_compliant' : 'partial';
     const { rows: [audit] } = await client.query(`INSERT INTO audits (employee_id,audited_by,audit_date,overall_status,notes,employee_present,location_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`, [employee_id, audited_by_override || req.user.id, audit_date || new Date(), overall_status, notes, employee_present !== false, location_id || null]);
     for (const item of items) {
-      const { rows: [ai] } = await client.query(`INSERT INTO audit_items (audit_id,ppe_item_id,condition,size_value,comment) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [audit.id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null]);
+      const { rows: [ai] } = await client.query(`INSERT INTO audit_items (audit_id,ppe_item_id,condition,size_value,comment,quantity) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`, [audit.id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null, item.quantity || 1]);
       if (item.condition === 'not_good') {
         // Skip if open PPE request already exists for this employee + PPE item
         const { rows: existing } = await client.query(

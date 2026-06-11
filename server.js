@@ -924,6 +924,112 @@ app.post('/api/admin/seed-locations', auth, async (req, res) => {
   } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
 
+
+app.post('/api/admin/replace-ppe-items', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: 'No token' });
+  const jwt = require('jsonwebtoken');
+  let user;
+  try { user = jwt.verify(authHeader.split(' ')[1], JWT_SECRET); } catch { return res.status(401).json({ error: 'Invalid token' }); }
+  if (user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM employee_ppe_assignments');
+    await client.query('DELETE FROM ppe_items');
+    await client.query(`
+      INSERT INTO ppe_items (name, category, has_size, size_type, sort_order, is_active) VALUES
+('Overall - EGYPRO Printed - With Reflective Straps - Blue', 'body_protection', true, 'clothing', 1, true),
+('Rain Coat - EGYPRO Printed', 'body_protection', true, 'clothing', 2, true),
+('Reflector Vest - (EN 471) - EGYPRO Printed', 'body_protection', true, 'clothing', 3, true),
+('Safety Gumboot - (EN 20345/6)', 'body_protection', true, 'shoe', 4, true),
+('Safety Shoes - (EN 20345) - PROTECTA (S3) - High Neck', 'body_protection', true, 'shoe', 5, true),
+('Safety Shoes - (EN 20345) - PROTECTA (S3) - Normal Neck', 'body_protection', true, 'shoe', 6, true),
+('Hand Gloves - (EN 388) - Basic Safety Protection', 'body_protection', false, NULL, 7, true),
+('Hand Gloves - (EN 388) - Impact Resistant', 'body_protection', false, NULL, 8, true),
+('Hand Gloves - Leather Size 14 - Cable Pulling', 'body_protection', false, NULL, 9, true),
+('Chin Strap (Helmet)', 'body_protection', false, NULL, 10, true),
+('Earmuff - (EN 352)', 'body_protection', false, NULL, 11, true),
+('Eye Protection Goggles - (EN 166)', 'body_protection', false, NULL, 12, true),
+('Respirator Half Mask', 'body_protection', false, NULL, 13, true),
+('Safety Helmet - (EN 397) - Blue', 'body_protection', false, NULL, 14, true),
+('Safety Helmet - (EN 397) - White', 'body_protection', false, NULL, 15, true),
+('WAH Helmet - (EN 397) - White', 'body_protection', false, NULL, 16, true),
+('Book - Fuel Truck Checklist - Egypro/Huawei', 'documentation_safety_signage', false, NULL, 17, true),
+('Book - Fuel Truck Checklist - Egypro/SFC', 'documentation_safety_signage', false, NULL, 18, true),
+('Book - Vehicle Checklist', 'documentation_safety_signage', false, NULL, 19, true),
+('Book - EHS - Egypro/Huawei', 'documentation_safety_signage', false, NULL, 20, true),
+('Book - EHS - Egypro/SFC', 'documentation_safety_signage', false, NULL, 21, true),
+('EHS Absolute Rules - A4 - Laminated Sign', 'documentation_safety_signage', false, NULL, 22, true),
+('Reflective Tape 2in (5cm width) 50m - Self Adhesive - White 3M', 'documentation_safety_signage', false, NULL, 23, true),
+('Safety Banner - Egypro/Huawei 1m X 1m', 'documentation_safety_signage', false, NULL, 24, true),
+('Safety Banner - Emergency Assembly Point 1m X 1m', 'documentation_safety_signage', false, NULL, 25, true),
+('Safety Banner - Safety Points 1m X 1m', 'documentation_safety_signage', false, NULL, 26, true),
+('Sign - Men At work With Speed Limit - Egypro/SFC - Metal', 'documentation_safety_signage', false, NULL, 27, true),
+('Body Harness - (EN 813)', 'fall_protection', false, NULL, 28, true),
+('Climber Straps', 'fall_protection', false, NULL, 29, true),
+('Climbers - Concrete Pole - Adjustable - with Rubber Grip', 'fall_protection', false, NULL, 30, true),
+('Climbers - Wooden Pole - Adjustable - Spikes Size 8.5', 'fall_protection', false, NULL, 31, true),
+('Double Lanyard with shock absorber - (EN 362) or (EN 355) or (EN 354)', 'fall_protection', false, NULL, 32, true),
+('Work Positioning Lanyard with grip adjuster - (EN 358)', 'fall_protection', false, NULL, 33, true),
+('Anchorage Sling - (EN 566) - 1.5m', 'fall_protection', false, NULL, 34, true),
+('Non Return Pulley System - (EN 567)', 'fall_protection', false, NULL, 35, true),
+('Rescue Kit', 'fall_protection', false, NULL, 36, true),
+('Safety Rope - (EN 1891:1998) - 100m', 'fall_protection', false, NULL, 37, true),
+('Safety Rope - (EN 1891:1998) - 200m', 'fall_protection', false, NULL, 38, true),
+('Safety Rope - (EN 1891:1998) - 25m', 'fall_protection', false, NULL, 39, true),
+('Waist Tool Bag', 'fall_protection', false, NULL, 40, true),
+('Ladder - Foldable - Fiber Glass - 4X3 Steps - (3.7m)', 'general_safety', false, NULL, 41, true),
+('Ladder - Foldable - Fiber Glass - 4X4 Steps - (4.7m)', 'general_safety', false, NULL, 42, true),
+('Ladder - Foldable - Fiber Glass - 4X5 Steps - (6.6m)', 'general_safety', false, NULL, 43, true),
+('Ladder - Foldable - Fiber Glass - 4X6 Steps - (7.8m)', 'general_safety', false, NULL, 44, true),
+('Jerrycan - Fuel - Metal - 20 Litres', 'general_safety', false, NULL, 45, true),
+('Jerrycan - Transparent - Water - Plastic - 20 Litres', 'general_safety', false, NULL, 46, true),
+('Fire Extinguisher - 6KG - Dry Powder With Inspection Sticker', 'general_safety', false, NULL, 47, true),
+('First Aid Kit - Category A - Small', 'general_safety', false, NULL, 48, true),
+('First Aid Kit - Category B - Medium', 'general_safety', false, NULL, 49, true),
+('First Aid Kit - Category C - Large', 'general_safety', false, NULL, 50, true),
+('Flag - Green', 'general_safety', false, NULL, 51, true),
+('Flag - Red', 'general_safety', false, NULL, 52, true),
+('Life Saver Triangle (Road Safety Reflective Warning Triangle) - Pair', 'general_safety', false, NULL, 53, true),
+('Tent - 30mm Aluminum - (3m x 3m) - Roof Only - Gazebo', 'general_safety', false, NULL, 54, true),
+('Cones - Reflector strap - 70cm', 'general_safety', false, NULL, 55, true),
+('Safety Net - 1m X 50m - Orange', 'general_safety', false, NULL, 56, true),
+('Crimping Tool - RJ45', 'maintenance_tools', false, NULL, 57, true),
+('Hacksaw Frame - Size 300mm/12in - INGCO (HHFS3068)', 'maintenance_tools', false, NULL, 58, true),
+('Hammer - Claw - Fiberglass handle - Weight 450g - INGCO (HCH81016)', 'maintenance_tools', false, NULL, 59, true),
+('Hex Allen Key - 9pcs Set - Long Arm - INGCO (HHK11091)', 'maintenance_tools', false, NULL, 60, true),
+('Torx (Star) Allen Key - 9pcs Set - Long Arm - INGCO (HHK13091)', 'maintenance_tools', false, NULL, 61, true),
+('Cutting Pliers 7in - 1000V Insulated - INGCO (HIHDCP28188)', 'maintenance_tools', false, NULL, 62, true),
+('Hand Tools Set - 16pcs - 1000V Insulated - INGCO (HKISPA0702)', 'maintenance_tools', false, NULL, 63, true),
+('Insulated Adjustable Wrench / Spanner 10in - INGCO (HIADW101)', 'maintenance_tools', false, NULL, 64, true),
+('Spanner Wrench Set - 7pcs - 1000V Insulated - Open End - INGCO (HKISPA0701)', 'maintenance_tools', false, NULL, 65, true),
+('Spanner Wrench Set - 7pcs - 1000V Insulated - Ring End - INGCO (HKISPA0702)', 'maintenance_tools', false, NULL, 66, true),
+('Contactless AC voltage detector - UNI-T', 'maintenance_tools', false, NULL, 67, true),
+('High Pressure Washer - 2500W - 160BAR - 6L/MIN - 5m Hose - INGCO (HPWR25008)', 'maintenance_tools', false, NULL, 68, true),
+('Pressure Sprayer 2L - INGCO (HSPP20202)', 'maintenance_tools', false, NULL, 69, true),
+('Shield Microfibre Telescopic Wash Mop - 2m', 'maintenance_tools', false, NULL, 70, true),
+('Converter Plug Adapter (2 Pin to 3 Pin) 13Amp', 'maintenance_tools', false, NULL, 71, true),
+('Extension Cable Reel - 25 Meter - 2.5mm 3 Core', 'maintenance_tools', false, NULL, 72, true),
+('Blower Aspirator 650W - INGCO (AB6038)', 'maintenance_tools', false, NULL, 73, true),
+('Drilling Machine - Impact - INGCO (ID8108)', 'maintenance_tools', false, NULL, 74, true),
+('Heat Gun - 2000W - INGCO (HG200078)', 'maintenance_tools', false, NULL, 75, true),
+('Hand Gloves - (EN 60903) - 1KV - Rubber Electrical Insulating - Class 0', 'testing_measuring', false, NULL, 76, true),
+('Hand Gloves - (EN 60903) - 33KV - Rubber Electrical Insulating - Class 4', 'testing_measuring', false, NULL, 77, true),
+('Helmet Mounted High Voltage Detector - (HHVSB11) - Honeywell', 'testing_measuring', false, NULL, 78, true),
+('LOTOTO kit (Lockout, Tagout, Tryout)', 'testing_measuring', false, NULL, 79, true),
+('Digital Clamp Meter - AC/DC - Uni-T (UT203)', 'testing_measuring', false, NULL, 80, true),
+('KPLC Safety Instrument Test Kit - High Voltage Personal Alert, 50KV Handle, Conduit Adapter - SureTech', 'testing_measuring', false, NULL, 81, true),
+('Laser Distance Detector - 0.05-100m - INGCO (HLDD1008)', 'testing_measuring', false, NULL, 82, true),
+('Tel-O-Pole Measuring Stick - Fiberglass - 40FT', 'testing_measuring', false, NULL, 83, true)
+    `);
+    await client.query('COMMIT');
+    const { rows } = await client.query('SELECT COUNT(*) FROM ppe_items');
+    res.json({ success: true, count: rows[0].count });
+  } catch(e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: e.message }); }
+  finally { client.release(); }
+});
+
 setupDB().then(() => {
   
 // ── Cloudinary Setup ────────────────────────────────────────

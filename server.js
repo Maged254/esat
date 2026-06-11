@@ -738,7 +738,8 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
         u2.full_name as ordered_by_name,
         u3.full_name as available_by_name,
         u4.full_name as distributed_by_name,
-        l.name as location_name
+        l.name as location_name,
+        COALESCE((SELECT ai3.quantity FROM audit_items ai3 JOIN ncr_items n3 ON n3.audit_item_id=ai3.id WHERE n3.id=r.ncr_item_id LIMIT 1), 1) as quantity
       FROM ppe_requests r
       JOIN employees e ON e.id=r.employee_id
       JOIN ppe_items p ON p.id=r.ppe_item_id

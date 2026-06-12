@@ -1139,11 +1139,16 @@ app.post('/api/admin/test-scm-digest', auth, async (req, res) => {
           </td></tr></table>
           <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
             <p style="font-size: 15px; color: #374151;">Hello Supply Chain Team,</p>
-            <p style="font-size: 15px; color: #374151;">
-              You have <strong style="color: #0f2a4a;">${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong> 
-              awaiting action. The oldest item has been waiting for 
+            ${count > 0 ? `<p style="font-size: 15px; color: #374151;">
+              We have <strong style="color: #0f2a4a;">${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong>
+              to be ordered or to confirm availability. The oldest item has been waiting for
               <strong style="color: #e53e3e;">${oldestDays} day${oldestDays !== 1 ? 's' : ''}</strong>.
-            </p>
+            </p>` : ''}
+            ${orderedCount > 0 ? `<p style="font-size: 15px; color: #374151;">
+              And our Suppliers have <strong style="color: #0f2a4a;">${orderedCount} pending PPE/Tool item${orderedCount > 1 ? 's' : ''}</strong>
+              to be delivered to our warehouse. The oldest item has been waiting for
+              <strong style="color: #e53e3e;">${orderedOldestDays} day${orderedOldestDays !== 1 ? 's' : ''}</strong>.
+            </p>` : ''}
             <p style="font-size: 15px; color: #374151;">Please check the ESAT system to clear the pending list.</p>
             <a href="https://esat.egypro.app" 
               style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">

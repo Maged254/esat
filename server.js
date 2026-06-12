@@ -1067,7 +1067,7 @@ async function sendDailySCMDigest() {
       await resend.emails.send({
         from: 'ESAT <esat@egypro.app>',
         to: user.email,
-        subject: `ESAT Daily SCM — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
+        subject: `ESAT Daily SCM — ${count + orderedCount} Pending PPE/Tool Item${(count + orderedCount) > 1 ? 's' : ''} Awaiting Action`,
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
             <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
@@ -1131,7 +1131,7 @@ app.post('/api/admin/test-scm-digest', auth, async (req, res) => {
     await resend.emails.send({
       from: 'ESAT <esat@egypro.app>',
       to: 'e.maged@outlook.com',
-      subject: `ESAT Daily SCM — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
+      subject: `ESAT Daily SCM — ${count + orderedCount} Pending PPE/Tool Item${(count + orderedCount) > 1 ? 's' : ''} Awaiting Action`,
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
           <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px; background-color: #ffffff !important;">
@@ -1142,12 +1142,12 @@ app.post('/api/admin/test-scm-digest', auth, async (req, res) => {
             ${count > 0 ? `<p style="font-size: 15px; color: #374151;">
               We have <strong style="color: #0f2a4a;">${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong>
               to be ordered or to confirm availability. The oldest item has been waiting for
-              <strong style="color: #e53e3e;">${oldestDays} day${oldestDays !== 1 ? 's' : ''}</strong>.
+              <strong style="color: ${oldestDays > 0 ? '#e53e3e' : '#374151'};">${oldestDays} day${oldestDays !== 1 ? 's' : ''}</strong>.
             </p>` : ''}
             ${orderedCount > 0 ? `<p style="font-size: 15px; color: #374151;">
               And our Suppliers have <strong style="color: #0f2a4a;">${orderedCount} pending PPE/Tool item${orderedCount > 1 ? 's' : ''}</strong>
               to be delivered to our warehouse. The oldest item has been waiting for
-              <strong style="color: #e53e3e;">${orderedOldestDays} day${orderedOldestDays !== 1 ? 's' : ''}</strong>.
+              <strong style="color: ${orderedOldestDays > 0 ? '#e53e3e' : '#374151'};">${orderedOldestDays} day${orderedOldestDays !== 1 ? 's' : ''}</strong>.
             </p>` : ''}
             <p style="font-size: 15px; color: #374151;">Please check the ESAT system to clear the pending list.</p>
             <a href="https://esat.egypro.app" 

@@ -1064,8 +1064,8 @@ async function sendDailySCMDigest() {
         subject: `ESAT Daily SCM — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
-            <div style="background: #0f2a4a; padding: 16px 24px; border-radius: 8px 8px 0 0;">
-              <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" style="height:40px;margin-bottom:4px;" /><br/><h2 style="color: white; margin: 4px 0 0; font-size: 18px;">ESAT Daily SCM</h2>
+            <div style="background: #ffffff; padding: 16px 24px; border-radius: 8px 8px 0 0; text-align:center; border: 1px solid #e5e7eb; border-bottom: 2px solid #0f2a4a;">
+              <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" style="height:50px;" />
             </div>
             <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
               <p style="font-size: 15px; color: #374151;">Hello Supply Chain Team,</p>
@@ -1080,9 +1080,6 @@ async function sendDailySCMDigest() {
                 Open ESAT
               </a>
               <p style="font-size: 14px; color: #374151; margin-top: 24px;">Thanks,<br/>Maged Ezzat</p>
-              <p style="font-size: 12px; color: #9ca3af; margin-top: 8px;">
-                This is an automated message from ESAT — Egypro Safety Audit Tracker.
-              </p>
             </div>
           </div>
         `
@@ -1125,9 +1122,8 @@ app.post('/api/admin/test-scm-digest', auth, async (req, res) => {
       subject: `ESAT Daily SCM — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
-          <div style="background: #0f2a4a; padding: 16px 24px; border-radius: 8px 8px 0 0; text-align:center;">
-            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" style="height:40px;margin-bottom:4px;" /><br/>
-            <h2 style="color: white; margin: 4px 0 0; font-size: 18px;">ESAT Daily SCM</h2>
+          <div style="background: #ffffff; padding: 16px 24px; border-radius: 8px 8px 0 0; text-align:center; border: 1px solid #e5e7eb; border-bottom: 2px solid #0f2a4a;">
+            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" style="height:50px;" />
           </div>
           <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
             <p style="font-size: 15px; color: #374151;">Hello Supply Chain Team,</p>
@@ -1142,9 +1138,6 @@ app.post('/api/admin/test-scm-digest', auth, async (req, res) => {
               Open ESAT
             </a>
             <p style="font-size: 14px; color: #374151; margin-top: 24px;">Thanks,<br/>Maged Ezzat</p>
-            <p style="font-size: 12px; color: #9ca3af; margin-top: 8px;">
-              This is an automated message from ESAT — Egypro Safety Audit Tracker.
-            </p>
           </div>
         </div>
       `

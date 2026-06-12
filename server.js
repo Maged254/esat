@@ -1064,7 +1064,7 @@ async function sendDailySCMDigest() {
         subject: `ESAT Daily SCM — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
-            <div style="background: #ffffff; padding: 16px 24px; border-radius: 8px 8px 0 0; text-align:center; border: 1px solid #e5e7eb; border-bottom: 2px solid #0f2a4a;">
+            <div style="background: #ffffff !important; padding: 16px 24px; border-radius: 8px 8px 0 0; text-align:center; border: 1px solid #e5e7eb; border-bottom: 2px solid #0f2a4a;" bgcolor="#ffffff">
               <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" style="height:50px;" />
             </div>
             <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
@@ -1122,7 +1122,7 @@ app.post('/api/admin/test-scm-digest', auth, async (req, res) => {
       subject: `ESAT Daily SCM — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
-          <div style="background: #ffffff; padding: 16px 24px; border-radius: 8px 8px 0 0; text-align:center; border: 1px solid #e5e7eb; border-bottom: 2px solid #0f2a4a;">
+          <div style="background: #ffffff !important; padding: 16px 24px; border-radius: 8px 8px 0 0; text-align:center; border: 1px solid #e5e7eb; border-bottom: 2px solid #0f2a4a;" bgcolor="#ffffff">
             <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" style="height:50px;" />
           </div>
           <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">

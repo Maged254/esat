@@ -1061,25 +1061,26 @@ async function sendDailySCMDigest() {
       await resend.emails.send({
         from: 'ESAT <esat@egypro.app>',
         to: user.email,
-        subject: `ESAT — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Your Action`,
+        subject: `ESAT Daily SCM — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
             <div style="background: #0f2a4a; padding: 16px 24px; border-radius: 8px 8px 0 0;">
-              <h2 style="color: white; margin: 0; font-size: 18px;">ESAT Daily Digest</h2>
+              <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" style="height:40px;margin-bottom:4px;" /><br/><h2 style="color: white; margin: 4px 0 0; font-size: 18px;">ESAT Daily SCM</h2>
             </div>
             <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
-              <p style="font-size: 15px; color: #374151;">Hi ${user.full_name},</p>
+              <p style="font-size: 15px; color: #374151;">Hello Supply Chain Team,</p>
               <p style="font-size: 15px; color: #374151;">
-                You have <strong style="color: #0f2a4a;">${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong> 
-                awaiting your action. The oldest item has been waiting for 
+                You have <strong style="color: #0f2a4a;">${count} SCM pending PPE/Tool item${count > 1 ? 's' : ''}</strong> 
+                awaiting action. The oldest item has been waiting for 
                 <strong style="color: #e53e3e;">${oldestDays} day${oldestDays !== 1 ? 's' : ''}</strong>.
               </p>
-              <p style="font-size: 15px; color: #374151;">Please check the ESAT system to clear the pending list.</p>
+              <p style="font-size: 15px; color: #374151;">Please check the ESAT system to clear the SCM pending list.</p>
               <a href="https://esat.egypro.app" 
                 style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">
                 Open ESAT
               </a>
-              <p style="font-size: 12px; color: #9ca3af; margin-top: 24px;">
+              <p style="font-size: 14px; color: #374151; margin-top: 24px;">Thanks,<br/>Maged Ezzat</p>
+              <p style="font-size: 12px; color: #9ca3af; margin-top: 8px;">
                 This is an automated message from ESAT — Egypro Safety Audit Tracker.
               </p>
             </div>
@@ -1121,7 +1122,7 @@ app.post('/api/admin/test-scm-digest', auth, async (req, res) => {
     await resend.emails.send({
       from: 'ESAT <esat@egypro.app>',
       to: 'e.maged@outlook.com',
-      subject: `[TEST] ESAT — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
+      subject: `ESAT Daily SCM — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
           <div style="background: #0f2a4a; padding: 16px 24px; border-radius: 8px 8px 0 0;">

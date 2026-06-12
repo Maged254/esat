@@ -245,10 +245,15 @@ const auth = (req, res, next) => {
 
 // ── Project access helper ────────────────────────────────────
 const RESTRICTED_ROLES = ['ehs_officer', 'supervisor', 'scm_officer'];
-const getProjectFilter = (user) => {
+const getProjectFilter = async (user) => {
   if (!RESTRICTED_ROLES.includes(user.role)) return null; // unrestricted
   const projects = user.project_access || [];
-  return projects; // empty array = sees nothing
+  if (projects.length === 0) return []; // no access
+  // Check if user has all projects
+  const { rows } = await pool.query("SELECT ARRAY_AGG(DISTINCT project) as all_projects FROM employees WHERE project IS NOT NULL");
+  const allProjects = rows[0].all_projects || [];
+  if (allProjects.every(p => projects.includes(p))) return null; // has all projects = unrestricted
+  return projects;
 };
 
 // ── Routes ───────────────────────────────────────────────────
@@ -331,7 +336,7 @@ app.get('/api/employees', auth, async (req, res) => {
     if (job_title) { params.push(`%${job_title}%`); q += ` AND e.job_title ILIKE $${params.length}`; }
     if (department) { params.push(department); q += ` AND e.department=$${params.length}`; }
     if (resource_type) { params.push(resource_type); q += ` AND e.resource_type=$${params.length}`; }
-    const empProjects = getProjectFilter(req.user);
+    const empProjects = await getProjectFilter(req.user);
     if (empProjects !== null) {
       if (empProjects.length === 0) { return res.json([]); }
       params.push(empProjects); q += ` AND e.project = ANY($${params.length})`;
@@ -490,7 +495,7 @@ app.get('/api/audits', auth, async (req, res) => {
     if (client) { params.push(client); q += ` AND e.client=$${params.length}`; }
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
     if (audited_by) { params.push(audited_by); q += ` AND a.audited_by=$${params.length}`; }
-    const auditProjects = getProjectFilter(req.user);
+    const auditProjects = await getProjectFilter(req.user);
     if (auditProjects !== null) {
       if (auditProjects.length === 0) { return res.json([]); }
       params.push(auditProjects); q += ` AND e.project = ANY($${params.length})`;
@@ -605,7 +610,7 @@ app.post('/api/audits', auth, async (req, res) => {
 app.get('/api/ncr', auth, async (req, res) => {
   try {
     let ncrRows;
-    const ncrProjects = getProjectFilter(req.user);
+    const ncrProjects = await getProjectFilter(req.user);
     if (ncrProjects !== null && ncrProjects.length === 0) {
       ncrRows = [];
     } else {
@@ -763,7 +768,7 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
         END,
         r.date_flagged DESC
     `);
-    const ppeProjects = getProjectFilter(req.user);
+    const ppeProjects = await getProjectFilter(req.user);
     let filteredRows = rows;
     if (ppeProjects !== null) {
       if (ppeProjects.length === 0) filteredRows = [];

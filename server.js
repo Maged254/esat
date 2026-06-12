@@ -1045,12 +1045,18 @@ async function sendDailySCMDigest() {
   try {
     const { rows: pending } = await pool.query(`
       SELECT COUNT(*) as count, MAX(CURRENT_DATE - date_flagged::date) as oldest_days
-      FROM ppe_requests
-      WHERE status = 'ehs_purchase_requested'
+      FROM ppe_requests WHERE status = 'ehs_purchase_requested'
     `);
     const count = parseInt(pending[0].count);
-    if (count === 0) return;
     const oldestDays = parseInt(pending[0].oldest_days) || 0;
+    const { rows: ordered } = await pool.query(`
+      SELECT COUNT(*) as count, MAX(CURRENT_DATE - date_ordered::date) as oldest_days
+      FROM ppe_requests WHERE status = 'scm_ordered'
+    `);
+    const orderedCount = parseInt(ordered[0].count);
+    const orderedOldestDays = parseInt(ordered[0].oldest_days) || 0;
+
+    if (count === 0 && orderedCount === 0) return;
 
     const { rows: scmUsers } = await pool.query(
       "SELECT email, full_name FROM users WHERE role = 'scm_officer' AND is_active = true"
@@ -1116,6 +1122,12 @@ app.post('/api/admin/test-scm-digest', auth, async (req, res) => {
     `);
     const count = parseInt(pending[0].count);
     const oldestDays = parseInt(pending[0].oldest_days) || 0;
+    const { rows: ordered } = await pool.query(`
+      SELECT COUNT(*) as count, MAX(CURRENT_DATE - date_ordered::date) as oldest_days
+      FROM ppe_requests WHERE status = 'scm_ordered'
+    `);
+    const orderedCount = parseInt(ordered[0].count);
+    const orderedOldestDays = parseInt(ordered[0].oldest_days) || 0;
     await resend.emails.send({
       from: 'ESAT <esat@egypro.app>',
       to: 'e.maged@outlook.com',
@@ -1142,7 +1154,7 @@ app.post('/api/admin/test-scm-digest', auth, async (req, res) => {
         </div>
       `
     });
-    res.json({ success: true, count, oldestDays });
+    res.json({ success: true, count, oldestDays, orderedCount, orderedOldestDays });
   } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
 

@@ -1120,7 +1120,7 @@ app.post('/api/admin/test-scm-digest', auth, async (req, res) => {
     const oldestDays = parseInt(pending[0].oldest_days) || 0;
     await resend.emails.send({
       from: 'ESAT <esat@egypro.app>',
-      to: 'maged_ezzat@egypro.com',
+      to: 'e.maged@outlook.com',
       subject: `[TEST] ESAT — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">

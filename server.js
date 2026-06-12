@@ -1109,6 +1109,14 @@ function scheduleDailyDigest() {
   }, msUntil);
 }
 
+app.post('/api/admin/test-scm-digest', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    await sendDailySCMDigest();
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 setupDB().then(() => {
   
 // ── Cloudinary Setup ────────────────────────────────────────

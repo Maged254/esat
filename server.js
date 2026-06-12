@@ -1127,7 +1127,7 @@ async function sendDailyEHSDigest() {
               <p style="font-size: 15px; color: #374151;">Hello John,</p>
               <p style="font-size: 15px; color: #374151;">
                 We have <strong style="color: #0f2a4a;">${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong>
-                to be purchase requested. The oldest item has been waiting for
+                that require a purchase request. The oldest item has been waiting for
                 <strong style="color: ${oldestDays > 0 ? '#e53e3e' : '#374151'};">${oldestDays} day${oldestDays !== 1 ? 's' : ''}</strong>.
               </p>
               <p style="font-size: 15px; color: #374151;">Please check the ESAT system to clear the pending list.</p>
@@ -1185,7 +1185,7 @@ app.post('/api/admin/test-ehs-digest', auth, async (req, res) => {
             <p style="font-size: 15px; color: #374151;">Hello John,</p>
             <p style="font-size: 15px; color: #374151;">
               We have <strong style="color: #0f2a4a;">${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong>
-              to be purchase requested. The oldest item has been waiting for
+              that require a purchase request. The oldest item has been waiting for
               <strong style="color: ${oldestDays > 0 ? '#e53e3e' : '#374151'};">${oldestDays} day${oldestDays !== 1 ? 's' : ''}</strong>.
             </p>
             <p style="font-size: 15px; color: #374151;">Please check the ESAT system to clear the pending list.</p>

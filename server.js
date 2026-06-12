@@ -1036,6 +1036,79 @@ app.post('/api/admin/replace-ppe-items', async (req, res) => {
   finally { client.release(); }
 });
 
+
+// ── Email / Resend ────────────────────────────────────────────
+const { Resend } = require('resend');
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+async function sendDailySCMDigest() {
+  try {
+    const { rows: pending } = await pool.query(`
+      SELECT COUNT(*) as count, MAX(CURRENT_DATE - date_flagged::date) as oldest_days
+      FROM ppe_requests
+      WHERE status = 'ehs_purchase_requested'
+    `);
+    const count = parseInt(pending[0].count);
+    if (count === 0) return;
+    const oldestDays = parseInt(pending[0].oldest_days) || 0;
+
+    const { rows: scmUsers } = await pool.query(
+      "SELECT email, full_name FROM users WHERE role = 'scm_officer' AND is_active = true"
+    );
+    if (scmUsers.length === 0) return;
+
+    for (const user of scmUsers) {
+      await resend.emails.send({
+        from: 'ESAT <esat@egypro.app>',
+        to: user.email,
+        subject: `ESAT — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Your Action`,
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
+            <div style="background: #0f2a4a; padding: 16px 24px; border-radius: 8px 8px 0 0;">
+              <h2 style="color: white; margin: 0; font-size: 18px;">ESAT Daily Digest</h2>
+            </div>
+            <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
+              <p style="font-size: 15px; color: #374151;">Hi ${user.full_name},</p>
+              <p style="font-size: 15px; color: #374151;">
+                You have <strong style="color: #0f2a4a;">${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong> 
+                awaiting your action. The oldest item has been waiting for 
+                <strong style="color: #e53e3e;">${oldestDays} day${oldestDays !== 1 ? 's' : ''}</strong>.
+              </p>
+              <p style="font-size: 15px; color: #374151;">Please check the ESAT system to clear the pending list.</p>
+              <a href="https://esat.egypro.app" 
+                style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">
+                Open ESAT
+              </a>
+              <p style="font-size: 12px; color: #9ca3af; margin-top: 24px;">
+                This is an automated message from ESAT — Egypro Safety Audit Tracker.
+              </p>
+            </div>
+          </div>
+        `
+      });
+    }
+    console.log('SCM digest sent to ' + scmUsers.length + ' user(s) — ' + count + ' pending items, oldest ' + oldestDays + ' days');
+  } catch(e) {
+    console.error('SCM digest error:', e.message);
+  }
+}
+
+// Schedule daily at 9am EAT (UTC+3 = 6am UTC)
+function scheduleDailyDigest() {
+  const now = new Date();
+  const next9am = new Date();
+  next9am.setUTCHours(6, 0, 0, 0);
+  if (next9am <= now) next9am.setUTCDate(next9am.getUTCDate() + 1);
+  const msUntil = next9am - now;
+  const h = Math.floor(msUntil / 3600000);
+  const m = Math.floor((msUntil % 3600000) / 60000);
+  console.log('SCM digest scheduled in ' + h + 'h ' + m + 'm');
+  setTimeout(() => {
+    sendDailySCMDigest();
+    setInterval(sendDailySCMDigest, 24 * 60 * 60 * 1000);
+  }, msUntil);
+}
+
 setupDB().then(() => {
   
 // ── Cloudinary Setup ────────────────────────────────────────

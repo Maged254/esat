@@ -1241,20 +1241,22 @@ async function sendDailyEHSDigest() {
   }
 }
 
-// Schedule daily at 9am EAT (UTC+3 = 6am UTC)
-function scheduleDailyDigest() {
+// Schedule daily digests
+function scheduleAt(utcHour, utcMin, label, fn) {
   const now = new Date();
-  const next9am = new Date();
-  next9am.setUTCHours(6, 0, 0, 0);
-  if (next9am <= now) next9am.setUTCDate(next9am.getUTCDate() + 1);
-  const msUntil = next9am - now;
-  const h = Math.floor(msUntil / 3600000);
-  const m = Math.floor((msUntil % 3600000) / 60000);
-  console.log('SCM digest scheduled in ' + h + 'h ' + m + 'm');
-  setTimeout(() => {
-    sendDailySCMDigest();
-    setInterval(sendDailySCMDigest, 24 * 60 * 60 * 1000);
-  }, msUntil);
+  const next = new Date();
+  next.setUTCHours(utcHour, utcMin, 0, 0);
+  if (next <= now) next.setUTCDate(next.getUTCDate() + 1);
+  const ms = next - now;
+  console.log(label + ' scheduled in ' + Math.floor(ms/3600000) + 'h ' + Math.floor((ms%3600000)/60000) + 'm');
+  setTimeout(() => { fn(); setInterval(fn, 24*60*60*1000); }, ms);
+}
+
+function scheduleDailyDigest() {
+  scheduleAt(5, 30, 'Fibre digest', sendDailyFibreDigest);  // 8:30am EAT
+  scheduleAt(5, 35, 'BTS digest', sendDailyBTSDigest);      // 8:35am EAT
+  scheduleAt(5, 45, 'EHS digest', sendDailyEHSDigest);      // 8:45am EAT
+  scheduleAt(6,  0, 'SCM digest', sendDailySCMDigest);      // 9:00am EAT
 }
 
 app.post('/api/admin/test-bts-digest', auth, async (req, res) => {

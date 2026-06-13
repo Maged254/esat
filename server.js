@@ -1452,7 +1452,7 @@ app.delete('/api/audit-documents/:id', auth, async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`ESAT running on port ${PORT}`));
+app.listen(PORT, () => { console.log(`ESAT running on port ${PORT}`); scheduleDailyDigest(); });
 });
 
 // ── User Management Routes ───────────────────────────────────

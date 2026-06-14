@@ -1275,6 +1275,7 @@ app.post('/api/admin/test-ehs-digest', auth, async (req, res) => {
     `);
     const count = parseInt(pending[0].count);
     const oldestDays = parseInt(pending[0].oldest_days) || 0;
+    if (count === 0) return res.json({ success: true, count, message: 'No pending items, email not sent' });
     await resend.emails.send({
       from: 'ESAT <esat@egypro.app>',
       to: 'e.maged@outlook.com',
@@ -1320,6 +1321,7 @@ app.post('/api/admin/test-scm-digest', auth, async (req, res) => {
     `);
     const orderedCount = parseInt(ordered[0].count);
     const orderedOldestDays = parseInt(ordered[0].oldest_days) || 0;
+    if (count === 0 && orderedCount === 0) return res.json({ success: true, count, orderedCount, message: 'No pending items, email not sent' });
     await resend.emails.send({
       from: 'ESAT <esat@egypro.app>',
       to: 'e.maged@outlook.com',

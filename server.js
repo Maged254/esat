@@ -737,7 +737,7 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT r.*,
-        e.full_name as employee_name, e.employee_number, e.national_id as employee_national_id, e.employment_status, e.project,
+        e.full_name as employee_name, e.employee_number, e.national_id as employee_national_id, e.employment_status, e.project, e.client,
         p.name as ppe_name, p.category,
         u0.full_name as flagged_by_name,
         u1.full_name as purchase_requested_by_name,

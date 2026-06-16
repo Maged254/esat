@@ -286,7 +286,7 @@ app.get('/api/dashboard', auth, async (req, res) => {
   try {
     const [emp, overdue, ncr, ncrCat, comp, delays, recent] = await Promise.all([
       pool.query(`SELECT COUNT(*) FILTER (WHERE employment_status='active') as active, COUNT(*) FILTER (WHERE employment_status='exit' AND exit_date >= date_trunc('year',NOW())) as exits_this_year FROM employees`),
-      pool.query(`SELECT COUNT(*) as overdue FROM employees e LEFT JOIN (SELECT employee_id, MAX(audit_date) as last_audit FROM audits GROUP BY employee_id) a ON e.id=a.employee_id WHERE e.employment_status='active' AND (a.last_audit IS NULL OR CURRENT_DATE - a.last_audit > 30)`),
+      pool.query(`SELECT COUNT(*) as overdue FROM employees e LEFT JOIN (SELECT employee_id, MAX(audit_date) as last_audit FROM audits WHERE employee_present = TRUE GROUP BY employee_id) a ON e.id=a.employee_id WHERE e.employment_status='active' AND e.san=TRUE AND (a.last_audit IS NULL OR CURRENT_DATE - a.last_audit > 30)`),
       pool.query(`SELECT COUNT(*) FILTER (WHERE status!='resolved') as open, COUNT(*) FILTER (WHERE status='pending') as pending FROM ncr_items`),
       pool.query(`SELECT p.name as ppe_name, p.category, COUNT(*) as count FROM ncr_items n JOIN ppe_items p ON p.id=n.ppe_item_id WHERE n.status!='resolved' AND n.status!='canceled' GROUP BY p.name, p.category ORDER BY count DESC LIMIT 10`),
       pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE overall_status='compliant') as compliant FROM audits WHERE audit_date >= date_trunc('month',NOW())`),
@@ -324,7 +324,7 @@ app.get('/api/dashboard', auth, async (req, res) => {
 app.get('/api/employees', auth, async (req, res) => {
   try {
     const { status, search, national_id, project, client, san, job_title, department, resource_type } = req.query;
-    let q = `SELECT e.*, MAX(a.audit_date) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) as days_since_audit, COUNT(epa.id) > 0 as ppe_assigned FROM employees e LEFT JOIN audits a ON a.employee_id=e.id LEFT JOIN employee_ppe_assignments epa ON epa.employee_id=e.id WHERE 1=1`;
+    let q = `SELECT e.*, MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) as days_since_audit, COUNT(epa.id) > 0 as ppe_assigned FROM employees e LEFT JOIN audits a ON a.employee_id=e.id LEFT JOIN employee_ppe_assignments epa ON epa.employee_id=e.id WHERE 1=1`;
     const params = [];
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
     if (search) { params.push(`%${search}%`); q += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length})`; }
@@ -1270,7 +1270,7 @@ async function sendDailyOverdueDigest() {
       FROM employees e
       LEFT JOIN (
         SELECT DISTINCT ON (employee_id) employee_id, audit_date
-        FROM audits ORDER BY employee_id, audit_date DESC
+        FROM audits WHERE employee_present = TRUE ORDER BY employee_id, audit_date DESC
       ) a ON a.employee_id = e.id
       WHERE e.employment_status = 'active' AND e.san = true
         AND COALESCE(CURRENT_DATE - a.audit_date::date, 9999) > 30

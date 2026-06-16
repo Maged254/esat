@@ -1065,7 +1065,7 @@ async function sendDailySCMDigest() {
         html: `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
             <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
-              <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" style="height:50px; display:block;" />
+              <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="180" height="50" style="height:50px; width:180px; display:block; margin:0 auto;" />
             </td></tr></table>
             <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
               <p style="font-size: 15px; color: #374151;">Hello Supply Chain Team,</p>
@@ -1119,7 +1119,7 @@ async function sendDailyBTSDigest() {
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
           <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
-            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" style="height:50px; display:block; margin: 0 auto;" />
+            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="180" height="50" style="height:50px; width:180px; display:block; margin:0 auto;" />
           </td></tr></table>
           <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
             <p style="font-size: 15px; color: #374151;">Hello BTS Project Team,</p>
@@ -1165,7 +1165,7 @@ async function sendDailyFibreDigest() {
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
           <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
-            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" style="height:50px; display:block; margin: 0 auto;" />
+            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="180" height="50" style="height:50px; width:180px; display:block; margin:0 auto;" />
           </td></tr></table>
           <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
             <p style="font-size: 15px; color: #374151;">Hello Fibre Project Team,</p>
@@ -1207,7 +1207,7 @@ async function sendDailyEHSDigest() {
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
           <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
-            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" style="height:50px; display:block; margin: 0 auto;" />
+            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="180" height="50" style="height:50px; width:180px; display:block; margin:0 auto;" />
           </td></tr></table>
           <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
             <p style="font-size: 15px; color: #374151;">Hello John,</p>
@@ -1312,7 +1312,7 @@ async function sendDailyOverdueDigest() {
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
           <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
-            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" style="height:50px; display:block;" />
+            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="180" height="50" style="height:50px; width:180px; display:block; margin:0 auto;" />
           </td></tr></table>
           <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
             <p style="margin:0 0 16px;font-size:15px;color:#111;">Hello Maged,</p>
@@ -1374,7 +1374,7 @@ app.post('/api/admin/test-ehs-digest', auth, async (req, res) => {
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
           <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
-            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" style="height:50px; display:block; margin: 0 auto;" />
+            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="180" height="50" style="height:50px; width:180px; display:block; margin:0 auto;" />
           </td></tr></table>
           <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
             <p style="font-size: 15px; color: #374151;">Hello John,</p>
@@ -1420,7 +1420,7 @@ app.post('/api/admin/test-scm-digest', auth, async (req, res) => {
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
           <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px; background-color: #ffffff !important;">
-            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" style="height:50px; display:block;" />
+            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="180" height="50" style="height:50px; width:180px; display:block; margin:0 auto;" />
           </td></tr></table>
           <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
             <p style="font-size: 15px; color: #374151;">Hello Supply Chain Team,</p>

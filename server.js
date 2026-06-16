@@ -1243,11 +1243,102 @@ function scheduleAt(utcHour, utcMin, label, fn) {
   setTimeout(() => { fn(); setInterval(fn, 24*60*60*1000); }, ms);
 }
 
+
+async function sendDailyOverdueDigest() {
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        e.client,
+        e.project,
+        COUNT(*) as overdue_count,
+        MAX(COALESCE(CURRENT_DATE - a.audit_date::date, 9999)) as max_days,
+        (SELECT e2.full_name FROM employees e2
+          LEFT JOIN audits a2 ON a2.employee_id = e2.id
+          WHERE e2.project = e.project AND e2.client = e.client
+            AND e2.employment_status = 'active' AND e2.san = true
+          GROUP BY e2.id, e2.full_name
+          ORDER BY MAX(COALESCE(CURRENT_DATE - a2.audit_date::date, 9999)) DESC
+          LIMIT 1) as oldest_employee,
+        (SELECT MAX(COALESCE(CURRENT_DATE - a2.audit_date::date, 9999))
+          FROM employees e2
+          LEFT JOIN audits a2 ON a2.employee_id = e2.id
+          WHERE e2.project = e.project AND e2.client = e.client
+            AND e2.employment_status = 'active' AND e2.san = true
+          GROUP BY e2.id
+          ORDER BY 1 DESC
+          LIMIT 1) as oldest_days
+      FROM employees e
+      LEFT JOIN (
+        SELECT DISTINCT ON (employee_id) employee_id, audit_date
+        FROM audits ORDER BY employee_id, audit_date DESC
+      ) a ON a.employee_id = e.id
+      WHERE e.employment_status = 'active' AND e.san = true
+        AND COALESCE(CURRENT_DATE - a.audit_date::date, 9999) > 30
+      GROUP BY e.client, e.project
+      ORDER BY e.client, e.project
+    `);
+
+    if (rows.length === 0) return;
+
+    const totalOverdue = rows.reduce((sum, r) => sum + parseInt(r.overdue_count), 0);
+
+    // Group by client
+    const byClient = {};
+    rows.forEach(r => {
+      const client = r.client || '—';
+      if (!byClient[client]) byClient[client] = [];
+      byClient[client].push(r);
+    });
+
+    let tableRows = '';
+    Object.entries(byClient).forEach(([client, projects]) => {
+      tableRows += `<tr><td colspan="3" style="background:#0f2a4a;color:white;font-weight:700;font-size:13px;padding:8px 12px;">${client}</td></tr>`;
+      projects.forEach(r => {
+        const days = parseInt(r.oldest_days) || 0;
+        const daysColor = days > 60 ? '#e53e3e' : days > 30 ? '#e65100' : '#1d9e75';
+        tableRows += `
+          <tr style="border-bottom:1px solid #e5e7eb;">
+            <td style="padding:8px 12px;font-size:13px;padding-left:24px;">${r.project || '—'}</td>
+            <td style="padding:8px 12px;font-size:13px;text-align:center;font-weight:700;color:#0f2a4a;">${r.overdue_count}</td>
+            <td style="padding:8px 12px;font-size:12px;">${r.oldest_employee || '—'} <span style="color:${daysColor};font-weight:700;">(${days}d)</span></td>
+          </tr>`;
+      });
+    });
+
+    await resend.emails.send({
+      from: 'ESAT <esat@egypro.app>',
+      to: 'e.maged@outlook.com',
+      subject: `ESAT Daily — ${totalOverdue} Overdue Audit${totalOverdue > 1 ? 's' : ''} Across Projects`,
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
+            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" style="height:50px; display:block;" />
+          </td></tr></table>
+          <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
+            <p style="margin:0 0 16px;font-size:15px;color:#111;">Hello Maged,</p>
+            <p style="margin:0 0 20px;font-size:14px;color:#374151;">Here is today's overdue audit summary. <strong>${totalOverdue} employee${totalOverdue > 1 ? 's are' : ' is'}</strong> overdue for a PPE/Tool audit (>30 days).</p>
+            <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;background:white;">
+              <tr style="background:#f3f4f6;">
+                <th style="padding:8px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;">PROJECT</th>
+                <th style="padding:8px 12px;text-align:center;font-size:12px;color:#6b7280;font-weight:600;">OVERDUE</th>
+                <th style="padding:8px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;">OLDEST DUE</th>
+              </tr>
+              ${tableRows}
+            </table>
+            <p style="margin:24px 0 0;font-size:13px;color:#6b7280;">Thanks, Maged Ezzat</p>
+          </div>
+        </div>`
+    });
+    console.log('Overdue digest sent — ' + totalOverdue + ' overdue');
+  } catch(e) { console.error('Overdue digest error:', e.message); }
+}
+
 function scheduleDailyDigest() {
   scheduleAt(5, 30, 'Fibre digest', sendDailyFibreDigest);  // 8:30am EAT
   scheduleAt(5, 35, 'BTS digest', sendDailyBTSDigest);      // 8:35am EAT
   scheduleAt(5, 45, 'EHS digest', sendDailyEHSDigest);      // 8:45am EAT
   scheduleAt(6,  0, 'SCM digest', sendDailySCMDigest);      // 9:00am EAT
+  scheduleAt(13, 0, 'Overdue digest', sendDailyOverdueDigest); // 4:00pm EAT
 }
 
 app.post('/api/admin/test-bts-digest', auth, async (req, res) => {
@@ -1443,6 +1534,14 @@ app.delete('/api/audit-documents/:id', auth, async (req, res) => {
   } catch (err) {
     res.status(500).json({ message: 'Delete failed' });
   }
+});
+
+app.post('/api/admin/test-overdue-digest', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    await sendDailyOverdueDigest();
+    res.json({ success: true });
+  } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
 
 app.listen(PORT, () => { console.log(`ESAT running on port ${PORT}`); scheduleDailyDigest(); });

@@ -271,14 +271,14 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     const isSync = rows[0].email === 'sync@egypro.com';
     const tokenOptions = isSync ? {} : { expiresIn: '8h' };
-    const token = jwt.sign({ id: rows[0].id, email: rows[0].email, role: rows[0].role, name: rows[0].full_name, project_access: rows[0].project_access || [] }, JWT_SECRET, tokenOptions);
-    res.json({ token, user: { id: rows[0].id, name: rows[0].full_name, email: rows[0].email, role: rows[0].role } });
+    const token = jwt.sign({ id: rows[0].id, email: rows[0].email, role: rows[0].role, name: rows[0].full_name, project_access: rows[0].project_access || [], page_access: rows[0].page_access || [] }, JWT_SECRET, tokenOptions);
+    res.json({ token, user: { id: rows[0].id, name: rows[0].full_name, email: rows[0].email, role: rows[0].role, project_access: rows[0].project_access || [], page_access: rows[0].page_access || [] } });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
 // Me
 app.get('/api/auth/me', auth, async (req, res) => {
-  const { rows } = await pool.query('SELECT id,full_name,email,role,profile_picture FROM users WHERE id=$1', [req.user.id]);
+  const { rows } = await pool.query('SELECT id,full_name,email,role,profile_picture,project_access,page_access FROM users WHERE id=$1', [req.user.id]);
   res.json(rows[0]);
 });
 

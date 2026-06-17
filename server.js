@@ -156,6 +156,7 @@ async function setupDB() {
 
     // Ensure project_access column exists on users
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS project_access TEXT[] DEFAULT '{}'");
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS page_access TEXT[] DEFAULT '{}'");
 
     // Ensure distribution columns exist on ppe_requests
     await client.query('ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS distribution_method VARCHAR(50)');
@@ -1599,20 +1600,20 @@ app.get('/api/graphs', auth, async (req, res) => {
 
 app.get('/api/users', auth, async (req, res) => {
   if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
-  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, created_at FROM users ORDER BY created_at DESC');
+  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, created_at FROM users ORDER BY created_at DESC');
   res.json(rows);
 });
 
 // POST create new user (admin only)
 app.post('/api/users', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  const { full_name, email, password, role } = req.body;
+  const { full_name, email, password, role, project_access, page_access } = req.body;
   if (!full_name || !email || !password || !role) return res.status(400).json({ error: 'All fields required' });
   try {
     const hash = await bcrypt.hash(password, 10);
     const { rows } = await pool.query(
-      'INSERT INTO users (full_name, email, password_hash, role) VALUES ($1,$2,$3,$4) RETURNING id, full_name, email, role, is_active',
-      [full_name, email, hash, role]
+      'INSERT INTO users (full_name, email, password_hash, role, project_access, page_access) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, full_name, email, role, is_active, project_access, page_access',
+      [full_name, email, hash, role, project_access || [], page_access || []]
     );
     res.status(201).json(rows[0]);
   } catch(e) {
@@ -1624,17 +1625,17 @@ app.post('/api/users', auth, async (req, res) => {
 // PUT update user (admin only)
 app.put('/api/users/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  const { full_name, email, role, is_active, password, profile_picture, project_access } = req.body;
+  const { full_name, email, role, is_active, password, profile_picture, project_access, page_access } = req.body;
   try {
     if (password) {
       const hash = await bcrypt.hash(password, 10);
-      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, password_hash=$5, profile_picture=$6, project_access=$7, updated_at=NOW() WHERE id=$8',
-        [full_name, email, role, is_active, hash, profile_picture || null, project_access || [], req.params.id]);
+      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, password_hash=$5, profile_picture=$6, project_access=$7, page_access=$8, updated_at=NOW() WHERE id=$9',
+        [full_name, email, role, is_active, hash, profile_picture || null, project_access || [], page_access || [], req.params.id]);
     } else {
-      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, profile_picture=$5, project_access=$6, updated_at=NOW() WHERE id=$7',
-        [full_name, email, role, is_active, profile_picture || null, project_access || [], req.params.id]);
+      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, profile_picture=$5, project_access=$6, page_access=$7, updated_at=NOW() WHERE id=$8',
+        [full_name, email, role, is_active, profile_picture || null, project_access || [], page_access || [], req.params.id]);
     }
-    const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access FROM users WHERE id=$1', [req.params.id]);
+    const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access FROM users WHERE id=$1', [req.params.id]);
     res.json(rows[0]);
   } catch(e) { console.error("PUT users error:", e.message); res.status(500).json({ error: e.message }); }
 });

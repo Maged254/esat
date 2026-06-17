@@ -348,6 +348,105 @@ app.get('/api/employees', auth, async (req, res) => {
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
+app.get('/api/audit-coverage', auth, async (req, res) => {
+  try {
+    const projectFilter = await getProjectFilter(req.user);
+    if (projectFilter !== null && projectFilter.length === 0) {
+      return res.json({
+        total_active: 0, san_count: 0, non_san_count: 0,
+        bucket_0_30: 0, bucket_31_60: 0, bucket_61_90: 0, bucket_90_plus: 0, never_audited: 0,
+        overdue_total: 0, audit_rate: null, avg_days_since_audit: null,
+        this_month_audited: 0, last_month_audited: 0, by_project: []
+      });
+    }
+
+    const { project, client } = req.query;
+    const params = [];
+    let whereExtra = '';
+    if (projectFilter !== null) { params.push(projectFilter); whereExtra += ` AND e.project = ANY($${params.length})`; }
+    if (project) { params.push(project); whereExtra += ` AND e.project = $${params.length}`; }
+    if (client) { params.push(client); whereExtra += ` AND e.client = $${params.length}`; }
+
+    const baseCTE = `
+      WITH last_audit AS (
+        SELECT employee_id, MAX(audit_date) as last_audit_date
+        FROM audits WHERE employee_present = TRUE
+        GROUP BY employee_id
+      ),
+      san_emp AS (
+        SELECT e.*, la.last_audit_date,
+          CASE WHEN la.last_audit_date IS NULL THEN NULL ELSE CURRENT_DATE - la.last_audit_date END as days_since
+        FROM employees e
+        LEFT JOIN last_audit la ON la.employee_id = e.id
+        WHERE e.employment_status = 'active' AND e.san = TRUE ${whereExtra}
+      )
+    `;
+
+    const countsQ = pool.query(`
+      ${baseCTE}
+      SELECT
+        COUNT(*) FILTER (WHERE days_since IS NOT NULL AND days_since <= 30) as bucket_0_30,
+        COUNT(*) FILTER (WHERE days_since > 30 AND days_since <= 60) as bucket_31_60,
+        COUNT(*) FILTER (WHERE days_since > 60 AND days_since <= 90) as bucket_61_90,
+        COUNT(*) FILTER (WHERE days_since > 90) as bucket_90_plus,
+        COUNT(*) FILTER (WHERE days_since IS NULL) as never_audited,
+        COUNT(*) FILTER (WHERE days_since IS NULL OR days_since > 30) as overdue_total,
+        COUNT(*) as san_total,
+        ROUND(AVG(days_since)) as avg_days_since_audit
+      FROM san_emp
+    `, params);
+
+    const totalQ = pool.query(`
+      SELECT COUNT(*) FILTER (WHERE e.employment_status='active' ${whereExtra}) as total_active,
+        COUNT(*) FILTER (WHERE e.employment_status='active' AND e.san=TRUE ${whereExtra}) as san_count,
+        COUNT(*) FILTER (WHERE e.employment_status='active' AND e.san=FALSE ${whereExtra}) as non_san_count
+      FROM employees e
+    `, params);
+
+    const monthQ = pool.query(`
+      SELECT
+        COUNT(DISTINCT a.employee_id) FILTER (WHERE date_trunc('month', a.audit_date) = date_trunc('month', NOW())) as this_month,
+        COUNT(DISTINCT a.employee_id) FILTER (WHERE date_trunc('month', a.audit_date) = date_trunc('month', NOW() - INTERVAL '1 month')) as last_month
+      FROM audits a
+      JOIN employees e ON e.id = a.employee_id
+      WHERE a.employee_present = TRUE AND e.san = TRUE AND e.employment_status='active' ${whereExtra}
+    `, params);
+
+    const byProjectQ = pool.query(`
+      ${baseCTE}
+      SELECT project,
+        COUNT(*) as san_total,
+        COUNT(*) FILTER (WHERE days_since IS NULL OR days_since > 30) as overdue
+      FROM san_emp
+      GROUP BY project
+      ORDER BY overdue DESC
+    `, params);
+
+    const [counts, totals, month, byProject] = await Promise.all([countsQ, totalQ, monthQ, byProjectQ]);
+    const c = counts.rows[0];
+    const t = totals.rows[0];
+    const m = month.rows[0];
+    const sanTotal = parseInt(c.san_total) || 0;
+    const auditedWithin30 = parseInt(c.bucket_0_30) || 0;
+
+    res.json({
+      total_active: parseInt(t.total_active) || 0,
+      san_count: parseInt(t.san_count) || 0,
+      non_san_count: parseInt(t.non_san_count) || 0,
+      bucket_0_30: auditedWithin30,
+      bucket_31_60: parseInt(c.bucket_31_60) || 0,
+      bucket_61_90: parseInt(c.bucket_61_90) || 0,
+      bucket_90_plus: parseInt(c.bucket_90_plus) || 0,
+      never_audited: parseInt(c.never_audited) || 0,
+      overdue_total: parseInt(c.overdue_total) || 0,
+      audit_rate: sanTotal > 0 ? Math.round((auditedWithin30 / sanTotal) * 100) : null,
+      avg_days_since_audit: c.avg_days_since_audit !== null ? parseInt(c.avg_days_since_audit) : null,
+      this_month_audited: parseInt(m.this_month) || 0,
+      last_month_audited: parseInt(m.last_month) || 0,
+      by_project: byProject.rows.map(r => ({ project: r.project, san_total: parseInt(r.san_total), overdue: parseInt(r.overdue) }))
+    });
+  } catch(e) { console.error('Audit coverage error:', e.message); res.status(500).json({ error: e.message }); }
+});
 app.get('/api/employees/overdue', auth, async (req, res) => {
   try {
     const { rows } = await pool.query(`

@@ -931,6 +931,19 @@ app.post('/api/admin/seed-locations', auth, async (req, res) => {
   } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
 });
 
+app.post('/api/admin/backfill-page-access', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    const fullPages = ['/','/employees','/audit/new','/history','/ncr','/ppe-tracker','/graphs'];
+    const { rowCount } = await pool.query(
+      `UPDATE users SET page_access=$1, updated_at=NOW()
+       WHERE role <> 'admin' AND (page_access IS NULL OR page_access = '{}')`,
+      [fullPages]
+    );
+    res.json({ success: true, updated: rowCount });
+  } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
+});
+
 
 app.post('/api/admin/replace-ppe-items', async (req, res) => {
   const authHeader = req.headers.authorization;

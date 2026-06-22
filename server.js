@@ -1328,6 +1328,21 @@ async function sendDailyFibreDigest() {
     const count = parseInt(pending[0].count);
     const oldestDays = parseInt(pending[0].oldest_days) || 0;
     if (count === 0) return;
+    const { rows: byProject } = await pool.query(`
+      SELECT e.project, COUNT(*) as count, MAX(CURRENT_DATE - date_available::date) as oldest_days
+      FROM ppe_requests r
+      JOIN employees e ON e.id = r.employee_id
+      WHERE r.status = 'warehouse_available'
+      AND e.project = ANY($1)
+      GROUP BY e.project
+      ORDER BY count DESC
+    `, [fibreProjects]);
+    const projectRowsHtml = byProject.map(p => `
+      <tr>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #374151;">${p.project}</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #0f2a4a; font-weight: 600; text-align: center;">${p.count}</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; text-align: center; color: ${parseInt(p.oldest_days) > 0 ? '#e53e3e' : '#374151'};">${parseInt(p.oldest_days) || 0}</td>
+      </tr>`).join('');
 
     await resend.emails.send({
       from: 'ESAT <esat@egypro.app>',
@@ -1345,6 +1360,14 @@ async function sendDailyFibreDigest() {
               at our warehouse to be collected. The oldest item has been waiting for
               <strong style="color: ${oldestDays > 0 ? '#e53e3e' : '#374151'};">${oldestDays} day${oldestDays !== 1 ? 's' : ''}</strong>.
             </p>
+            <table width="100%" cellpadding="0" cellspacing="0" style="margin: 16px 0; border: 1px solid #e5e7eb; border-radius: 6px; overflow: hidden;">
+              <tr style="background: #f3f4f6;">
+                <th style="padding: 8px 12px; text-align: left; font-size: 12px; color: #6b7280; text-transform: uppercase;">Project</th>
+                <th style="padding: 8px 12px; text-align: center; font-size: 12px; color: #6b7280; text-transform: uppercase;">Items</th>
+                <th style="padding: 8px 12px; text-align: center; font-size: 12px; color: #6b7280; text-transform: uppercase;">Oldest (days)</th>
+              </tr>
+              ${projectRowsHtml}
+            </table>
             <p style="font-size: 15px; color: #374151;">Please check the ESAT system to clear the pending list.</p>
             <a href="https://esat.egypro.app"
               style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">

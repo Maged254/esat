@@ -1293,7 +1293,7 @@ async function sendDailyBTSDigest() {
     `, [btsProjects]);
     const projectRowsHtml = byProject.map(p => `
       <tr>
-        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #374151;">${p.project}${p.client ? `<div style="font-size: 11px; color: #9ca3af; margin-top: 2px;">Client: ${p.client}</div>` : ''}</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #374151;">${p.project}${p.client ? `<div style="font-size: 11px; color: #9ca3af; margin-top: 2px;">${p.client}</div>` : ''}</td>
         <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #0f2a4a; font-weight: 600; text-align: center;">${p.count}</td>
         <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; text-align: center; color: ${parseInt(p.oldest_days) > 0 ? '#e53e3e' : '#374151'};">${parseInt(p.oldest_days) || 0}</td>
       </tr>`).join('');
@@ -1362,7 +1362,7 @@ async function sendDailyFibreDigest() {
     `, [fibreProjects]);
     const projectRowsHtml = byProject.map(p => `
       <tr>
-        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #374151;">${p.project}${p.client ? `<div style="font-size: 11px; color: #9ca3af; margin-top: 2px;">Client: ${p.client}</div>` : ''}</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #374151;">${p.project}${p.client ? `<div style="font-size: 11px; color: #9ca3af; margin-top: 2px;">${p.client}</div>` : ''}</td>
         <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #0f2a4a; font-weight: 600; text-align: center;">${p.count}</td>
         <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; text-align: center; color: ${parseInt(p.oldest_days) > 0 ? '#e53e3e' : '#374151'};">${parseInt(p.oldest_days) || 0}</td>
       </tr>`).join('');

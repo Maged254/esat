@@ -880,17 +880,41 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
 
 app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
   const { status, distribution_method, courier_tracking_number } = req.body;
-  const allowedRoles = ['admin', 'scm_officer', 'ehs_manager'];
+  const allowedRoles = ['admin', 'scm_officer', 'ehs_manager', 'project_director'];
   if (!allowedRoles.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
-  if (req.user.role === 'scm_officer' && ['pending', 'ehs_purchase_requested'].includes(status)) {
-    return res.status(403).json({ error: 'SCM Officer can only update from EHS Purchase Requested onwards' });
+  if (req.user.role === 'scm_officer' && ['pending', 'ehs_purchase_requested', 'pda_approved'].includes(status)) {
+    return res.status(403).json({ error: 'SCM Officer can only update from PDA Approved onwards' });
+  }
+  if (req.user.role === 'project_director' && status !== 'pda_approved') {
+    return res.status(403).json({ error: 'Project Director can only set status to PDA Approved' });
   }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const { rows: [current] } = await client.query(
+      'SELECT pr.status, pr.pda_approved_date, pi.needs_pda FROM ppe_requests pr JOIN ppe_items pi ON pr.ppe_item_id = pi.id WHERE pr.id = $1',
+      [req.params.id]
+    );
+    if (!current) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'PPE request not found' });
+    }
+    const skippingPda = current.needs_pda
+      && current.status === 'ehs_purchase_requested'
+      && !current.pda_approved_date
+      && ['scm_ordered', 'warehouse_available', 'distributed'].includes(status);
+    if (skippingPda) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'This PPE item requires Project Director Approval before it can move to SCM Ordered' });
+    }
+    if (req.user.role === 'project_director' && current.status !== 'ehs_purchase_requested') {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Can only approve items currently at EHS Purchase Requested' });
+    }
     let extraFields = '';
     let extraParams = [status, req.params.id];
     if (status === 'ehs_purchase_requested') extraFields = ', date_purchase_requested=NOW(), purchase_requested_by=$3';
+    if (status === 'pda_approved') extraFields = ', pda_approved_date=NOW(), pda_approved_by=$3';
     if (status === 'scm_ordered') extraFields = ', date_ordered=NOW(), ordered_by=$3';
     if (status === 'warehouse_available') extraFields = ', date_available=NOW(), available_by=$3, date_ordered=COALESCE(date_ordered,NOW()), ordered_by=COALESCE(ordered_by,$3)';
     if (status === 'distributed') {

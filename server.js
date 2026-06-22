@@ -1283,17 +1283,17 @@ async function sendDailyBTSDigest() {
     const oldestDays = parseInt(pending[0].oldest_days) || 0;
     if (count === 0) return;
     const { rows: byProject } = await pool.query(`
-      SELECT e.project, COUNT(*) as count, MAX(CURRENT_DATE - date_available::date) as oldest_days
+      SELECT e.project, e.client, COUNT(*) as count, MAX(CURRENT_DATE - date_available::date) as oldest_days
       FROM ppe_requests r
       JOIN employees e ON e.id = r.employee_id
       WHERE r.status = 'warehouse_available'
       AND e.project = ANY($1)
-      GROUP BY e.project
+      GROUP BY e.project, e.client
       ORDER BY count DESC
     `, [btsProjects]);
     const projectRowsHtml = byProject.map(p => `
       <tr>
-        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #374151;">${p.project}</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #374151;">${p.project}${p.client ? `<div style="font-size: 11px; color: #9ca3af; margin-top: 2px;">Client: ${p.client}</div>` : ''}</td>
         <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #0f2a4a; font-weight: 600; text-align: center;">${p.count}</td>
         <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; text-align: center; color: ${parseInt(p.oldest_days) > 0 ? '#e53e3e' : '#374151'};">${parseInt(p.oldest_days) || 0}</td>
       </tr>`).join('');
@@ -1352,17 +1352,17 @@ async function sendDailyFibreDigest() {
     const oldestDays = parseInt(pending[0].oldest_days) || 0;
     if (count === 0) return;
     const { rows: byProject } = await pool.query(`
-      SELECT e.project, COUNT(*) as count, MAX(CURRENT_DATE - date_available::date) as oldest_days
+      SELECT e.project, e.client, COUNT(*) as count, MAX(CURRENT_DATE - date_available::date) as oldest_days
       FROM ppe_requests r
       JOIN employees e ON e.id = r.employee_id
       WHERE r.status = 'warehouse_available'
       AND e.project = ANY($1)
-      GROUP BY e.project
+      GROUP BY e.project, e.client
       ORDER BY count DESC
     `, [fibreProjects]);
     const projectRowsHtml = byProject.map(p => `
       <tr>
-        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #374151;">${p.project}</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #374151;">${p.project}${p.client ? `<div style="font-size: 11px; color: #9ca3af; margin-top: 2px;">Client: ${p.client}</div>` : ''}</td>
         <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #0f2a4a; font-weight: 600; text-align: center;">${p.count}</td>
         <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; text-align: center; color: ${parseInt(p.oldest_days) > 0 ? '#e53e3e' : '#374151'};">${parseInt(p.oldest_days) || 0}</td>
       </tr>`).join('');

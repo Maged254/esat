@@ -845,21 +845,21 @@ app.delete('/api/ppe/:id', auth, async (req, res) => {
 
 app.post('/api/ppe', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-  const { name, category, has_size, size_type, sort_order } = req.body;
+  const { name, category, has_size, size_type, sort_order, needs_pda } = req.body;
   if (!name || !category) return res.status(400).json({ error: 'name and category required' });
   const { rows } = await pool.query(
-    'INSERT INTO ppe_items (name, category, has_size, size_type, sort_order, is_active) VALUES ($1,$2,$3,$4,$5,true) RETURNING *',
-    [name, category, has_size || false, size_type || null, sort_order || 99]
+    'INSERT INTO ppe_items (name, category, has_size, size_type, sort_order, is_active, needs_pda) VALUES ($1,$2,$3,$4,$5,true,$6) RETURNING *',
+    [name, category, has_size || false, size_type || null, sort_order || 99, needs_pda || false]
   );
   res.json(rows[0]);
 });
 
 app.put('/api/ppe/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-  const { name, category, has_size, size_type, sort_order, is_active } = req.body;
+  const { name, category, has_size, size_type, sort_order, is_active, needs_pda } = req.body;
   const { rows } = await pool.query(
-    'UPDATE ppe_items SET name=$1, category=$2, has_size=$3, size_type=$4, sort_order=$5, is_active=$6 WHERE id=$7 RETURNING *',
-    [name, category, has_size, size_type || null, sort_order, is_active, req.params.id]
+    'UPDATE ppe_items SET name=$1, category=$2, has_size=$3, size_type=$4, sort_order=$5, is_active=$6, needs_pda=$7 WHERE id=$8 RETURNING *',
+    [name, category, has_size, size_type || null, sort_order, is_active, needs_pda || false, req.params.id]
   );
   if (!rows.length) return res.status(404).json({ error: 'Not found' });
   res.json(rows[0]);

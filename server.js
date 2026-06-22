@@ -732,9 +732,38 @@ app.get('/api/ncr/stats', auth, async (req, res) => {
 
 app.put('/api/ncr/:id/status', auth, async (req, res) => {
   const { status } = req.body;
+  const allowedRoles = ['admin', 'ehs_manager', 'project_director'];
+  if (!allowedRoles.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  if (req.user.role === 'project_director' && status !== 'pda_approved') {
+    return res.status(403).json({ error: 'Project Director can only set status to PDA Approved' });
+  }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const { rows: [current] } = await client.query(
+      `SELECT n.status, pr.id as ppe_request_id, pr.pda_approved_date, pi.needs_pda
+       FROM ncr_items n
+       LEFT JOIN ppe_requests pr ON pr.ncr_item_id = n.id
+       LEFT JOIN ppe_items pi ON pi.id = n.ppe_item_id
+       WHERE n.id = $1`,
+      [req.params.id]
+    );
+    if (!current) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'NCR item not found' });
+    }
+    if (req.user.role === 'project_director' && current.status !== 'ehs_purchase_requested') {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Can only approve items currently at EHS Purchase Requested' });
+    }
+    const skippingPda = current.needs_pda
+      && current.status === 'ehs_purchase_requested'
+      && !current.pda_approved_date
+      && ['scm_ordered', 'warehouse_available', 'distributed'].includes(status);
+    if (skippingPda) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'This PPE item requires Project Director Approval before it can move to SCM Ordered' });
+    }
     let updateQ;
     if (status === 'resolved') {
       updateQ = await client.query('UPDATE ncr_items SET status=$1, resolved_at=NOW(), updated_at=NOW() WHERE id=$2 RETURNING *', [status, req.params.id]);
@@ -744,6 +773,9 @@ app.put('/api/ncr/:id/status', auth, async (req, res) => {
     const ncr = updateQ.rows[0];
     if (status === 'ehs_purchase_requested') {
       await client.query('UPDATE ppe_requests SET status=$1, date_purchase_requested=NOW(), purchase_requested_by=$2, updated_at=NOW() WHERE ncr_item_id=$3', ['ehs_purchase_requested', req.user.id, req.params.id]);
+    }
+    if (status === 'pda_approved') {
+      await client.query('UPDATE ppe_requests SET status=$1, pda_approved_date=NOW(), pda_approved_by=$2, updated_at=NOW() WHERE ncr_item_id=$3', ['pda_approved', req.user.id, req.params.id]);
     }
     await client.query('COMMIT');
     res.json(ncr);

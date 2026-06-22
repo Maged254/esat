@@ -245,7 +245,7 @@ const auth = (req, res, next) => {
 };
 
 // ── Project access helper ────────────────────────────────────
-const RESTRICTED_ROLES = ['ehs_officer', 'supervisor', 'scm_officer'];
+const RESTRICTED_ROLES = ['ehs_officer', 'supervisor', 'scm_officer', 'project_director'];
 const getProjectFilter = async (user) => {
   if (!RESTRICTED_ROLES.includes(user.role)) return null; // unrestricted
   const projects = user.project_access || [];
@@ -838,12 +838,13 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
     const { rows } = await pool.query(`
       SELECT r.*,
         e.full_name as employee_name, e.employee_number, e.national_id as employee_national_id, e.employment_status, e.project, e.client,
-        p.name as ppe_name, p.category,
+        p.name as ppe_name, p.category, p.needs_pda,
         u0.full_name as flagged_by_name,
         u1.full_name as purchase_requested_by_name,
         u2.full_name as ordered_by_name,
         u3.full_name as available_by_name,
         u4.full_name as distributed_by_name,
+        u5.full_name as pda_approved_by_name,
         l.name as location_name,
         COALESCE((SELECT ai3.quantity FROM audit_items ai3 JOIN ncr_items n3 ON n3.audit_item_id=ai3.id WHERE n3.id=r.ncr_item_id LIMIT 1), 1) as quantity
       FROM ppe_requests r
@@ -856,6 +857,7 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
       LEFT JOIN users u2 ON u2.id=r.ordered_by
       LEFT JOIN users u3 ON u3.id=r.available_by
       LEFT JOIN users u4 ON u4.id=r.distributed_by
+      LEFT JOIN users u5 ON u5.id=r.pda_approved_by
       ORDER BY
         CASE r.status
           WHEN 'pending' THEN 1

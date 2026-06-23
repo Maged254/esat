@@ -251,7 +251,13 @@ const getProjectFilter = async (user) => {
   const projects = user.project_access || [];
   if (projects.length === 0) return []; // no access
   // Check if user has all projects
-  const { rows } = await pool.query("SELECT ARRAY_AGG(DISTINCT project) as all_projects FROM employees WHERE project IS NOT NULL");
+  const { rows } = await pool.query(`
+    SELECT ARRAY_AGG(DISTINCT project) as all_projects FROM (
+      SELECT project FROM employees WHERE project IS NOT NULL
+      UNION
+      SELECT project FROM casuals WHERE project IS NOT NULL
+    ) combined
+  `);
   const allProjects = rows[0].all_projects || [];
   if (allProjects.every(p => projects.includes(p))) return null; // has all projects = unrestricted
   return projects;
@@ -551,6 +557,81 @@ app.put('/api/employees/:id/san', auth, async (req, res) => {
   const { san } = req.body;
   const { rows } = await pool.query('UPDATE employees SET san=$1, updated_at=NOW() WHERE id=$2 RETURNING *', [san, req.params.id]);
   res.json(rows[0]);
+});
+
+// ── Casuals ──────────────────────────────────────────────────
+const CASUAL_EDIT_ROLES = ['admin', 'supervisor'];
+const CASUAL_VIEW_ROLES = ['admin', 'supervisor', 'ehs_officer', 'ehs_manager'];
+
+// List casuals (view: admin, supervisor, ehs_officer, ehs_manager; project-scoped)
+app.get('/api/casuals', auth, async (req, res) => {
+  if (!CASUAL_VIEW_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  try {
+    const casualProjects = await getProjectFilter(req.user);
+    if (casualProjects !== null && casualProjects.length === 0) return res.json([]);
+    let q = 'SELECT * FROM casuals WHERE 1=1';
+    const params = [];
+    if (casualProjects !== null) { params.push(casualProjects); q += ` AND project = ANY($${params.length})`; }
+    q += ' ORDER BY created_at DESC';
+    const { rows } = await pool.query(q, params);
+    res.json(rows);
+  } catch(e) { console.error('Casuals list error:', e.message); res.status(500).json({ error: e.message }); }
+});
+
+// Batch add casuals (admin, supervisor only)
+app.post('/api/casuals/batch', auth, async (req, res) => {
+  if (!CASUAL_EDIT_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  const { project, client, organization, casuals } = req.body;
+  if (!project || !Array.isArray(casuals) || casuals.length === 0) {
+    return res.status(400).json({ error: 'project and at least one casual required' });
+  }
+  const client_db = await pool.connect();
+  try {
+    await client_db.query('BEGIN');
+    const inserted = [];
+    for (const c of casuals) {
+      if (!c.full_name) continue;
+      const { rows } = await client_db.query(
+        `INSERT INTO casuals (full_name, national_id, job_title, project, client, organization, created_by)
+         VALUES ($1,$2,'Casual',$3,$4,$5,$6) RETURNING *`,
+        [c.full_name, c.national_id || null, project, client || null, organization || null, req.user.id]
+      );
+      inserted.push(rows[0]);
+    }
+    await client_db.query('COMMIT');
+    res.json(inserted);
+  } catch(e) { await client_db.query('ROLLBACK'); console.error('Casuals batch add error:', e.message); res.status(500).json({ error: e.message }); }
+  finally { client_db.release(); }
+});
+
+// Edit a casual (admin, supervisor only)
+app.put('/api/casuals/:id', auth, async (req, res) => {
+  if (!CASUAL_EDIT_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  const { full_name, national_id, project, client, organization } = req.body;
+  const { rows } = await pool.query(
+    `UPDATE casuals SET full_name=$1, national_id=$2, project=$3, client=$4, organization=$5, updated_at=NOW() WHERE id=$6 RETURNING *`,
+    [full_name, national_id || null, project, client || null, organization || null, req.params.id]
+  );
+  if (!rows.length) return res.status(404).json({ error: 'Not found' });
+  res.json(rows[0]);
+});
+
+// Exit a casual (admin, supervisor only) — cancels open casual PPE requests
+app.put('/api/casuals/:id/status', auth, async (req, res) => {
+  if (!CASUAL_EDIT_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  const { employment_status, exit_date } = req.body;
+  const client_db = await pool.connect();
+  try {
+    await client_db.query('BEGIN');
+    await client_db.query('UPDATE casuals SET employment_status=$1, exit_date=$2, updated_at=NOW() WHERE id=$3', [employment_status, exit_date || null, req.params.id]);
+    if (employment_status === 'exit') {
+      await client_db.query(`UPDATE casual_ppe_requests SET status='canceled', updated_at=NOW() WHERE casual_id=$1 AND status NOT IN ('distributed','canceled')`, [req.params.id]);
+    }
+    await client_db.query('COMMIT');
+    const { rows } = await pool.query('SELECT * FROM casuals WHERE id=$1', [req.params.id]);
+    res.json(rows[0]);
+  } catch(e) { await client_db.query('ROLLBACK'); console.error('Casual status error:', e.message); res.status(500).json({ error: 'Server error' }); }
+  finally { client_db.release(); }
 });
 
 // Delete employee (admin only)

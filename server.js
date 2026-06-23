@@ -639,7 +639,7 @@ const CASUAL_PPE_VIEW_ROLES = ['admin', 'ehs_manager', 'ehs_officer', 'superviso
 
 // Create casual PPE requests from checklist (admin, supervisor only)
 app.post('/api/casual-ppe-requests', auth, async (req, res) => {
-  if (!CASUAL_EDIT_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  if (!['admin', 'ehs_manager'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
   const { casual_id, items } = req.body;
   if (!casual_id || !Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'casual_id and at least one item required' });

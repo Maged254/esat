@@ -569,10 +569,10 @@ app.get('/api/casuals', auth, async (req, res) => {
   try {
     const casualProjects = await getProjectFilter(req.user);
     if (casualProjects !== null && casualProjects.length === 0) return res.json([]);
-    let q = 'SELECT * FROM casuals WHERE 1=1';
+    let q = `SELECT c.*, COUNT(cpa.id) > 0 as ppe_assigned FROM casuals c LEFT JOIN casual_ppe_assignments cpa ON cpa.casual_id=c.id WHERE 1=1`;
     const params = [];
-    if (casualProjects !== null) { params.push(casualProjects); q += ` AND project = ANY($${params.length})`; }
-    q += ' ORDER BY created_at DESC';
+    if (casualProjects !== null) { params.push(casualProjects); q += ` AND c.project = ANY($${params.length})`; }
+    q += ' GROUP BY c.id ORDER BY c.created_at DESC';
     const { rows } = await pool.query(q, params);
     res.json(rows);
   } catch(e) { console.error('Casuals list error:', e.message); res.status(500).json({ error: e.message }); }
@@ -632,6 +632,34 @@ app.put('/api/casuals/:id/status', auth, async (req, res) => {
     res.json(rows[0]);
   } catch(e) { await client_db.query('ROLLBACK'); console.error('Casual status error:', e.message); res.status(500).json({ error: 'Server error' }); }
   finally { client_db.release(); }
+});
+
+// Get casual PPE assignments
+app.get('/api/casuals/:id/ppe-assignments', auth, async (req, res) => {
+  const { rows } = await pool.query(`SELECT p.* FROM ppe_items p JOIN casual_ppe_assignments cpa ON cpa.ppe_item_id=p.id WHERE cpa.casual_id=$1 AND p.is_active=true ORDER BY p.sort_order`, [req.params.id]);
+  res.json(rows);
+});
+// Set casual PPE assignments (admin, ehs_manager only)
+app.put('/api/casuals/:id/ppe-assignments', auth, async (req, res) => {
+  if (!['admin','ehs_manager'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  const { ppe_item_ids } = req.body;
+  const casualId = req.params.id;
+  const client_db = await pool.connect();
+  try {
+    await client_db.query('BEGIN');
+    await client_db.query('DELETE FROM casual_ppe_assignments WHERE casual_id=$1', [casualId]);
+    if (ppe_item_ids && ppe_item_ids.length > 0) {
+      for (const ppeId of ppe_item_ids) {
+        await client_db.query('INSERT INTO casual_ppe_assignments (casual_id, ppe_item_id) VALUES ($1,$2)', [casualId, ppeId]);
+      }
+    }
+    await client_db.query('COMMIT');
+    res.json({ success: true });
+  } catch (e) {
+    await client_db.query('ROLLBACK');
+    console.error('Casual PPE assignment error:', e.message);
+    res.status(500).json({ error: e.message });
+  } finally { client_db.release(); }
 });
 
 // ── Casual PPE Requests ──────────────────────────────────────────────────

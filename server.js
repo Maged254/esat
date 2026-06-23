@@ -582,24 +582,48 @@ app.get('/api/casuals', auth, async (req, res) => {
 app.post('/api/casuals/batch', auth, async (req, res) => {
   if (!CASUAL_EDIT_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
   const { project, client, organization, casuals } = req.body;
-  if (!project || !Array.isArray(casuals) || casuals.length === 0) {
-    return res.status(400).json({ error: 'project and at least one casual required' });
+  if (!project || !client || !Array.isArray(casuals) || casuals.length === 0) {
+    return res.status(400).json({ error: 'project, client, and at least one casual required' });
   }
   const client_db = await pool.connect();
   try {
     await client_db.query('BEGIN');
     const inserted = [];
+    const reactivated = [];
+    const skipped = [];
     for (const c of casuals) {
-      if (!c.full_name) continue;
+      if (!c.full_name || !c.national_id) {
+        skipped.push({ full_name: c.full_name || '(no name)', reason: 'Full name and National ID are required' });
+        continue;
+      }
+      const { rows: existing } = await client_db.query(
+        'SELECT * FROM casuals WHERE national_id=$1',
+        [c.national_id]
+      );
+      if (existing.length > 0) {
+        const match = existing[0];
+        if (match.employment_status === 'active') {
+          skipped.push({ full_name: c.full_name, reason: `National ID ${c.national_id} already exists as an active casual (${match.full_name})` });
+          continue;
+        } else {
+          const { rows } = await client_db.query(
+            `UPDATE casuals SET full_name=$1, project=$2, client=$3, organization=$4, employment_status='active', exit_date=NULL, updated_at=NOW()
+             WHERE id=$5 RETURNING *`,
+            [c.full_name, project, client, organization || 'Egypro', match.id]
+          );
+          reactivated.push(rows[0]);
+          continue;
+        }
+      }
       const { rows } = await client_db.query(
         `INSERT INTO casuals (full_name, national_id, job_title, project, client, organization, created_by)
          VALUES ($1,$2,'Casual',$3,$4,$5,$6) RETURNING *`,
-        [c.full_name, c.national_id || null, project, client || null, organization || null, req.user.id]
+        [c.full_name, c.national_id, project, client, organization || 'Egypro', req.user.id]
       );
       inserted.push(rows[0]);
     }
     await client_db.query('COMMIT');
-    res.json(inserted);
+    res.json({ inserted, reactivated, skipped });
   } catch(e) { await client_db.query('ROLLBACK'); console.error('Casuals batch add error:', e.message); res.status(500).json({ error: e.message }); }
   finally { client_db.release(); }
 });

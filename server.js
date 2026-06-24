@@ -1159,7 +1159,13 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
   try {
     const { rows } = await pool.query(`
       SELECT r.*,
-        e.full_name as employee_name, e.employee_number, e.national_id as employee_national_id, e.employment_status, e.project, e.client,
+        COALESCE(e.full_name, c.full_name) as employee_name,
+        e.employee_number,
+        COALESCE(e.national_id, c.national_id) as employee_national_id,
+        COALESCE(e.employment_status, c.employment_status) as employment_status,
+        COALESCE(e.project, c.project) as project,
+        COALESCE(e.client, c.client) as client,
+        (r.casual_id IS NOT NULL) as is_casual,
         p.name as ppe_name, p.category, p.needs_pda,
         u0.full_name as flagged_by_name,
         u1.full_name as purchase_requested_by_name,
@@ -1170,7 +1176,8 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
         l.name as location_name,
         COALESCE((SELECT ai3.quantity FROM audit_items ai3 JOIN ncr_items n3 ON n3.audit_item_id=ai3.id WHERE n3.id=r.ncr_item_id LIMIT 1), 1) as quantity
       FROM ppe_requests r
-      JOIN employees e ON e.id=r.employee_id
+      LEFT JOIN employees e ON e.id=r.employee_id
+      LEFT JOIN casuals c ON c.id=r.casual_id
       JOIN ppe_items p ON p.id=r.ppe_item_id
       LEFT JOIN audits a ON a.id=(SELECT ai2.audit_id FROM audit_items ai2 JOIN ncr_items n2 ON n2.audit_item_id=ai2.id WHERE n2.id=r.ncr_item_id LIMIT 1)
       LEFT JOIN locations l ON l.id=a.location_id
@@ -1565,20 +1572,22 @@ async function sendDailyBTSDigest() {
     const { rows: pending } = await pool.query(`
       SELECT COUNT(*) as count, MAX(CURRENT_DATE - date_available::date) as oldest_days
       FROM ppe_requests r
-      JOIN employees e ON e.id = r.employee_id
+      LEFT JOIN employees e ON e.id = r.employee_id
+      LEFT JOIN casuals c ON c.id = r.casual_id
       WHERE r.status = 'warehouse_available'
-      AND e.project = ANY($1)
+      AND COALESCE(e.project, c.project) = ANY($1)
     `, [btsProjects]);
     const count = parseInt(pending[0].count);
     const oldestDays = parseInt(pending[0].oldest_days) || 0;
     if (count === 0) return;
     const { rows: byProject } = await pool.query(`
-      SELECT e.project, e.client, COUNT(*) as count, MAX(CURRENT_DATE - date_available::date) as oldest_days
+      SELECT COALESCE(e.project, c.project) as project, COALESCE(e.client, c.client) as client, COUNT(*) as count, MAX(CURRENT_DATE - date_available::date) as oldest_days
       FROM ppe_requests r
-      JOIN employees e ON e.id = r.employee_id
+      LEFT JOIN employees e ON e.id = r.employee_id
+      LEFT JOIN casuals c ON c.id = r.casual_id
       WHERE r.status = 'warehouse_available'
-      AND e.project = ANY($1)
-      GROUP BY e.project, e.client
+      AND COALESCE(e.project, c.project) = ANY($1)
+      GROUP BY COALESCE(e.project, c.project), COALESCE(e.client, c.client)
       ORDER BY count DESC
     `, [btsProjects]);
     const projectRowsHtml = byProject.map(p => `
@@ -1634,20 +1643,22 @@ async function sendDailyFibreDigest() {
     const { rows: pending } = await pool.query(`
       SELECT COUNT(*) as count, MAX(CURRENT_DATE - date_available::date) as oldest_days
       FROM ppe_requests r
-      JOIN employees e ON e.id = r.employee_id
+      LEFT JOIN employees e ON e.id = r.employee_id
+      LEFT JOIN casuals c ON c.id = r.casual_id
       WHERE r.status = 'warehouse_available'
-      AND e.project = ANY($1)
+      AND COALESCE(e.project, c.project) = ANY($1)
     `, [fibreProjects]);
     const count = parseInt(pending[0].count);
     const oldestDays = parseInt(pending[0].oldest_days) || 0;
     if (count === 0) return;
     const { rows: byProject } = await pool.query(`
-      SELECT e.project, e.client, COUNT(*) as count, MAX(CURRENT_DATE - date_available::date) as oldest_days
+      SELECT COALESCE(e.project, c.project) as project, COALESCE(e.client, c.client) as client, COUNT(*) as count, MAX(CURRENT_DATE - date_available::date) as oldest_days
       FROM ppe_requests r
-      JOIN employees e ON e.id = r.employee_id
+      LEFT JOIN employees e ON e.id = r.employee_id
+      LEFT JOIN casuals c ON c.id = r.casual_id
       WHERE r.status = 'warehouse_available'
-      AND e.project = ANY($1)
-      GROUP BY e.project, e.client
+      AND COALESCE(e.project, c.project) = ANY($1)
+      GROUP BY COALESCE(e.project, c.project), COALESCE(e.client, c.client)
       ORDER BY count DESC
     `, [fibreProjects]);
     const projectRowsHtml = byProject.map(p => `

@@ -846,7 +846,8 @@ app.get('/api/audits', auth, async (req, res) => {
     const params = [];
     if (search) { params.push(`%${search}%`); q += ` AND COALESCE(e.full_name, c.full_name) ILIKE $${params.length}`; }
     if (national_id) { params.push(`%${national_id}%`); q += ` AND COALESCE(e.national_id, c.national_id) ILIKE $${params.length}`; }
-    if (resource_type) { params.push(resource_type); q += ` AND e.resource_type=$${params.length}`; }
+    if (resource_type === 'casual') { q += ` AND a.casual_id IS NOT NULL`; }
+    else if (resource_type) { params.push(resource_type); q += ` AND e.resource_type=$${params.length}`; }
     if (project) { params.push(project); q += ` AND COALESCE(e.project, c.project)=$${params.length}`; }
     if (client) { params.push(client); q += ` AND COALESCE(e.client, c.client)=$${params.length}`; }
     if (status) { params.push(status); q += ` AND COALESCE(e.employment_status, c.employment_status)=$${params.length}`; }

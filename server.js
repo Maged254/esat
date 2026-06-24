@@ -991,9 +991,22 @@ app.get('/api/ncr', auth, async (req, res) => {
     if (ncrProjects !== null && ncrProjects.length === 0) {
       ncrRows = [];
     } else {
-      let ncrQ = `SELECT n.*,e.full_name as employee_name,e.employee_number,e.national_id as employee_national_id,e.project,p.name as ppe_name,p.category,p.needs_pda,u.full_name as audited_by_name,COALESCE(ai.quantity,1) as quantity FROM ncr_items n JOIN employees e ON e.id=n.employee_id JOIN ppe_items p ON p.id=n.ppe_item_id LEFT JOIN audit_items ai ON ai.id=n.audit_item_id LEFT JOIN audits a ON a.id=ai.audit_id LEFT JOIN users u ON u.id=a.audited_by WHERE 1=1`;
+      let ncrQ = `SELECT n.*,
+          COALESCE(e.full_name, c.full_name) as employee_name,
+          e.employee_number,
+          COALESCE(e.national_id, c.national_id) as employee_national_id,
+          COALESCE(e.project, c.project) as project,
+          (n.casual_id IS NOT NULL) as is_casual,
+          p.name as ppe_name,p.category,p.needs_pda,u.full_name as audited_by_name,COALESCE(ai.quantity,1) as quantity
+        FROM ncr_items n
+        LEFT JOIN employees e ON e.id=n.employee_id
+        LEFT JOIN casuals c ON c.id=n.casual_id
+        JOIN ppe_items p ON p.id=n.ppe_item_id
+        LEFT JOIN audit_items ai ON ai.id=n.audit_item_id
+        LEFT JOIN audits a ON a.id=ai.audit_id
+        LEFT JOIN users u ON u.id=a.audited_by WHERE 1=1`;
       const ncrParams = [];
-      if (ncrProjects !== null) { ncrParams.push(ncrProjects); ncrQ += ` AND e.project = ANY($${ncrParams.length})`; }
+      if (ncrProjects !== null) { ncrParams.push(ncrProjects); ncrQ += ` AND COALESCE(e.project, c.project) = ANY($${ncrParams.length})`; }
       ncrQ += ` ORDER BY n.created_at DESC`;
       const { rows: _ncrRows } = await pool.query(ncrQ, ncrParams);
       ncrRows = _ncrRows;

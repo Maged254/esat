@@ -706,6 +706,18 @@ app.delete('/api/employees/:id', auth, async (req, res) => {
   }
 });
 
+// Delete a casual (admin only)
+app.delete('/api/casuals/:id', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    await pool.query('DELETE FROM casuals WHERE id=$1', [req.params.id]);
+    res.json({ message: 'Deleted' });
+  } catch (e) {
+    if (e.code === '23503') return res.status(400).json({ error: 'Cannot delete: this casual has existing audits, NCR items, or PPE requests. Exit them instead.' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // PPE Items
 app.get('/api/ppe', auth, async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM ppe_items WHERE is_active=true ORDER BY sort_order');

@@ -307,7 +307,7 @@ app.get('/api/dashboard', auth, async (req, res) => {
         FROM ppe_requests
         WHERE status NOT IN ('distributed','resolved','canceled')
       `),
-      pool.query(`SELECT a.id,a.audit_date,a.overall_status,e.full_name as employee_name,e.employee_number,e.national_id,e.department,e.project,u.full_name as audited_by_name,COUNT(ai.id) as total_items,COUNT(CASE WHEN ai.condition!='good' THEN 1 END) as issues_count FROM audits a JOIN employees e ON e.id=a.employee_id JOIN users u ON u.id=a.audited_by LEFT JOIN audit_items ai ON ai.audit_id=a.id GROUP BY a.id,e.full_name,e.employee_number,e.national_id,e.department,e.project,u.full_name ORDER BY a.created_at DESC LIMIT 5`)
+      pool.query(`SELECT a.id,a.audit_date,a.overall_status,COALESCE(e.full_name,c.full_name) as employee_name,e.employee_number,COALESCE(e.national_id,c.national_id) as national_id,e.department,COALESCE(e.project,c.project) as project,u.full_name as audited_by_name,COUNT(ai.id) as total_items,COUNT(CASE WHEN ai.condition!='good' THEN 1 END) as issues_count FROM audits a LEFT JOIN employees e ON e.id=a.employee_id LEFT JOIN casuals c ON c.id=a.casual_id JOIN users u ON u.id=a.audited_by LEFT JOIN audit_items ai ON ai.audit_id=a.id GROUP BY a.id,e.full_name,c.full_name,e.employee_number,e.national_id,c.national_id,e.department,e.project,c.project,u.full_name ORDER BY a.created_at DESC LIMIT 5`)
     ]);
     const c = comp.rows[0];
     res.json({
@@ -826,24 +826,37 @@ app.get('/api/ppe', auth, async (req, res) => {
 app.get('/api/audits', auth, async (req, res) => {
   try {
     const { search, national_id, resource_type, project, client, status, audited_by } = req.query;
-    let q = `SELECT a.*,e.full_name as employee_name,e.employee_number,e.national_id,e.department,e.project,e.client,e.organization,e.resource_type,u.full_name as audited_by_name,
+    let q = `SELECT a.*,
+        COALESCE(e.full_name, c.full_name) as employee_name,
+        e.employee_number,
+        COALESCE(e.national_id, c.national_id) as national_id,
+        e.department,
+        COALESCE(e.project, c.project) as project,
+        COALESCE(e.client, c.client) as client,
+        COALESCE(e.organization, c.organization) as organization,
+        e.resource_type,
+        (a.casual_id IS NOT NULL) as is_casual,
+        u.full_name as audited_by_name,
         COUNT(ai.id) as total_items, COUNT(CASE WHEN ai.condition!='good' THEN 1 END) as issues_count
-      FROM audits a JOIN employees e ON e.id=a.employee_id JOIN users u ON u.id=a.audited_by
+      FROM audits a
+      LEFT JOIN employees e ON e.id=a.employee_id
+      LEFT JOIN casuals c ON c.id=a.casual_id
+      JOIN users u ON u.id=a.audited_by
       LEFT JOIN audit_items ai ON ai.audit_id=a.id WHERE 1=1`;
     const params = [];
-    if (search) { params.push(`%${search}%`); q += ` AND e.full_name ILIKE $${params.length}`; }
-    if (national_id) { params.push(`%${national_id}%`); q += ` AND e.national_id ILIKE $${params.length}`; }
+    if (search) { params.push(`%${search}%`); q += ` AND COALESCE(e.full_name, c.full_name) ILIKE $${params.length}`; }
+    if (national_id) { params.push(`%${national_id}%`); q += ` AND COALESCE(e.national_id, c.national_id) ILIKE $${params.length}`; }
     if (resource_type) { params.push(resource_type); q += ` AND e.resource_type=$${params.length}`; }
-    if (project) { params.push(project); q += ` AND e.project=$${params.length}`; }
-    if (client) { params.push(client); q += ` AND e.client=$${params.length}`; }
-    if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
+    if (project) { params.push(project); q += ` AND COALESCE(e.project, c.project)=$${params.length}`; }
+    if (client) { params.push(client); q += ` AND COALESCE(e.client, c.client)=$${params.length}`; }
+    if (status) { params.push(status); q += ` AND COALESCE(e.employment_status, c.employment_status)=$${params.length}`; }
     if (audited_by) { params.push(audited_by); q += ` AND a.audited_by=$${params.length}`; }
     const auditProjects = await getProjectFilter(req.user);
     if (auditProjects !== null) {
       if (auditProjects.length === 0) { return res.json([]); }
-      params.push(auditProjects); q += ` AND e.project = ANY($${params.length})`;
+      params.push(auditProjects); q += ` AND COALESCE(e.project, c.project) = ANY($${params.length})`;
     }
-    q += ` GROUP BY a.id,e.full_name,e.employee_number,e.national_id,e.department,e.project,e.client,e.organization,e.resource_type,u.full_name,a.employee_present ORDER BY a.created_at DESC`;
+    q += ` GROUP BY a.id,e.full_name,c.full_name,e.employee_number,e.national_id,c.national_id,e.department,e.project,c.project,e.client,c.client,e.organization,c.organization,e.resource_type,u.full_name,a.employee_present,a.casual_id ORDER BY a.created_at DESC`;
     const { rows } = await pool.query(q, params);
     res.json(rows);
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
@@ -906,8 +919,24 @@ app.get('/api/audits/leaderboard', auth, async (req, res) => {
 app.get('/api/audits/:id', auth, async (req, res) => {
   try {
     const { rows: [audit] } = await pool.query(`
-      SELECT a.*,e.full_name as employee_name,e.employee_number,e.national_id,e.department,e.project,e.job_title,e.client,e.organization,e.resource_type,u.full_name as audited_by_name,l.name as location_name
-      FROM audits a JOIN employees e ON e.id=a.employee_id JOIN users u ON u.id=a.audited_by LEFT JOIN locations l ON l.id=a.location_id
+      SELECT a.*,
+        COALESCE(e.full_name, c.full_name) as employee_name,
+        e.employee_number,
+        COALESCE(e.national_id, c.national_id) as national_id,
+        e.department,
+        COALESCE(e.project, c.project) as project,
+        COALESCE(e.job_title, c.job_title) as job_title,
+        COALESCE(e.client, c.client) as client,
+        COALESCE(e.organization, c.organization) as organization,
+        e.resource_type,
+        (a.casual_id IS NOT NULL) as is_casual,
+        u.full_name as audited_by_name,
+        l.name as location_name
+      FROM audits a
+      LEFT JOIN employees e ON e.id=a.employee_id
+      LEFT JOIN casuals c ON c.id=a.casual_id
+      JOIN users u ON u.id=a.audited_by
+      LEFT JOIN locations l ON l.id=a.location_id
       WHERE a.id=$1
     `, [req.params.id]);
     if (!audit) return res.status(404).json({ error: 'Not found' });
@@ -921,25 +950,29 @@ app.get('/api/audits/:id', auth, async (req, res) => {
 });
 
 app.post('/api/audits', auth, async (req, res) => {
-  const { employee_id, audit_date, notes, items, audited_by_override, employee_present, location_id } = req.body;
+  const { employee_id, casual_id, audit_date, notes, items, audited_by_override, employee_present, location_id } = req.body;
+  if (!employee_id && !casual_id) return res.status(400).json({ error: 'employee_id or casual_id required' });
+  if (employee_id && casual_id) return res.status(400).json({ error: 'Provide only one of employee_id or casual_id' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const hasIssues = items.some(i => i.condition !== 'good');
     const allBad = items.every(i => i.condition !== 'good');
     const overall_status = !hasIssues ? 'compliant' : allBad ? 'non_compliant' : 'partial';
-    const { rows: [audit] } = await client.query(`INSERT INTO audits (employee_id,audited_by,audit_date,overall_status,notes,employee_present,location_id) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`, [employee_id, audited_by_override || req.user.id, audit_date || new Date(), overall_status, notes, employee_present !== false, location_id || null]);
+    const { rows: [audit] } = await client.query(`INSERT INTO audits (employee_id,casual_id,audited_by,audit_date,overall_status,notes,employee_present,location_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`, [employee_id || null, casual_id || null, audited_by_override || req.user.id, audit_date || new Date(), overall_status, notes, employee_present !== false, location_id || null]);
     for (const item of items) {
       const { rows: [ai] } = await client.query(`INSERT INTO audit_items (audit_id,ppe_item_id,condition,size_value,comment,quantity) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`, [audit.id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null, item.quantity || 1]);
       if (item.condition === 'not_good') {
-        // Skip if open PPE request already exists for this employee + PPE item
+        // Skip if open PPE request already exists for this person + PPE item
         const { rows: existing } = await client.query(
-          `SELECT id FROM ppe_requests WHERE employee_id=$1 AND ppe_item_id=$2 AND status NOT IN ('distributed','resolved','canceled')`,
-          [employee_id, item.ppe_item_id]
+          employee_id
+            ? `SELECT id FROM ppe_requests WHERE employee_id=$1 AND ppe_item_id=$2 AND status NOT IN ('distributed','resolved','canceled')`
+            : `SELECT id FROM ppe_requests WHERE casual_id=$1 AND ppe_item_id=$2 AND status NOT IN ('distributed','resolved','canceled')`,
+          [employee_id || casual_id, item.ppe_item_id]
         );
         if (existing.length === 0) {
-          const { rows: [ncr] } = await client.query('INSERT INTO ncr_items (audit_item_id,employee_id,ppe_item_id,condition,size_value,comment) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *', [ai.id, employee_id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null]);
-          await client.query('INSERT INTO ppe_requests (ncr_item_id,employee_id,ppe_item_id,size_value,status,flagged_by) VALUES ($1,$2,$3,$4,$5,$6)', [ncr.id, employee_id, item.ppe_item_id, item.size_value || null, 'pending', req.user.id]);
+          const { rows: [ncr] } = await client.query('INSERT INTO ncr_items (audit_item_id,employee_id,casual_id,ppe_item_id,condition,size_value,comment) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *', [ai.id, employee_id || null, casual_id || null, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null]);
+          await client.query('INSERT INTO ppe_requests (ncr_item_id,employee_id,casual_id,ppe_item_id,size_value,status,flagged_by) VALUES ($1,$2,$3,$4,$5,$6,$7)', [ncr.id, employee_id || null, casual_id || null, item.ppe_item_id, item.size_value || null, 'pending', req.user.id]);
         }
       }
     }

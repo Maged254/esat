@@ -624,6 +624,31 @@ app.post('/api/casuals/batch', auth, async (req, res) => {
       inserted.push(rows[0]);
     }
     await client_db.query('COMMIT');
+    const totalAdded = inserted.length + reactivated.length;
+    if (totalAdded > 0) {
+      resend.emails.send({
+        from: 'ESAT <esat@egypro.app>',
+        to: 'e.maged@outlook.com',
+        subject: `ESAT — ${totalAdded} Casual${totalAdded > 1 ? 's' : ''} Added`,
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
+            <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
+              <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="110" height="50" style="height:50px; width:110px; display:block; margin:0 auto;" />
+            </td></tr></table>
+            <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
+              <p style="font-size: 15px; color: #374151;">
+                <strong style="color: #0f2a4a;">${totalAdded} casual${totalAdded > 1 ? 's were' : ' was'}</strong> added by <strong style="color: #0f2a4a;">${req.user.name || req.user.email}</strong>.
+              </p>
+              <a href="https://esat.egypro.app/casuals"
+                style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">
+                Open ESAT
+              </a>
+              <p style="font-size: 14px; color: #374151; margin-top: 24px;">Thanks,<br/>Maged Ezzat</p>
+            </div>
+          </div>
+        `
+      }).catch(e => console.error('Casuals batch email error:', e.message));
+    }
     res.json({ inserted, reactivated, skipped });
   } catch(e) { await client_db.query('ROLLBACK'); console.error('Casuals batch add error:', e.message); res.status(500).json({ error: e.message }); }
   finally { client_db.release(); }

@@ -329,6 +329,9 @@ app.get('/api/dashboard', auth, async (req, res) => {
 
 // Employees
 app.get('/api/employees', auth, async (req, res) => {
+  if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) {
+    return res.status(403).json({ error: 'Not authorized' });
+  }
   try {
     const { status, search, national_id, project, client, san, job_title, department, resource_type } = req.query;
     let q = `SELECT e.*, MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) as days_since_audit, COUNT(epa.id) > 0 as ppe_assigned, u.full_name as ppe_last_edited_by_name FROM employees e LEFT JOIN audits a ON a.employee_id=e.id LEFT JOIN employee_ppe_assignments epa ON epa.employee_id=e.id LEFT JOIN users u ON u.id=e.ppe_last_edited_by WHERE 1=1`;
@@ -473,10 +476,17 @@ app.get('/api/employees/overdue', auth, async (req, res) => {
 app.get('/api/employees/:id', auth, async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM employees WHERE id=$1', [req.params.id]);
   if (!rows[0]) return res.status(404).json({ error: 'Not found' });
+  const empProjects = await getProjectFilter(req.user);
+  if (empProjects !== null && !empProjects.includes(rows[0].project)) {
+    return res.status(404).json({ error: 'Not found' });
+  }
   res.json(rows[0]);
 });
 
 app.get('/api/employees/:id/ppe-assignments', auth, async (req, res) => {
+  if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) {
+    return res.status(403).json({ error: 'Not authorized' });
+  }
   const { rows } = await pool.query(`SELECT p.* FROM ppe_items p JOIN employee_ppe_assignments epa ON epa.ppe_item_id=p.id WHERE epa.employee_id=$1 AND p.is_active=true ORDER BY p.sort_order`, [req.params.id]);
   res.json(rows);
 });
@@ -689,6 +699,9 @@ app.put('/api/casuals/:id/status', auth, async (req, res) => {
 
 // Get casual PPE assignments
 app.get('/api/casuals/:id/ppe-assignments', auth, async (req, res) => {
+  if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) {
+    return res.status(403).json({ error: 'Not authorized' });
+  }
   const { rows } = await pool.query(`SELECT p.* FROM ppe_items p JOIN casual_ppe_assignments cpa ON cpa.ppe_item_id=p.id WHERE cpa.casual_id=$1 AND p.is_active=true ORDER BY p.sort_order`, [req.params.id]);
   res.json(rows);
 });

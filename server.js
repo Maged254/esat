@@ -639,6 +639,9 @@ app.post('/api/casuals/batch', auth, async (req, res) => {
               <p style="font-size: 15px; color: #374151;">
                 <strong style="color: #0f2a4a;">${totalAdded} casual${totalAdded > 1 ? 's were' : ' was'}</strong> added by <strong style="color: #0f2a4a;">${req.user.name || req.user.email}</strong>.
               </p>
+              <p style="font-size: 15px; color: #374151;">
+                Project: <strong style="color: #0f2a4a;">${project}</strong> &middot; Client: <strong style="color: #0f2a4a;">${client}</strong>
+              </p>
               <a href="https://esat.egypro.app/casuals"
                 style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">
                 Open ESAT

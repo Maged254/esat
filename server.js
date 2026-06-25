@@ -331,7 +331,7 @@ app.get('/api/dashboard', auth, async (req, res) => {
 app.get('/api/employees', auth, async (req, res) => {
   try {
     const { status, search, national_id, project, client, san, job_title, department, resource_type } = req.query;
-    let q = `SELECT e.*, MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) as days_since_audit, COUNT(epa.id) > 0 as ppe_assigned FROM employees e LEFT JOIN audits a ON a.employee_id=e.id LEFT JOIN employee_ppe_assignments epa ON epa.employee_id=e.id WHERE 1=1`;
+    let q = `SELECT e.*, MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) as days_since_audit, COUNT(epa.id) > 0 as ppe_assigned, u.full_name as ppe_last_edited_by_name FROM employees e LEFT JOIN audits a ON a.employee_id=e.id LEFT JOIN employee_ppe_assignments epa ON epa.employee_id=e.id LEFT JOIN users u ON u.id=e.ppe_last_edited_by WHERE 1=1`;
     const params = [];
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
     if (search) { params.push(`%${search}%`); q += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length})`; }
@@ -348,7 +348,7 @@ app.get('/api/employees', auth, async (req, res) => {
       if (empProjects.length === 0) { return res.json([]); }
       params.push(empProjects); q += ` AND e.project = ANY($${params.length})`;
     }
-    q += ` GROUP BY e.id ORDER BY e.full_name`;
+    q += ` GROUP BY e.id, u.full_name ORDER BY e.full_name`;
     const { rows } = await pool.query(q, params);
     res.json(rows);
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
@@ -495,6 +495,7 @@ app.put('/api/employees/:id/ppe-assignments', auth, async (req, res) => {
         await client.query('INSERT INTO employee_ppe_assignments (employee_id, ppe_item_id) VALUES ($1,$2)', [employeeId, ppeId]);
       }
     }
+    await client.query('UPDATE employees SET ppe_last_edited_by=$1, ppe_last_edited_at=NOW() WHERE id=$2', [req.user.id, employeeId]);
     await client.query('COMMIT');
     res.json({ success: true });
   } catch (e) {

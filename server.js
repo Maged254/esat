@@ -569,10 +569,10 @@ app.get('/api/casuals', auth, async (req, res) => {
   try {
     const casualProjects = await getProjectFilter(req.user);
     if (casualProjects !== null && casualProjects.length === 0) return res.json([]);
-    let q = `SELECT c.*, COUNT(cpa.id) > 0 as ppe_assigned, u.full_name as last_edited_by_name FROM casuals c LEFT JOIN casual_ppe_assignments cpa ON cpa.casual_id=c.id LEFT JOIN users u ON u.id=c.last_edited_by WHERE 1=1`;
+    let q = `SELECT c.*, COUNT(cpa.id) > 0 as ppe_assigned, u.full_name as last_edited_by_name, u2.full_name as ppe_last_edited_by_name FROM casuals c LEFT JOIN casual_ppe_assignments cpa ON cpa.casual_id=c.id LEFT JOIN users u ON u.id=c.last_edited_by LEFT JOIN users u2 ON u2.id=c.ppe_last_edited_by WHERE 1=1`;
     const params = [];
     if (casualProjects !== null) { params.push(casualProjects); q += ` AND c.project = ANY($${params.length})`; }
-    q += ' GROUP BY c.id, u.full_name ORDER BY c.created_at DESC';
+    q += ' GROUP BY c.id, u.full_name, u2.full_name ORDER BY c.created_at DESC';
     const { rows } = await pool.query(q, params);
     res.json(rows);
   } catch(e) { console.error('Casuals list error:', e.message); res.status(500).json({ error: e.message }); }
@@ -677,6 +677,7 @@ app.put('/api/casuals/:id/ppe-assignments', auth, async (req, res) => {
         await client_db.query('INSERT INTO casual_ppe_assignments (casual_id, ppe_item_id) VALUES ($1,$2)', [casualId, ppeId]);
       }
     }
+    await client_db.query('UPDATE casuals SET ppe_last_edited_by=$1, ppe_last_edited_at=NOW() WHERE id=$2', [req.user.id, casualId]);
     await client_db.query('COMMIT');
     res.json({ success: true });
   } catch (e) {

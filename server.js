@@ -569,10 +569,10 @@ app.get('/api/casuals', auth, async (req, res) => {
   try {
     const casualProjects = await getProjectFilter(req.user);
     if (casualProjects !== null && casualProjects.length === 0) return res.json([]);
-    let q = `SELECT c.*, COUNT(cpa.id) > 0 as ppe_assigned FROM casuals c LEFT JOIN casual_ppe_assignments cpa ON cpa.casual_id=c.id WHERE 1=1`;
+    let q = `SELECT c.*, COUNT(cpa.id) > 0 as ppe_assigned, u.full_name as last_edited_by_name FROM casuals c LEFT JOIN casual_ppe_assignments cpa ON cpa.casual_id=c.id LEFT JOIN users u ON u.id=c.last_edited_by WHERE 1=1`;
     const params = [];
     if (casualProjects !== null) { params.push(casualProjects); q += ` AND c.project = ANY($${params.length})`; }
-    q += ' GROUP BY c.id ORDER BY c.created_at DESC';
+    q += ' GROUP BY c.id, u.full_name ORDER BY c.created_at DESC';
     const { rows } = await pool.query(q, params);
     res.json(rows);
   } catch(e) { console.error('Casuals list error:', e.message); res.status(500).json({ error: e.message }); }
@@ -607,17 +607,17 @@ app.post('/api/casuals/batch', auth, async (req, res) => {
           continue;
         } else {
           const { rows } = await client_db.query(
-            `UPDATE casuals SET full_name=$1, project=$2, client=$3, organization=$4, employment_status='active', exit_date=NULL, updated_at=NOW()
-             WHERE id=$5 RETURNING *`,
-            [c.full_name, project, client, organization || 'Egypro', match.id]
+            `UPDATE casuals SET full_name=$1, project=$2, client=$3, organization=$4, employment_status='active', exit_date=NULL, updated_at=NOW(), last_edited_by=$5
+             WHERE id=$6 RETURNING *`,
+            [c.full_name, project, client, organization || 'Egypro', req.user.id, match.id]
           );
           reactivated.push(rows[0]);
           continue;
         }
       }
       const { rows } = await client_db.query(
-        `INSERT INTO casuals (full_name, national_id, job_title, project, client, organization, created_by)
-         VALUES ($1,$2,'Casual',$3,$4,$5,$6) RETURNING *`,
+        `INSERT INTO casuals (full_name, national_id, job_title, project, client, organization, created_by, last_edited_by)
+         VALUES ($1,$2,'Casual',$3,$4,$5,$6,$6) RETURNING *`,
         [c.full_name, c.national_id, project, client, organization || 'Egypro', req.user.id]
       );
       inserted.push(rows[0]);
@@ -633,8 +633,8 @@ app.put('/api/casuals/:id', auth, async (req, res) => {
   if (!CASUAL_EDIT_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
   const { full_name, national_id, project, client, organization } = req.body;
   const { rows } = await pool.query(
-    `UPDATE casuals SET full_name=$1, national_id=$2, project=$3, client=$4, organization=$5, updated_at=NOW() WHERE id=$6 RETURNING *`,
-    [full_name, national_id || null, project, client || null, organization || null, req.params.id]
+    `UPDATE casuals SET full_name=$1, national_id=$2, project=$3, client=$4, organization=$5, updated_at=NOW(), last_edited_by=$6 WHERE id=$7 RETURNING *`,
+    [full_name, national_id || null, project, client || null, organization || null, req.user.id, req.params.id]
   );
   if (!rows.length) return res.status(404).json({ error: 'Not found' });
   res.json(rows[0]);

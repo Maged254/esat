@@ -899,6 +899,14 @@ app.post('/api/audits', auth, async (req, res) => {
   const { employee_id, casual_id, audit_date, notes, items, audited_by_override, employee_present, location_id } = req.body;
   if (!employee_id && !casual_id) return res.status(400).json({ error: 'employee_id or casual_id required' });
   if (employee_id && casual_id) return res.status(400).json({ error: 'Provide only one of employee_id or casual_id' });
+  if (employee_id) {
+    const { rows: [emp] } = await pool.query('SELECT employment_status FROM employees WHERE id=$1', [employee_id]);
+    if (emp && emp.employment_status === 'exit') return res.status(400).json({ error: 'This employee has exited and can no longer be audited or have PPE/Tool requests created.' });
+  }
+  if (casual_id) {
+    const { rows: [cas] } = await pool.query('SELECT employment_status FROM casuals WHERE id=$1', [casual_id]);
+    if (cas && cas.employment_status === 'exit') return res.status(400).json({ error: 'This casual has exited and can no longer be audited or have PPE/Tool requests created.' });
+  }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');

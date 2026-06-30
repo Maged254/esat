@@ -877,12 +877,14 @@ app.get('/api/audits/:id', auth, async (req, res) => {
         e.resource_type,
         (a.casual_id IS NOT NULL) as is_casual,
         u.full_name as audited_by_name,
-        l.name as location_name
+        l.name as location_name,
+        u2.full_name as last_edited_by_name
       FROM audits a
       LEFT JOIN employees e ON e.id=a.employee_id
       LEFT JOIN casuals c ON c.id=a.casual_id
       JOIN users u ON u.id=a.audited_by
       LEFT JOIN locations l ON l.id=a.location_id
+      LEFT JOIN users u2 ON u2.id=a.last_edited_by
       WHERE a.id=$1
     `, [req.params.id]);
     if (!audit) return res.status(404).json({ error: 'Not found' });
@@ -974,8 +976,8 @@ app.put('/api/audits/:id', auth, async (req, res) => {
     const allBad = items.every(i => i.condition !== 'good');
     const overall_status = !hasIssues ? 'compliant' : allBad ? 'non_compliant' : 'partial';
     await client.query(
-      `UPDATE audits SET notes=$1, location_id=$2, employee_present=$3, overall_status=$4 WHERE id=$5`,
-      [notes || null, location_id || null, employee_present !== false, overall_status, id]
+      `UPDATE audits SET notes=$1, location_id=$2, employee_present=$3, overall_status=$4, last_edited_at=NOW(), last_edited_by=$6 WHERE id=$5`,
+      [notes || null, location_id || null, employee_present !== false, overall_status, id, req.user.id]
     );
 
     // Get existing audit_items for this audit

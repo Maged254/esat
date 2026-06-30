@@ -936,6 +936,158 @@ app.post('/api/audits', auth, async (req, res) => {
   finally { client.release(); }
 });
 
+// Edit Audit (within 24h for submitter; anytime for admin)
+app.put('/api/audits/:id', auth, async (req, res) => {
+  const { id } = req.params;
+  const { notes, location_id, employee_present, items } = req.body;
+  const isAdmin = req.user.role === 'admin';
+
+  // Fetch existing audit
+  const { rows: [existing] } = await pool.query('SELECT * FROM audits WHERE id=$1', [id]);
+  if (!existing) return res.status(404).json({ error: 'Audit not found' });
+
+  // 24h check for non-admins
+  if (!isAdmin) {
+    const ageMs = Date.now() - new Date(existing.created_at).getTime();
+    if (ageMs > 24 * 60 * 60 * 1000) return res.status(403).json({ error: 'Edit window has expired (24 hours).' });
+    if (existing.audited_by !== req.user.id) return res.status(403).json({ error: 'You can only edit your own requests.' });
+  }
+
+  // For non-admins: block if ANY linked PPE request has moved past pending
+  if (!isAdmin) {
+    const { rows: blocked } = await pool.query(
+      `SELECT pr.id FROM ppe_requests pr
+       JOIN ncr_items n ON n.id = pr.ncr_item_id
+       JOIN audit_items ai ON ai.id = n.audit_item_id
+       WHERE ai.audit_id=$1 AND pr.status NOT IN ('pending','canceled')`,
+      [id]
+    );
+    if (blocked.length > 0) return res.status(403).json({ error: 'This request has already been actioned by EHS. Contact an admin to make changes.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Update audit header
+    const hasIssues = items.some(i => i.condition !== 'good');
+    const allBad = items.every(i => i.condition !== 'good');
+    const overall_status = !hasIssues ? 'compliant' : allBad ? 'non_compliant' : 'partial';
+    await client.query(
+      `UPDATE audits SET notes=$1, location_id=$2, employee_present=$3, overall_status=$4 WHERE id=$5`,
+      [notes || null, location_id || null, employee_present !== false, overall_status, id]
+    );
+
+    // Get existing audit_items for this audit
+    const { rows: existingItems } = await client.query(
+      'SELECT * FROM audit_items WHERE audit_id=$1', [id]
+    );
+
+    for (const item of items) {
+      const existingAI = existingItems.find(ai => ai.ppe_item_id === item.ppe_item_id);
+      const oldCondition = existingAI ? existingAI.condition : null;
+      const newCondition = item.condition;
+
+      if (existingAI) {
+        // Update existing audit_item
+        await client.query(
+          `UPDATE audit_items SET condition=$1, size_value=$2, comment=$3, quantity=$4 WHERE id=$5`,
+          [newCondition, item.size_value || null, item.comment || null, item.quantity || 1, existingAI.id]
+        );
+
+        // Was not_good, now good → delete pending NCR + PPE request
+        if (oldCondition === 'not_good' && newCondition !== 'not_good') {
+          const { rows: ncrRows } = await client.query(
+            'SELECT n.id, pr.id as pr_id, pr.status FROM ncr_items n LEFT JOIN ppe_requests pr ON pr.ncr_item_id=n.id WHERE n.audit_item_id=$1',
+            [existingAI.id]
+          );
+          for (const ncr of ncrRows) {
+            if (!isAdmin && ncr.status && !['pending','canceled'].includes(ncr.status)) {
+              throw new Error(`Cannot remove ${item.ppe_item_id} — PPE request already actioned (${ncr.status}).`);
+            }
+            if (ncr.pr_id) await client.query('DELETE FROM ppe_requests WHERE id=$1', [ncr.pr_id]);
+            await client.query('DELETE FROM ncr_items WHERE id=$1', [ncr.id]);
+          }
+        }
+
+        // Was good/not_present, now not_good → create NCR + PPE request if no open one exists
+        if (oldCondition !== 'not_good' && newCondition === 'not_good') {
+          const personCol = existing.employee_id ? 'employee_id' : 'casual_id';
+          const personId = existing.employee_id || existing.casual_id;
+          const { rows: openReqs } = await client.query(
+            `SELECT id FROM ppe_requests WHERE ${personCol}=$1 AND ppe_item_id=$2 AND status NOT IN ('distributed','resolved','canceled')`,
+            [personId, item.ppe_item_id]
+          );
+          if (openReqs.length === 0) {
+            const { rows: [ncr] } = await client.query(
+              'INSERT INTO ncr_items (audit_item_id,employee_id,casual_id,ppe_item_id,condition,size_value,comment) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
+              [existingAI.id, existing.employee_id || null, existing.casual_id || null, item.ppe_item_id, newCondition, item.size_value || null, item.comment || null]
+            );
+            await client.query(
+              'INSERT INTO ppe_requests (ncr_item_id,employee_id,casual_id,ppe_item_id,size_value,status,flagged_by) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+              [ncr.id, existing.employee_id || null, existing.casual_id || null, item.ppe_item_id, item.size_value || null, 'pending', req.user.id]
+            );
+          }
+          // Also update NCR size/comment if it exists
+          await client.query(
+            'UPDATE ncr_items SET size_value=$1, comment=$2 WHERE audit_item_id=$3',
+            [item.size_value || null, item.comment || null, existingAI.id]
+          );
+          await client.query(
+            'UPDATE ppe_requests SET size_value=$1 WHERE ncr_item_id IN (SELECT id FROM ncr_items WHERE audit_item_id=$2)',
+            [item.size_value || null, existingAI.id]
+          );
+        }
+
+        // Still not_good → update NCR + PPE request size/comment
+        if (oldCondition === 'not_good' && newCondition === 'not_good') {
+          await client.query(
+            'UPDATE ncr_items SET size_value=$1, comment=$2 WHERE audit_item_id=$3',
+            [item.size_value || null, item.comment || null, existingAI.id]
+          );
+          await client.query(
+            'UPDATE ppe_requests SET size_value=$1 WHERE ncr_item_id IN (SELECT id FROM ncr_items WHERE audit_item_id=$2)',
+            [item.size_value || null, existingAI.id]
+          );
+        }
+
+      } else {
+        // New item not previously in audit — insert it
+        const { rows: [ai] } = await client.query(
+          `INSERT INTO audit_items (audit_id,ppe_item_id,condition,size_value,comment,quantity) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+          [id, item.ppe_item_id, newCondition, item.size_value || null, item.comment || null, item.quantity || 1]
+        );
+        if (newCondition === 'not_good') {
+          const personCol = existing.employee_id ? 'employee_id' : 'casual_id';
+          const personId = existing.employee_id || existing.casual_id;
+          const { rows: openReqs } = await client.query(
+            `SELECT id FROM ppe_requests WHERE ${personCol}=$1 AND ppe_item_id=$2 AND status NOT IN ('distributed','resolved','canceled')`,
+            [personId, item.ppe_item_id]
+          );
+          if (openReqs.length === 0) {
+            const { rows: [ncr] } = await client.query(
+              'INSERT INTO ncr_items (audit_item_id,employee_id,casual_id,ppe_item_id,condition,size_value,comment) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *',
+              [ai.id, existing.employee_id || null, existing.casual_id || null, item.ppe_item_id, newCondition, item.size_value || null, item.comment || null]
+            );
+            await client.query(
+              'INSERT INTO ppe_requests (ncr_item_id,employee_id,casual_id,ppe_item_id,size_value,status,flagged_by) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+              [ncr.id, existing.employee_id || null, existing.casual_id || null, item.ppe_item_id, item.size_value || null, 'pending', req.user.id]
+            );
+          }
+        }
+      }
+    }
+
+    await client.query('COMMIT');
+    const { rows: [updated] } = await pool.query('SELECT * FROM audits WHERE id=$1', [id]);
+    res.json(updated);
+  } catch(e) {
+    await client.query('ROLLBACK');
+    console.error(e);
+    res.status(400).json({ error: e.message || 'Server error' });
+  } finally { client.release(); }
+});
+
 // NCR
 app.get('/api/ncr', auth, async (req, res) => {
   try {

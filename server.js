@@ -293,10 +293,10 @@ app.get('/api/dashboard', auth, async (req, res) => {
   try {
     const [emp, overdue, ncr, ncrCat, comp, delays, recent] = await Promise.all([
       pool.query(`SELECT COUNT(*) FILTER (WHERE employment_status='active') as active, COUNT(*) FILTER (WHERE employment_status='exit' AND exit_date >= date_trunc('year',NOW())) as exits_this_year FROM employees`),
-      pool.query(`SELECT COUNT(*) as overdue FROM employees e LEFT JOIN (SELECT employee_id, MAX(audit_date) as last_audit FROM audits WHERE employee_present = TRUE GROUP BY employee_id) a ON e.id=a.employee_id WHERE e.employment_status='active' AND e.san=TRUE AND (a.last_audit IS NULL OR CURRENT_DATE - a.last_audit > 30)`),
+      pool.query(`SELECT COUNT(*) as overdue FROM employees e LEFT JOIN (SELECT employee_id, MAX(audit_date) as last_audit FROM audits WHERE employee_present = TRUE AND is_deleted IS NOT TRUE GROUP BY employee_id) a ON e.id=a.employee_id WHERE e.employment_status='active' AND e.san=TRUE AND (a.last_audit IS NULL OR CURRENT_DATE - a.last_audit > 30)`),
       pool.query(`SELECT COUNT(*) FILTER (WHERE status!='resolved') as open, COUNT(*) FILTER (WHERE status='pending') as pending FROM ncr_items`),
       pool.query(`SELECT p.name as ppe_name, p.category, COUNT(*) as count FROM ncr_items n JOIN ppe_items p ON p.id=n.ppe_item_id WHERE n.status!='resolved' AND n.status!='canceled' GROUP BY p.name, p.category ORDER BY count DESC LIMIT 10`),
-      pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE overall_status='compliant') as compliant FROM audits WHERE audit_date >= date_trunc('month',NOW())`),
+      pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE overall_status='compliant') as compliant FROM audits WHERE audit_date >= date_trunc('month',NOW()) AND is_deleted IS NOT TRUE`),
       pool.query(`
         SELECT
           MAX(CASE WHEN status='pending' THEN CURRENT_DATE - date_flagged::date END) as ehs_delay,
@@ -334,7 +334,7 @@ app.get('/api/employees', auth, async (req, res) => {
   }
   try {
     const { status, search, national_id, project, client, san, job_title, department, resource_type } = req.query;
-    let q = `SELECT e.*, MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) as days_since_audit, COUNT(epa.id) > 0 as ppe_assigned, u.full_name as ppe_last_edited_by_name FROM employees e LEFT JOIN audits a ON a.employee_id=e.id LEFT JOIN employee_ppe_assignments epa ON epa.employee_id=e.id LEFT JOIN users u ON u.id=e.ppe_last_edited_by WHERE 1=1`;
+    let q = `SELECT e.*, MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as days_since_audit, COUNT(epa.id) > 0 as ppe_assigned, u.full_name as ppe_last_edited_by_name FROM employees e LEFT JOIN audits a ON a.employee_id=e.id LEFT JOIN employee_ppe_assignments epa ON epa.employee_id=e.id LEFT JOIN users u ON u.id=e.ppe_last_edited_by WHERE 1=1`;
     const params = [];
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
     if (search) { params.push(`%${search}%`); q += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length})`; }
@@ -782,12 +782,14 @@ app.get('/api/audits', auth, async (req, res) => {
         e.resource_type,
         (a.casual_id IS NOT NULL) as is_casual,
         u.full_name as audited_by_name,
+        ud.full_name as deleted_by_name,
         COUNT(ai.id) as total_items, COUNT(CASE WHEN ai.condition!='good' THEN 1 END) as issues_count
       FROM audits a
       LEFT JOIN employees e ON e.id=a.employee_id
       LEFT JOIN casuals c ON c.id=a.casual_id
       JOIN users u ON u.id=a.audited_by
-      LEFT JOIN audit_items ai ON ai.audit_id=a.id WHERE 1=1`;
+      LEFT JOIN audit_items ai ON ai.audit_id=a.id
+      LEFT JOIN users ud ON ud.id=a.deleted_by WHERE 1=1`;
     const params = [];
     if (search) { params.push(`%${search}%`); q += ` AND COALESCE(e.full_name, c.full_name) ILIKE $${params.length}`; }
     if (national_id) { params.push(`%${national_id}%`); q += ` AND COALESCE(e.national_id, c.national_id) ILIKE $${params.length}`; }
@@ -802,7 +804,7 @@ app.get('/api/audits', auth, async (req, res) => {
       if (auditProjects.length === 0) { return res.json([]); }
       params.push(auditProjects); q += ` AND COALESCE(e.project, c.project) = ANY($${params.length})`;
     }
-    q += ` GROUP BY a.id,e.full_name,c.full_name,e.employee_number,e.national_id,c.national_id,e.department,e.project,c.project,e.client,c.client,e.organization,c.organization,e.resource_type,u.full_name,a.employee_present,a.casual_id ORDER BY a.created_at DESC`;
+    q += ` GROUP BY a.id,e.full_name,c.full_name,e.employee_number,e.national_id,c.national_id,e.department,e.project,c.project,e.client,c.client,e.organization,c.organization,e.resource_type,u.full_name,a.employee_present,a.casual_id,ud.full_name ORDER BY a.created_at DESC`;
     const { rows } = await pool.query(q, params);
     res.json(rows);
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
@@ -818,26 +820,37 @@ app.get('/api/audits/stats', auth, async (req, res) => {
         COUNT(*) FILTER (WHERE overall_status='non_compliant') as non_compliant,
         COUNT(*) FILTER (WHERE date_trunc('month', audit_date) = date_trunc('month', NOW())) as this_month,
         COUNT(*) FILTER (WHERE date_trunc('month', audit_date) = date_trunc('month', NOW() - INTERVAL '1 month')) as last_month
-      FROM audits
+      FROM audits WHERE is_deleted IS NOT TRUE
     `);
     res.json(rows[0]);
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.delete('/api/audits/:id', auth, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const isAdmin = req.user.role === 'admin';
+  const { rows: [existing] } = await pool.query('SELECT * FROM audits WHERE id=$1', [req.params.id]);
+  if (!existing) return res.status(404).json({ error: 'Audit not found' });
+
+  if (!isAdmin) {
+    const ageMs = Date.now() - new Date(existing.created_at).getTime();
+    if (ageMs > 24 * 60 * 60 * 1000) return res.status(403).json({ error: 'Delete window has expired (24 hours).' });
+    if (existing.audited_by !== req.user.id) return res.status(403).json({ error: 'You can only delete your own requests.' });
+  }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // Soft delete the audit
+    await client.query(
+      'UPDATE audits SET is_deleted=TRUE, deleted_at=NOW(), deleted_by=$1 WHERE id=$2',
+      [req.user.id, req.params.id]
+    );
+    // Cancel all linked PPE requests and NCR items
     const { rows: auditItems } = await client.query('SELECT id FROM audit_items WHERE audit_id=$1', [req.params.id]);
     for (const ai of auditItems) {
-      const { rows: ncrs } = await client.query('SELECT id FROM ncr_items WHERE audit_item_id=$1', [ai.id]);
-      for (const ncr of ncrs) {
-        await client.query('DELETE FROM ppe_requests WHERE ncr_item_id=$1', [ncr.id]);
-      }
-      await client.query('DELETE FROM ncr_items WHERE audit_item_id=$1', [ai.id]);
+      await client.query('UPDATE ppe_requests SET status=$1 WHERE ncr_item_id IN (SELECT id FROM ncr_items WHERE audit_item_id=$2)', ['canceled', ai.id]);
+      await client.query('UPDATE ncr_items SET status=$1 WHERE audit_item_id=$2', ['canceled', ai.id]);
     }
-    await client.query('DELETE FROM audits WHERE id=$1', [req.params.id]);
     await client.query('COMMIT');
     res.json({ message: 'Deleted' });
   } catch(e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: e.message }); }
@@ -851,7 +864,7 @@ app.get('/api/audits/leaderboard', auth, async (req, res) => {
         COUNT(a.id) as total_audits,
         COUNT(a.id) FILTER (WHERE date_trunc('month', a.audit_date) = date_trunc('month', NOW())) as this_month
       FROM users u
-      LEFT JOIN audits a ON a.audited_by = u.id
+      LEFT JOIN audits a ON a.audited_by = u.id AND a.is_deleted IS NOT TRUE
       WHERE u.is_active = true
         AND u.email NOT IN ('admin@egypro.com', 'sync@egypro.com', 'eats-sync@egypro.app')
         AND u.role != 'scm_officer'

@@ -1283,6 +1283,7 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
         e.employee_number,
         COALESCE(e.national_id, c.national_id) as employee_national_id,
         COALESCE(e.employment_status, c.employment_status) as employment_status,
+        COALESCE(e.job_title, c.job_title) as job_title,
         COALESCE(e.project, c.project) as project,
         COALESCE(e.client, c.client) as client,
         (r.casual_id IS NOT NULL) as is_casual,

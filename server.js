@@ -686,7 +686,7 @@ app.put('/api/casuals/:id/status', auth, async (req, res) => {
   const client_db = await pool.connect();
   try {
     await client_db.query('BEGIN');
-    await client_db.query('UPDATE casuals SET employment_status=$1, exit_date=$2, updated_at=NOW() WHERE id=$3', [employment_status, exit_date || null, req.params.id]);
+    await client_db.query('UPDATE casuals SET employment_status=$1, exit_date=$2, updated_at=NOW(), last_edited_by=$3 WHERE id=$4', [employment_status, exit_date || null, req.user.id, req.params.id]);
     if (employment_status === 'exit') {
       await client_db.query(`UPDATE ppe_requests SET status='canceled' WHERE casual_id=$1 AND status NOT IN ('distributed','resolved','canceled')`, [req.params.id]);
     }

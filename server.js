@@ -1367,7 +1367,7 @@ app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
     let extraParams = [status, req.params.id];
     if (status === 'ehs_purchase_requested') extraFields = ', date_purchase_requested=NOW(), purchase_requested_by=$3';
     if (status === 'pda_approved') extraFields = ', pda_approved_date=NOW(), pda_approved_by=$3';
-    if (status === 'scm_ordered') extraFields = ', date_ordered=NOW(), ordered_by=$3';
+    if (status === 'scm_ordered') { extraParams.push(req.user.id); extraFields = ', date_ordered=NOW(), ordered_by=$3, po_number=$4'; extraParams.push(req.body.po_number || null); }
     if (status === 'warehouse_available') extraFields = ', date_available=NOW(), available_by=$3, date_ordered=COALESCE(date_ordered,NOW()), ordered_by=COALESCE(ordered_by,$3)';
     if (status === 'distributed') {
       extraParams.push(req.user.id); // $3

@@ -833,7 +833,7 @@ app.delete('/api/audits/:id', auth, async (req, res) => {
 
   if (!isAdmin) {
     const ageMs = Date.now() - new Date(existing.created_at).getTime();
-    if (ageMs > 24 * 60 * 60 * 1000) return res.status(403).json({ error: 'Delete window has expired (24 hours).' });
+    if (ageMs > 72 * 60 * 60 * 1000) return res.status(403).json({ error: 'Delete window has expired (72 hours).' });
     if (existing.audited_by !== req.user.id) return res.status(403).json({ error: 'You can only delete your own requests.' });
   }
 
@@ -964,7 +964,7 @@ app.put('/api/audits/:id', auth, async (req, res) => {
   // 24h check for non-admins
   if (!isAdmin) {
     const ageMs = Date.now() - new Date(existing.created_at).getTime();
-    if (ageMs > 24 * 60 * 60 * 1000) return res.status(403).json({ error: 'Edit window has expired (24 hours).' });
+    if (ageMs > 72 * 60 * 60 * 1000) return res.status(403).json({ error: 'Edit window has expired (72 hours).' });
     if (existing.audited_by !== req.user.id) return res.status(403).json({ error: 'You can only edit your own requests.' });
   }
 

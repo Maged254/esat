@@ -155,7 +155,8 @@ async function setupDB() {
     await client.query('ALTER TABLE audit_items ADD COLUMN IF NOT EXISTS quantity INTEGER NOT NULL DEFAULT 1');
 
     // Ensure project_access column exists on users
-    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS project_access TEXT[] DEFAULT '{}'");
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS project_access TEXT[] DEFAULT '{}'")
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS client_access TEXT[] DEFAULT '{}'");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS page_access TEXT[] DEFAULT '{}'");
 
     // Ensure distribution columns exist on ppe_requests
@@ -284,7 +285,7 @@ app.post('/api/auth/login', async (req, res) => {
 
 // Me
 app.get('/api/auth/me', auth, async (req, res) => {
-  const { rows } = await pool.query('SELECT id,full_name,email,role,profile_picture,project_access,page_access FROM users WHERE id=$1', [req.user.id]);
+  const { rows } = await pool.query('SELECT id,full_name,email,role,profile_picture,project_access,page_access,client_access FROM users WHERE id=$1', [req.user.id]);
   res.json(rows[0]);
 });
 
@@ -2238,7 +2239,7 @@ app.get('/api/graphs', auth, async (req, res) => {
 
 app.get('/api/users', auth, async (req, res) => {
   if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
-  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, created_at FROM users ORDER BY created_at DESC');
+  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access, created_at FROM users ORDER BY created_at DESC');
   res.json(rows);
 });
 
@@ -2250,8 +2251,8 @@ app.post('/api/users', auth, async (req, res) => {
   try {
     const hash = await bcrypt.hash(password, 10);
     const { rows } = await pool.query(
-      'INSERT INTO users (full_name, email, password_hash, role, project_access, page_access) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id, full_name, email, role, is_active, project_access, page_access',
-      [full_name, email, hash, role, project_access || [], page_access || []]
+      'INSERT INTO users (full_name, email, password_hash, role, project_access, page_access, client_access) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, full_name, email, role, is_active, project_access, page_access, client_access',
+      [full_name, email, hash, role, project_access || [], page_access || [], req.body.client_access || []]
     );
     res.status(201).json(rows[0]);
   } catch(e) {
@@ -2267,13 +2268,13 @@ app.put('/api/users/:id', auth, async (req, res) => {
   try {
     if (password) {
       const hash = await bcrypt.hash(password, 10);
-      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, password_hash=$5, profile_picture=$6, project_access=$7, page_access=$8, updated_at=NOW() WHERE id=$9',
-        [full_name, email, role, is_active, hash, profile_picture || null, project_access || [], page_access || [], req.params.id]);
+      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, password_hash=$5, profile_picture=$6, project_access=$7, page_access=$8, client_access=$9, updated_at=NOW() WHERE id=$10',
+        [full_name, email, role, is_active, hash, profile_picture || null, project_access || [], page_access || [], req.body.client_access || [], req.params.id]);
     } else {
-      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, profile_picture=$5, project_access=$6, page_access=$7, updated_at=NOW() WHERE id=$8',
-        [full_name, email, role, is_active, profile_picture || null, project_access || [], page_access || [], req.params.id]);
+      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, profile_picture=$5, project_access=$6, page_access=$7, client_access=$8, updated_at=NOW() WHERE id=$9',
+        [full_name, email, role, is_active, profile_picture || null, project_access || [], page_access || [], req.body.client_access || [], req.params.id]);
     }
-    const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access FROM users WHERE id=$1', [req.params.id]);
+    const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access FROM users WHERE id=$1', [req.params.id]);
     res.json(rows[0]);
   } catch(e) { console.error("PUT users error:", e.message); res.status(500).json({ error: e.message }); }
 });

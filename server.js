@@ -6,6 +6,7 @@ const jwt = require('jsonwebtoken');
 const cors = require('cors');
 
 const app = express();
+app.set('trust proxy', true); // so req.ip reflects the real client IP behind Render's proxy
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: "10mb" }));
 
@@ -165,6 +166,21 @@ async function setupDB() {
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER DEFAULT 0");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ");
 
+    // Request log (admin-only visibility)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS request_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+        endpoint VARCHAR(300),
+        ip VARCHAR(64),
+        status_code INTEGER,
+        error_detail TEXT,
+        duration_ms INTEGER
+      )
+    `);
+    await client.query('CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at DESC)');
+
     // Ensure distribution columns exist on ppe_requests
     await client.query('ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS distribution_method VARCHAR(50)');
     await client.query('ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS courier_tracking_number VARCHAR(200)');
@@ -248,9 +264,25 @@ async function setupDB() {
 const GENERIC_ERROR_MESSAGE = 'Something went wrong. Please contact support.';
 const sendError = (res, err, status = 500) => {
   console.error(err);
+  // Stashed for the request-logging middleware below — full detail, admin-only,
+  // never sent in the client-facing response.
+  res.locals.errorDetail = (err && (err.stack || err.message)) || String(err);
   const safeMessage = err.code ? GENERIC_ERROR_MESSAGE : (err.message || GENERIC_ERROR_MESSAGE);
   res.status(status).json({ error: safeMessage });
 };
+
+// ── Request logging (admin-only visibility via GET /api/admin/logs) ──
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on('finish', () => {
+    pool.query(
+      `INSERT INTO request_logs (user_id, endpoint, ip, status_code, error_detail, duration_ms)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [req.user?.id || null, `${req.method} ${req.path}`, req.ip, res.statusCode, res.locals.errorDetail || null, Date.now() - start]
+    ).catch(e => console.error('Request log insert failed:', e.message));
+  });
+  next();
+});
 
 // ── Auth middleware ──────────────────────────────────────────
 const auth = (req, res, next) => {
@@ -2189,12 +2221,20 @@ async function sendDailyOverdueDigest() {
   } catch(e) { console.error('Overdue digest error:', e.message); }
 }
 
+async function pruneOldRequestLogs() {
+  try {
+    const { rowCount } = await pool.query(`DELETE FROM request_logs WHERE created_at < NOW() - INTERVAL '30 days'`);
+    console.log(`Pruned ${rowCount} request log(s) older than 30 days`);
+  } catch(e) { console.error('Log prune error:', e.message); }
+}
+
 function scheduleDailyDigest() {
   scheduleAt(5, 30, 'Fibre digest', sendDailyFibreDigest);  // 8:30am EAT
   scheduleAt(5, 35, 'BTS digest', sendDailyBTSDigest);      // 8:35am EAT
   scheduleAt(5, 45, 'EHS digest', sendDailyEHSDigest);      // 8:45am EAT
   scheduleAt(6,  0, 'SCM digest', sendDailySCMDigest);      // 9:00am EAT
   scheduleAt(13, 0, 'Overdue digest', sendDailyOverdueDigest); // 4:00pm EAT
+  scheduleAt(2,  0, 'Log prune', pruneOldRequestLogs);      // 5:00am EAT
 }
 
 app.post('/api/admin/test-bts-digest', auth, async (req, res) => {
@@ -2521,6 +2561,31 @@ app.post('/api/admin/force-password-reset', auth, async (req, res) => {
     [req.user.id]
   );
   res.json({ count: rows.length });
+});
+
+// System logs — timestamp, user, endpoint, IP, status, error detail (admin only)
+app.get('/api/admin/logs', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    const { errorsOnly, search, limit } = req.query;
+    const conditions = [];
+    const params = [];
+    if (errorsOnly === 'true') conditions.push('l.status_code >= 400');
+    if (search) { params.push(`%${search}%`); conditions.push(`(l.endpoint ILIKE $${params.length} OR l.ip ILIKE $${params.length} OR u.email ILIKE $${params.length})`); }
+    const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
+    const capped = Math.min(parseInt(limit) || 200, 500);
+    params.push(capped);
+    const { rows } = await pool.query(`
+      SELECT l.id, l.created_at, l.endpoint, l.ip, l.status_code, l.error_detail, l.duration_ms,
+        u.full_name as user_name, u.email as user_email
+      FROM request_logs l
+      LEFT JOIN users u ON u.id = l.user_id
+      ${where}
+      ORDER BY l.created_at DESC
+      LIMIT $${params.length}
+    `, params);
+    res.json(rows);
+  } catch(e) { sendError(res, e); }
 });
 
 // POST create new user (admin only)

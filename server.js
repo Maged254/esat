@@ -306,6 +306,31 @@ const getClientFilter = async (user) => {
   return clients;
 };
 
+// True if a resource with this project/client is within the user's access.
+const inScope = async (user, project, client) => {
+  const projectFilter = await getProjectFilter(user);
+  if (projectFilter !== null && !projectFilter.includes(project)) return false;
+  const clientFilter = await getClientFilter(user);
+  if (clientFilter !== null && !clientFilter.includes(client)) return false;
+  return true;
+};
+// Looks up the project/client of the employee or casual behind an id.
+const getPersonScope = async (id) => {
+  const { rows } = await pool.query(
+    `SELECT project, client FROM employees WHERE id=$1
+     UNION ALL
+     SELECT project, client FROM casuals WHERE id=$1`,
+    [id]
+  );
+  return rows[0] || null;
+};
+// Looks up the project/client of the employee or casual behind an audit.
+const getAuditScope = async (auditId) => {
+  const { rows: [audit] } = await pool.query('SELECT employee_id, casual_id FROM audits WHERE id=$1', [auditId]);
+  if (!audit) return null;
+  return getPersonScope(audit.employee_id || audit.casual_id);
+};
+
 // ── Routes ───────────────────────────────────────────────────
 
 // Health
@@ -549,6 +574,10 @@ app.get('/api/employees/:id/ppe-assignments', auth, async (req, res) => {
   if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) {
     return res.status(403).json({ error: 'Not authorized' });
   }
+  const scope = await getPersonScope(req.params.id);
+  if (!scope || !(await inScope(req.user, scope.project, scope.client))) {
+    return res.status(404).json({ error: 'Not found' });
+  }
   const { rows } = await pool.query(`SELECT p.* FROM ppe_items p JOIN employee_ppe_assignments epa ON epa.ppe_item_id=p.id WHERE epa.employee_id=$1 AND p.is_active=true ORDER BY p.sort_order`, [req.params.id]);
   res.json(rows);
 });
@@ -556,8 +585,12 @@ app.get('/api/employees/:id/ppe-assignments', auth, async (req, res) => {
 
 app.put('/api/employees/:id/ppe-assignments', auth, async (req, res) => {
   if (!['admin','ehs_manager'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
-  const { ppe_item_ids } = req.body; // array of UUIDs
   const employeeId = req.params.id;
+  const scope = await getPersonScope(employeeId);
+  if (!scope || !(await inScope(req.user, scope.project, scope.client))) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  const { ppe_item_ids } = req.body; // array of UUIDs
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -739,6 +772,10 @@ app.post('/api/casuals/batch', auth, async (req, res) => {
 // Edit a casual (admin, supervisor only)
 app.put('/api/casuals/:id', auth, async (req, res) => {
   if (!CASUAL_EDIT_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  const scope = await getPersonScope(req.params.id);
+  if (!scope || !(await inScope(req.user, scope.project, scope.client))) {
+    return res.status(404).json({ error: 'Not found' });
+  }
   const { full_name, national_id, project, client, organization } = req.body;
   const { rows } = await pool.query(
     `UPDATE casuals SET full_name=$1, national_id=$2, project=$3, client=$4, organization=$5, updated_at=NOW(), last_edited_by=$6 WHERE id=$7 RETURNING *`,
@@ -751,6 +788,10 @@ app.put('/api/casuals/:id', auth, async (req, res) => {
 // Exit a casual (admin, supervisor only) — cancels open casual PPE requests
 app.put('/api/casuals/:id/status', auth, async (req, res) => {
   if (!CASUAL_EDIT_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  const scope = await getPersonScope(req.params.id);
+  if (!scope || !(await inScope(req.user, scope.project, scope.client))) {
+    return res.status(404).json({ error: 'Not found' });
+  }
   const { employment_status, exit_date } = req.body;
   if (employment_status && !['active', 'exit'].includes(employment_status)) {
     return res.status(400).json({ error: 'Invalid employment_status' });
@@ -775,14 +816,22 @@ app.get('/api/casuals/:id/ppe-assignments', auth, async (req, res) => {
   if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) {
     return res.status(403).json({ error: 'Not authorized' });
   }
+  const scope = await getPersonScope(req.params.id);
+  if (!scope || !(await inScope(req.user, scope.project, scope.client))) {
+    return res.status(404).json({ error: 'Not found' });
+  }
   const { rows } = await pool.query(`SELECT p.* FROM ppe_items p JOIN casual_ppe_assignments cpa ON cpa.ppe_item_id=p.id WHERE cpa.casual_id=$1 AND p.is_active=true ORDER BY p.sort_order`, [req.params.id]);
   res.json(rows);
 });
 // Set casual PPE assignments (admin, ehs_manager only)
 app.put('/api/casuals/:id/ppe-assignments', auth, async (req, res) => {
   if (!['admin','ehs_manager'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
-  const { ppe_item_ids } = req.body;
   const casualId = req.params.id;
+  const scope = await getPersonScope(casualId);
+  if (!scope || !(await inScope(req.user, scope.project, scope.client))) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  const { ppe_item_ids } = req.body;
   const client_db = await pool.connect();
   try {
     await client_db.query('BEGIN');
@@ -979,6 +1028,9 @@ app.get('/api/audits/:id', auth, async (req, res) => {
       WHERE a.id=$1
     `, [req.params.id]);
     if (!audit) return res.status(404).json({ error: 'Not found' });
+    if (!(await inScope(req.user, audit.project, audit.client))) {
+      return res.status(404).json({ error: 'Not found' });
+    }
     const { rows: items } = await pool.query(`
       SELECT ai.*,p.name as ppe_name,p.category,p.has_size,p.size_type
       FROM audit_items ai JOIN ppe_items p ON p.id=ai.ppe_item_id
@@ -1243,6 +1295,12 @@ app.put('/api/ncr/:id/status', auth, async (req, res) => {
   if (req.user.role === 'project_director' && status !== 'pda_approved') {
     return res.status(403).json({ error: 'Project Director can only set status to PDA Approved' });
   }
+  const { rows: [ncrPerson] } = await pool.query('SELECT COALESCE(employee_id, casual_id) as person_id FROM ncr_items WHERE id=$1', [req.params.id]);
+  if (!ncrPerson) return res.status(404).json({ error: 'NCR item not found' });
+  const ncrScope = await getPersonScope(ncrPerson.person_id);
+  if (!ncrScope || !(await inScope(req.user, ncrScope.project, ncrScope.client))) {
+    return res.status(404).json({ error: 'Not found' });
+  }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -1440,6 +1498,12 @@ app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
   }
   if (req.user.role === 'project_director' && status !== 'pda_approved') {
     return res.status(403).json({ error: 'Project Director can only set status to PDA Approved' });
+  }
+  const { rows: [reqPerson] } = await pool.query('SELECT COALESCE(employee_id, casual_id) as person_id FROM ppe_requests WHERE id=$1', [req.params.id]);
+  if (!reqPerson) return res.status(404).json({ error: 'PPE request not found' });
+  const reqScope = await getPersonScope(reqPerson.person_id);
+  if (!reqScope || !(await inScope(req.user, reqScope.project, reqScope.client))) {
+    return res.status(404).json({ error: 'Not found' });
   }
   const client = await pool.connect();
   try {
@@ -2225,6 +2289,10 @@ app.post('/api/audit-documents/upload', auth, (req, res) => {
       if (audit_date && isNaN(Date.parse(audit_date))) {
         return res.status(400).json({ message: 'Invalid audit_date' });
       }
+      const uploadScope = await getAuditScope(audit_id);
+      if (!uploadScope || !(await inScope(req.user, uploadScope.project, uploadScope.client))) {
+        return res.status(404).json({ message: 'Not found' });
+      }
 
       const safeName = sanitizeForPublicId(employee_name);
       const safeNationalId = sanitizeForPublicId(national_id);
@@ -2262,6 +2330,10 @@ app.get('/api/audit-documents/:id/download', auth, async (req, res) => {
   try {
     const doc = await pool.query('SELECT * FROM audit_documents WHERE id = $1', [req.params.id]);
     if (!doc.rows.length) return res.status(404).json({ message: 'Not found' });
+    const scope = await getAuditScope(doc.rows[0].audit_id);
+    if (!scope || !(await inScope(req.user, scope.project, scope.client))) {
+      return res.status(404).json({ message: 'Not found' });
+    }
     const url = doc.rows[0].cloudinary_url;
     const rawFilename = url.split('/').pop().split('?')[0];
     const filename = rawFilename.replace(/[^a-zA-Z0-9._-]/g, '_');
@@ -2276,6 +2348,10 @@ app.get('/api/audit-documents/:id/download', auth, async (req, res) => {
 // ── Get Audit Documents ──────────────────────────────────────
 app.get('/api/audit-documents/:audit_id', auth, async (req, res) => {
   try {
+    const scope = await getAuditScope(req.params.audit_id);
+    if (!scope || !(await inScope(req.user, scope.project, scope.client))) {
+      return res.status(404).json({ message: 'Not found' });
+    }
     const result = await pool.query(
       `SELECT * FROM audit_documents WHERE audit_id = $1 ORDER BY uploaded_at ASC`,
       [req.params.audit_id]
@@ -2291,6 +2367,10 @@ app.delete('/api/audit-documents/:id', auth, async (req, res) => {
   try {
     const doc = await pool.query(`SELECT * FROM audit_documents WHERE id = $1`, [req.params.id]);
     if (!doc.rows.length) return res.status(404).json({ message: 'Not found' });
+    const scope = await getAuditScope(doc.rows[0].audit_id);
+    if (!scope || !(await inScope(req.user, scope.project, scope.client))) {
+      return res.status(404).json({ message: 'Not found' });
+    }
     await cloudinary.uploader.destroy(doc.rows[0].cloudinary_public_id);
     await pool.query(`DELETE FROM audit_documents WHERE id = $1`, [req.params.id]);
     res.json({ message: 'Deleted' });

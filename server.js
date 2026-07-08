@@ -252,6 +252,26 @@ const auth = (req, res, next) => {
 };
 
 // ── Project / client access helpers ──────────────────────────
+// Escapes free-text values before they're interpolated into HTML email templates.
+const escapeHtml = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+}[c]));
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const VALID_ROLES = ['admin', 'ehs_manager', 'ehs_officer', 'supervisor', 'scm_officer', 'project_director'];
+// Data-URL profile pictures only, capped just under the 10mb JSON body limit
+// (no client-side resize happens before upload, so this must stay generous).
+const isValidProfilePicture = (s) => typeof s === 'string' && s.startsWith('data:image/') && s.length <= 9 * 1024 * 1024;
+
+const VALID_CONDITIONS = ['good', 'not_good', 'missing'];
+// Returns a whole number 1-9999, or null if the input isn't a valid quantity.
+const sanitizeQuantity = (q) => {
+  if (q === undefined || q === null) return null;
+  const n = Number(q);
+  if (!Number.isInteger(n) || n < 1 || n > 9999) return null;
+  return n;
+};
+
 const RESTRICTED_ROLES = ['ehs_officer', 'supervisor', 'scm_officer', 'project_director', 'ehs_manager'];
 const getProjectFilter = async (user) => {
   if (!RESTRICTED_ROLES.includes(user.role)) return null; // unrestricted
@@ -589,6 +609,10 @@ app.post('/api/employees', auth, async (req, res) => {
 app.put('/api/employees/:id/status', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const { employment_status, exit_date } = req.body;
+  if (employment_status && !['active', 'exit'].includes(employment_status)) {
+    return res.status(400).json({ error: 'Invalid employment_status' });
+  }
+  if (exit_date && isNaN(Date.parse(exit_date))) return res.status(400).json({ error: 'Invalid exit_date' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -692,10 +716,10 @@ app.post('/api/casuals/batch', auth, async (req, res) => {
             </td></tr></table>
             <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
               <p style="font-size: 15px; color: #374151;">
-                <strong style="color: #0f2a4a;">${totalAdded} casual${totalAdded > 1 ? 's were' : ' was'}</strong> added by <strong style="color: #0f2a4a;">${req.user.name || req.user.email}</strong>.
+                <strong style="color: #0f2a4a;">${totalAdded} casual${totalAdded > 1 ? 's were' : ' was'}</strong> added by <strong style="color: #0f2a4a;">${escapeHtml(req.user.name || req.user.email)}</strong>.
               </p>
               <p style="font-size: 15px; color: #374151;">
-                Project: <strong style="color: #0f2a4a;">${project}</strong> &middot; Client: <strong style="color: #0f2a4a;">${client}</strong>
+                Project: <strong style="color: #0f2a4a;">${escapeHtml(project)}</strong> &middot; Client: <strong style="color: #0f2a4a;">${escapeHtml(client)}</strong>
               </p>
               <a href="https://esat.egypro.app/casuals"
                 style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">
@@ -728,6 +752,10 @@ app.put('/api/casuals/:id', auth, async (req, res) => {
 app.put('/api/casuals/:id/status', auth, async (req, res) => {
   if (!CASUAL_EDIT_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
   const { employment_status, exit_date } = req.body;
+  if (employment_status && !['active', 'exit'].includes(employment_status)) {
+    return res.status(400).json({ error: 'Invalid employment_status' });
+  }
+  if (exit_date && isNaN(Date.parse(exit_date))) return res.status(400).json({ error: 'Invalid exit_date' });
   const client_db = await pool.connect();
   try {
     await client_db.query('BEGIN');
@@ -972,6 +1000,14 @@ app.post('/api/audits', auth, async (req, res) => {
     const { rows: [cas] } = await pool.query('SELECT employment_status FROM casuals WHERE id=$1', [casual_id]);
     if (cas && cas.employment_status === 'exit') return res.status(400).json({ error: 'This casual has exited and can no longer be audited or have PPE/Tool requests created.' });
   }
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'At least one item is required' });
+  for (const item of items) {
+    if (!VALID_CONDITIONS.includes(item.condition)) return res.status(400).json({ error: 'Invalid condition value' });
+    if (item.quantity !== undefined && item.quantity !== null && sanitizeQuantity(item.quantity) === null) {
+      return res.status(400).json({ error: 'quantity must be a whole number between 1 and 9999' });
+    }
+  }
+  if (audit_date && isNaN(Date.parse(audit_date))) return res.status(400).json({ error: 'Invalid audit_date' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -980,7 +1016,7 @@ app.post('/api/audits', auth, async (req, res) => {
     const overall_status = !hasIssues ? 'compliant' : allBad ? 'non_compliant' : 'partial';
     const { rows: [audit] } = await client.query(`INSERT INTO audits (employee_id,casual_id,audited_by,audit_date,overall_status,notes,employee_present,location_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`, [employee_id || null, casual_id || null, audited_by_override || req.user.id, audit_date || new Date(), overall_status, notes, employee_present !== false, location_id || null]);
     for (const item of items) {
-      const { rows: [ai] } = await client.query(`INSERT INTO audit_items (audit_id,ppe_item_id,condition,size_value,comment,quantity) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`, [audit.id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null, item.quantity || 1]);
+      const { rows: [ai] } = await client.query(`INSERT INTO audit_items (audit_id,ppe_item_id,condition,size_value,comment,quantity) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`, [audit.id, item.ppe_item_id, item.condition, item.size_value || null, item.comment || null, sanitizeQuantity(item.quantity) || 1]);
       if (item.condition === 'not_good') {
         // Skip if open PPE request already exists for this person + PPE item
         const { rows: existing } = await client.query(
@@ -1030,6 +1066,14 @@ app.put('/api/audits/:id', auth, async (req, res) => {
     if (blocked.length > 0) return res.status(403).json({ error: 'This request has already been actioned by EHS. Contact an admin to make changes.' });
   }
 
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'At least one item is required' });
+  for (const item of items) {
+    if (!VALID_CONDITIONS.includes(item.condition)) return res.status(400).json({ error: 'Invalid condition value' });
+    if (item.quantity !== undefined && item.quantity !== null && sanitizeQuantity(item.quantity) === null) {
+      return res.status(400).json({ error: 'quantity must be a whole number between 1 and 9999' });
+    }
+  }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -1057,7 +1101,7 @@ app.put('/api/audits/:id', auth, async (req, res) => {
         // Update existing audit_item
         await client.query(
           `UPDATE audit_items SET condition=$1, size_value=$2, comment=$3, quantity=$4 WHERE id=$5`,
-          [newCondition, item.size_value || null, item.comment || null, item.quantity || 1, existingAI.id]
+          [newCondition, item.size_value || null, item.comment || null, sanitizeQuantity(item.quantity) || 1, existingAI.id]
         );
 
         // Was not_good, now good → delete pending NCR + PPE request
@@ -1120,7 +1164,7 @@ app.put('/api/audits/:id', auth, async (req, res) => {
         // New item not previously in audit — insert it
         const { rows: [ai] } = await client.query(
           `INSERT INTO audit_items (audit_id,ppe_item_id,condition,size_value,comment,quantity) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-          [id, item.ppe_item_id, newCondition, item.size_value || null, item.comment || null, item.quantity || 1]
+          [id, item.ppe_item_id, newCondition, item.size_value || null, item.comment || null, sanitizeQuantity(item.quantity) || 1]
         );
         if (newCondition === 'not_good') {
           const personCol = existing.employee_id ? 'employee_id' : 'casual_id';
@@ -1770,7 +1814,7 @@ async function sendDailyBTSDigest() {
     `, [btsProjects]);
     const projectRowsHtml = byProject.map(p => `
       <tr>
-        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #374151;">${p.project}${p.client ? `<div style="font-size: 11px; color: #9ca3af; margin-top: 2px;">${p.client}</div>` : ''}</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #374151;">${escapeHtml(p.project)}${p.client ? `<div style="font-size: 11px; color: #9ca3af; margin-top: 2px;">${escapeHtml(p.client)}</div>` : ''}</td>
         <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #0f2a4a; font-weight: 600; text-align: center;">${p.count}</td>
         <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; text-align: center; color: ${parseInt(p.oldest_days) > 0 ? '#e53e3e' : '#374151'};">${parseInt(p.oldest_days) || 0}</td>
       </tr>`).join('');
@@ -1841,7 +1885,7 @@ async function sendDailyFibreDigest() {
     `, [fibreProjects]);
     const projectRowsHtml = byProject.map(p => `
       <tr>
-        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #374151;">${p.project}${p.client ? `<div style="font-size: 11px; color: #9ca3af; margin-top: 2px;">${p.client}</div>` : ''}</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #374151;">${escapeHtml(p.project)}${p.client ? `<div style="font-size: 11px; color: #9ca3af; margin-top: 2px;">${escapeHtml(p.client)}</div>` : ''}</td>
         <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #0f2a4a; font-weight: 600; text-align: center;">${p.count}</td>
         <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; text-align: center; color: ${parseInt(p.oldest_days) > 0 ? '#e53e3e' : '#374151'};">${parseInt(p.oldest_days) || 0}</td>
       </tr>`).join('');
@@ -1988,15 +2032,15 @@ async function sendDailyOverdueDigest() {
 
     let tableRows = '';
     Object.entries(byClient).forEach(([client, projects]) => {
-      tableRows += `<tr><td colspan="3" style="background:#0f2a4a;color:white;font-weight:700;font-size:13px;padding:8px 12px;">${client}</td></tr>`;
+      tableRows += `<tr><td colspan="3" style="background:#0f2a4a;color:white;font-weight:700;font-size:13px;padding:8px 12px;">${escapeHtml(client)}</td></tr>`;
       projects.forEach(r => {
         const days = parseInt(r.oldest_days) || 0;
         const daysColor = days > 60 ? '#e53e3e' : days > 30 ? '#e65100' : '#1d9e75';
         tableRows += `
           <tr style="border-bottom:1px solid #e5e7eb;">
-            <td style="padding:8px 12px;font-size:13px;padding-left:24px;">${r.project || '—'}</td>
+            <td style="padding:8px 12px;font-size:13px;padding-left:24px;">${escapeHtml(r.project) || '—'}</td>
             <td style="padding:8px 12px;font-size:13px;text-align:center;font-weight:700;color:#0f2a4a;">${r.overdue_count}</td>
-            <td style="padding:8px 12px;font-size:12px;">${r.oldest_employee || '—'} <span style="color:${daysColor};font-weight:700;">(${days}d)</span></td>
+            <td style="padding:8px 12px;font-size:12px;">${escapeHtml(r.oldest_employee) || '—'} <span style="color:${daysColor};font-weight:700;">(${days}d)</span></td>
           </tr>`;
       });
     });
@@ -2149,7 +2193,18 @@ setupDB().then(() => {
 // ── Cloudinary Setup ────────────────────────────────────────
 const cloudinary = require('cloudinary').v2;
 const multer = require('multer');
-const upload = multer({ storage: multer.memoryStorage() });
+const ALLOWED_UPLOAD_MIMETYPES = ['application/pdf', 'image/jpeg', 'image/png', 'image/heic', 'image/heif'];
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  fileFilter: (req, file, cb) => {
+    if (ALLOWED_UPLOAD_MIMETYPES.includes(file.mimetype)) cb(null, true);
+    else cb(new Error('Only PDF and image files (JPEG, PNG, HEIC) are allowed'));
+  }
+});
+// Strips anything but alphanumerics/hyphen/underscore so user-controlled values
+// can't inject extra path segments into the Cloudinary public_id/folder.
+const sanitizeForPublicId = (s) => String(s || '').replace(/[^a-zA-Z0-9_-]/g, '-');
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -2158,36 +2213,47 @@ cloudinary.config({
 });
 
 // ── Upload Audit Document ────────────────────────────────────
-app.post('/api/audit-documents/upload', auth, upload.single('file'), async (req, res) => {
-  try {
-    const { audit_id, employee_id, field_name, national_id, employee_name, audit_date } = req.body;
-    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+app.post('/api/audit-documents/upload', auth, (req, res) => {
+  upload.single('file')(req, res, async (err) => {
+    if (err) return res.status(400).json({ message: err.message || 'Upload rejected' });
+    try {
+      const { audit_id, employee_id, field_name, national_id, employee_name, audit_date } = req.body;
+      if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+      if (!audit_id || !employee_id || !field_name) {
+        return res.status(400).json({ message: 'audit_id, employee_id and field_name are required' });
+      }
+      if (audit_date && isNaN(Date.parse(audit_date))) {
+        return res.status(400).json({ message: 'Invalid audit_date' });
+      }
 
-    const safeName = employee_name.replace(/[^a-zA-Z0-9]/g, '-');
-    const folder = `esat/${national_id}_${safeName}/${audit_date}`;
-    const safeField = field_name.replace(/ /g, '_');
-    const publicId = `${folder}/${audit_date}_${safeName}_${safeField}`;
+      const safeName = sanitizeForPublicId(employee_name);
+      const safeNationalId = sanitizeForPublicId(national_id);
+      const safeDate = sanitizeForPublicId(audit_date);
+      const safeField = sanitizeForPublicId(field_name);
+      const folder = `esat/${safeNationalId}_${safeName}/${safeDate}`;
+      const publicId = `${folder}/${safeDate}_${safeName}_${safeField}`;
 
-    const result = await new Promise((resolve, reject) => {
-      const stream = cloudinary.uploader.upload_stream(
-        { public_id: publicId, overwrite: true, resource_type: 'auto' },
-        (error, result) => { if (error) reject(error); else resolve(result); }
+      const result = await new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          { public_id: publicId, overwrite: true, resource_type: 'auto' },
+          (error, result) => { if (error) reject(error); else resolve(result); }
+        );
+        stream.end(req.file.buffer);
+      });
+
+      await pool.query(
+        `INSERT INTO audit_documents (audit_id, employee_id, field_name, cloudinary_url, cloudinary_public_id)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (audit_id, field_name) DO UPDATE SET cloudinary_url=EXCLUDED.cloudinary_url, cloudinary_public_id=EXCLUDED.cloudinary_public_id`,
+        [audit_id, employee_id, field_name, result.secure_url, result.public_id]
       );
-      stream.end(req.file.buffer);
-    });
 
-    await pool.query(
-      `INSERT INTO audit_documents (audit_id, employee_id, field_name, cloudinary_url, cloudinary_public_id)
-       VALUES ($1, $2, $3, $4, $5)
-       ON CONFLICT (audit_id, field_name) DO UPDATE SET cloudinary_url=EXCLUDED.cloudinary_url, cloudinary_public_id=EXCLUDED.cloudinary_public_id`,
-      [audit_id, employee_id, field_name, result.secure_url, result.public_id]
-    );
-
-    res.json({ url: result.secure_url, public_id: result.public_id });
-  } catch (err) {
-    console.error('Upload error:', err);
-    res.status(500).json({ message: 'Upload failed', error: err.message });
-  }
+      res.json({ url: result.secure_url, public_id: result.public_id });
+    } catch (err) {
+      console.error('Upload error:', err);
+      res.status(500).json({ message: 'Upload failed', error: err.message });
+    }
+  });
 });
 
 
@@ -2197,7 +2263,8 @@ app.get('/api/audit-documents/:id/download', auth, async (req, res) => {
     const doc = await pool.query('SELECT * FROM audit_documents WHERE id = $1', [req.params.id]);
     if (!doc.rows.length) return res.status(404).json({ message: 'Not found' });
     const url = doc.rows[0].cloudinary_url;
-    const filename = url.split('/').pop().split('?')[0];
+    const rawFilename = url.split('/').pop().split('?')[0];
+    const filename = rawFilename.replace(/[^a-zA-Z0-9._-]/g, '_');
     const https = require('https');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     https.get(url, (stream) => stream.pipe(res));
@@ -2304,6 +2371,9 @@ app.post('/api/users', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const { full_name, email, password, role, project_access, page_access } = req.body;
   if (!full_name || !email || !password || !role) return res.status(400).json({ error: 'All fields required' });
+  if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'Invalid email format' });
+  if (!VALID_ROLES.includes(role)) return res.status(400).json({ error: 'Invalid role' });
+  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
   try {
     const hash = await bcrypt.hash(password, 10);
     const { rows } = await pool.query(
@@ -2321,6 +2391,10 @@ app.post('/api/users', auth, async (req, res) => {
 app.put('/api/users/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const { full_name, email, role, is_active, password, profile_picture, project_access, page_access } = req.body;
+  if (email && !EMAIL_RE.test(email)) return res.status(400).json({ error: 'Invalid email format' });
+  if (role && !VALID_ROLES.includes(role)) return res.status(400).json({ error: 'Invalid role' });
+  if (password && password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  if (profile_picture && !isValidProfilePicture(profile_picture)) return res.status(400).json({ error: 'Invalid profile picture' });
   try {
     if (password) {
       const hash = await bcrypt.hash(password, 10);

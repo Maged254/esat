@@ -15,6 +15,9 @@ const pool = new Pool({
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'esat-secret-2026';
+// Any token issued before this process started is rejected, forcing everyone
+// to re-login after a backend deploy (except the long-lived sync account).
+const SERVER_BOOT_TIME = Math.floor(Date.now() / 1000);
 
 // ── Auto-setup database on startup ──────────────────────────
 async function setupDB() {
@@ -241,6 +244,9 @@ const auth = (req, res, next) => {
   if (!token) return res.status(401).json({ error: 'No token' });
   try {
     req.user = jwt.verify(token, JWT_SECRET);
+    if (!req.user.sync && req.user.iat < SERVER_BOOT_TIME) {
+      return res.status(401).json({ error: 'Session expired, please log in again' });
+    }
     next();
   } catch { res.status(401).json({ error: 'Invalid token' }); }
 };
@@ -294,7 +300,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     const isSync = rows[0].email === 'sync@egypro.com';
     const tokenOptions = isSync ? {} : { expiresIn: '8h' };
-    const token = jwt.sign({ id: rows[0].id, email: rows[0].email, role: rows[0].role, name: rows[0].full_name, project_access: rows[0].project_access || [], client_access: rows[0].client_access || [], page_access: rows[0].page_access || [] }, JWT_SECRET, tokenOptions);
+    const token = jwt.sign({ id: rows[0].id, email: rows[0].email, role: rows[0].role, name: rows[0].full_name, project_access: rows[0].project_access || [], client_access: rows[0].client_access || [], page_access: rows[0].page_access || [], sync: isSync }, JWT_SECRET, tokenOptions);
     res.json({ token, user: { id: rows[0].id, name: rows[0].full_name, email: rows[0].email, role: rows[0].role, project_access: rows[0].project_access || [], client_access: rows[0].client_access || [], page_access: rows[0].page_access || [] } });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });

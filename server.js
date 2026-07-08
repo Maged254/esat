@@ -245,8 +245,8 @@ const auth = (req, res, next) => {
   } catch { res.status(401).json({ error: 'Invalid token' }); }
 };
 
-// ── Project access helper ────────────────────────────────────
-const RESTRICTED_ROLES = ['ehs_officer', 'supervisor', 'scm_officer', 'project_director'];
+// ── Project / client access helpers ──────────────────────────
+const RESTRICTED_ROLES = ['ehs_officer', 'supervisor', 'scm_officer', 'project_director', 'ehs_manager'];
 const getProjectFilter = async (user) => {
   if (!RESTRICTED_ROLES.includes(user.role)) return null; // unrestricted
   const projects = user.project_access || [];
@@ -263,6 +263,22 @@ const getProjectFilter = async (user) => {
   if (allProjects.every(p => projects.includes(p))) return null; // has all projects = unrestricted
   return projects;
 };
+const getClientFilter = async (user) => {
+  if (!RESTRICTED_ROLES.includes(user.role)) return null; // unrestricted
+  const clients = user.client_access || [];
+  if (clients.length === 0) return []; // no access
+  // Check if user has all clients
+  const { rows } = await pool.query(`
+    SELECT ARRAY_AGG(DISTINCT client) as all_clients FROM (
+      SELECT client FROM employees WHERE client IS NOT NULL
+      UNION
+      SELECT client FROM casuals WHERE client IS NOT NULL
+    ) combined
+  `);
+  const allClients = rows[0].all_clients || [];
+  if (allClients.every(c => clients.includes(c))) return null; // has all clients = unrestricted
+  return clients;
+};
 
 // ── Routes ───────────────────────────────────────────────────
 
@@ -278,8 +294,8 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     const isSync = rows[0].email === 'sync@egypro.com';
     const tokenOptions = isSync ? {} : { expiresIn: '8h' };
-    const token = jwt.sign({ id: rows[0].id, email: rows[0].email, role: rows[0].role, name: rows[0].full_name, project_access: rows[0].project_access || [], page_access: rows[0].page_access || [] }, JWT_SECRET, tokenOptions);
-    res.json({ token, user: { id: rows[0].id, name: rows[0].full_name, email: rows[0].email, role: rows[0].role, project_access: rows[0].project_access || [], page_access: rows[0].page_access || [] } });
+    const token = jwt.sign({ id: rows[0].id, email: rows[0].email, role: rows[0].role, name: rows[0].full_name, project_access: rows[0].project_access || [], client_access: rows[0].client_access || [], page_access: rows[0].page_access || [] }, JWT_SECRET, tokenOptions);
+    res.json({ token, user: { id: rows[0].id, name: rows[0].full_name, email: rows[0].email, role: rows[0].role, project_access: rows[0].project_access || [], client_access: rows[0].client_access || [], page_access: rows[0].page_access || [] } });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -352,6 +368,11 @@ app.get('/api/employees', auth, async (req, res) => {
       if (empProjects.length === 0) { return res.json([]); }
       params.push(empProjects); q += ` AND e.project = ANY($${params.length})`;
     }
+    const empClients = await getClientFilter(req.user);
+    if (empClients !== null) {
+      if (empClients.length === 0) { return res.json([]); }
+      params.push(empClients); q += ` AND e.client = ANY($${params.length})`;
+    }
     q += ` GROUP BY e.id, u.full_name ORDER BY e.full_name`;
     const { rows } = await pool.query(q, params);
     res.json(rows);
@@ -361,7 +382,8 @@ app.get('/api/employees', auth, async (req, res) => {
 app.get('/api/audit-coverage', auth, async (req, res) => {
   try {
     const projectFilter = await getProjectFilter(req.user);
-    if (projectFilter !== null && projectFilter.length === 0) {
+    const clientFilter = await getClientFilter(req.user);
+    if ((projectFilter !== null && projectFilter.length === 0) || (clientFilter !== null && clientFilter.length === 0)) {
       return res.json({
         total_active: 0, san_count: 0, non_san_count: 0,
         bucket_0_30: 0, bucket_31_60: 0, bucket_61_90: 0, bucket_90_plus: 0, never_audited: 0,
@@ -374,6 +396,7 @@ app.get('/api/audit-coverage', auth, async (req, res) => {
     const params = [];
     let whereExtra = '';
     if (projectFilter !== null) { params.push(projectFilter); whereExtra += ` AND e.project = ANY($${params.length})`; }
+    if (clientFilter !== null) { params.push(clientFilter); whereExtra += ` AND e.client = ANY($${params.length})`; }
     if (project) { params.push(project); whereExtra += ` AND e.project = $${params.length}`; }
     if (client) { params.push(client); whereExtra += ` AND e.client = $${params.length}`; }
 
@@ -459,17 +482,25 @@ app.get('/api/audit-coverage', auth, async (req, res) => {
 });
 app.get('/api/employees/overdue', auth, async (req, res) => {
   try {
+    const overdueProjects = await getProjectFilter(req.user);
+    if (overdueProjects !== null && overdueProjects.length === 0) return res.json([]);
+    const overdueClients = await getClientFilter(req.user);
+    if (overdueClients !== null && overdueClients.length === 0) return res.json([]);
+    const params = [];
+    let whereExtra = '';
+    if (overdueProjects !== null) { params.push(overdueProjects); whereExtra += ` AND e.project = ANY($${params.length})`; }
+    if (overdueClients !== null) { params.push(overdueClients); whereExtra += ` AND e.client = ANY($${params.length})`; }
     const { rows } = await pool.query(`
       SELECT e.id as employee_id, e.employee_number, e.national_id, e.full_name, e.department, e.project, e.employment_status,
         MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) as last_audit_date,
         CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) as days_since_audit
       FROM employees e LEFT JOIN audits a ON a.employee_id=e.id
-      WHERE e.employment_status='active' AND e.san=TRUE
+      WHERE e.employment_status='active' AND e.san=TRUE ${whereExtra}
       GROUP BY e.id
       HAVING MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) IS NULL
         OR CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE) > 30
       ORDER BY days_since_audit DESC NULLS FIRST
-    `);
+    `, params);
     res.json(rows);
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
@@ -479,6 +510,10 @@ app.get('/api/employees/:id', auth, async (req, res) => {
   if (!rows[0]) return res.status(404).json({ error: 'Not found' });
   const empProjects = await getProjectFilter(req.user);
   if (empProjects !== null && !empProjects.includes(rows[0].project)) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  const empClients = await getClientFilter(req.user);
+  if (empClients !== null && !empClients.includes(rows[0].client)) {
     return res.status(404).json({ error: 'Not found' });
   }
   res.json(rows[0]);
@@ -581,9 +616,12 @@ app.get('/api/casuals', auth, async (req, res) => {
   try {
     const casualProjects = await getProjectFilter(req.user);
     if (casualProjects !== null && casualProjects.length === 0) return res.json([]);
+    const casualClients = await getClientFilter(req.user);
+    if (casualClients !== null && casualClients.length === 0) return res.json([]);
     let q = `SELECT c.*, COUNT(cpa.id) > 0 as ppe_assigned, u.full_name as last_edited_by_name, u2.full_name as ppe_last_edited_by_name FROM casuals c LEFT JOIN casual_ppe_assignments cpa ON cpa.casual_id=c.id LEFT JOIN users u ON u.id=c.last_edited_by LEFT JOIN users u2 ON u2.id=c.ppe_last_edited_by WHERE 1=1`;
     const params = [];
     if (casualProjects !== null) { params.push(casualProjects); q += ` AND c.project = ANY($${params.length})`; }
+    if (casualClients !== null) { params.push(casualClients); q += ` AND c.client = ANY($${params.length})`; }
     q += ' GROUP BY c.id, u.full_name, u2.full_name ORDER BY c.created_at DESC';
     const { rows } = await pool.query(q, params);
     res.json(rows);
@@ -804,6 +842,11 @@ app.get('/api/audits', auth, async (req, res) => {
     if (auditProjects !== null) {
       if (auditProjects.length === 0) { return res.json([]); }
       params.push(auditProjects); q += ` AND COALESCE(e.project, c.project) = ANY($${params.length})`;
+    }
+    const auditClients = await getClientFilter(req.user);
+    if (auditClients !== null) {
+      if (auditClients.length === 0) { return res.json([]); }
+      params.push(auditClients); q += ` AND COALESCE(e.client, c.client) = ANY($${params.length})`;
     }
     q += ` GROUP BY a.id,e.full_name,c.full_name,e.employee_number,e.national_id,c.national_id,e.department,e.project,c.project,e.client,c.client,e.organization,c.organization,e.resource_type,u.full_name,a.employee_present,a.casual_id,ud.full_name ORDER BY a.created_at DESC`;
     const { rows } = await pool.query(q, params);
@@ -1109,7 +1152,8 @@ app.get('/api/ncr', auth, async (req, res) => {
   try {
     let ncrRows;
     const ncrProjects = await getProjectFilter(req.user);
-    if (ncrProjects !== null && ncrProjects.length === 0) {
+    const ncrClients = await getClientFilter(req.user);
+    if ((ncrProjects !== null && ncrProjects.length === 0) || (ncrClients !== null && ncrClients.length === 0)) {
       ncrRows = [];
     } else {
       let ncrQ = `SELECT n.*,
@@ -1128,6 +1172,7 @@ app.get('/api/ncr', auth, async (req, res) => {
         LEFT JOIN users u ON u.id=a.audited_by WHERE 1=1`;
       const ncrParams = [];
       if (ncrProjects !== null) { ncrParams.push(ncrProjects); ncrQ += ` AND COALESCE(e.project, c.project) = ANY($${ncrParams.length})`; }
+      if (ncrClients !== null) { ncrParams.push(ncrClients); ncrQ += ` AND COALESCE(e.client, c.client) = ANY($${ncrParams.length})`; }
       ncrQ += ` ORDER BY n.created_at DESC`;
       const { rows: _ncrRows } = await pool.query(ncrQ, ncrParams);
       ncrRows = _ncrRows;
@@ -1322,10 +1367,15 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
         r.date_flagged DESC
     `);
     const ppeProjects = await getProjectFilter(req.user);
+    const ppeClients = await getClientFilter(req.user);
     let filteredRows = rows;
     if (ppeProjects !== null) {
       if (ppeProjects.length === 0) filteredRows = [];
-      else filteredRows = rows.filter(r => ppeProjects.includes(r.project));
+      else filteredRows = filteredRows.filter(r => ppeProjects.includes(r.project));
+    }
+    if (ppeClients !== null) {
+      if (ppeClients.length === 0) filteredRows = [];
+      else filteredRows = filteredRows.filter(r => ppeClients.includes(r.client));
     }
     res.json(filteredRows);
   } catch(e) { console.error('PPE requests error:', e.message); res.status(500).json({ error: e.message }); }

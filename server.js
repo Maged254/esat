@@ -1431,7 +1431,7 @@ app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
       extraFields = ', date_distributed=NOW(), distributed_by=$3, date_available=COALESCE(date_available,NOW()), available_by=COALESCE(available_by,$3), date_ordered=COALESCE(date_ordered,NOW()), ordered_by=COALESCE(ordered_by,$3)';
       if (distribution_method) { extraFields += ', distribution_method=$4'; extraParams.push(distribution_method); }
       if (distribution_method && courier_tracking_number) { extraFields += ', courier_tracking_number=$5'; extraParams.push(courier_tracking_number); }
-    } else if (extraFields.includes('$3')) {
+    } else if (status !== 'scm_ordered' && extraFields.includes('$3')) {
       extraParams.push(req.user.id);
     }
     const { rows: [r] } = await client.query(

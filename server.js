@@ -162,6 +162,8 @@ async function setupDB() {
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS client_access TEXT[] DEFAULT '{}'");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS page_access TEXT[] DEFAULT '{}'");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS must_reset_password BOOLEAN DEFAULT FALSE");
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER DEFAULT 0");
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ");
 
     // Ensure distribution columns exist on ppe_requests
     await client.query('ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS distribution_method VARCHAR(50)');
@@ -351,16 +353,42 @@ const getAuditScope = async (auditId) => {
 app.get('/health', (_, res) => res.json({ status: 'ok', app: 'ESAT', version: '1.0.0' }));
 
 // Login
+const LOCKOUT_THRESHOLD = 5;
+const LOCKOUT_MINUTES = 15;
+
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
   try {
     const { rows } = await pool.query('SELECT * FROM users WHERE email=$1 AND is_active=true', [email]);
-    if (!rows[0] || !(await bcrypt.compare(password, rows[0].password_hash)))
+    const user = rows[0];
+
+    if (user && user.locked_until && new Date(user.locked_until) > new Date()) {
+      const minutesLeft = Math.ceil((new Date(user.locked_until) - new Date()) / 60000);
+      return res.status(423).json({ error: `Account locked due to failed login attempts. Try again in ${minutesLeft} minute(s).` });
+    }
+
+    if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+      if (user) {
+        const attempts = (user.failed_login_attempts || 0) + 1;
+        if (attempts >= LOCKOUT_THRESHOLD) {
+          await pool.query(
+            `UPDATE users SET failed_login_attempts=$1, locked_until=NOW() + INTERVAL '${LOCKOUT_MINUTES} minutes' WHERE id=$2`,
+            [attempts, user.id]
+          );
+        } else {
+          await pool.query('UPDATE users SET failed_login_attempts=$1 WHERE id=$2', [attempts, user.id]);
+        }
+      }
       return res.status(401).json({ error: 'Invalid credentials' });
-    const isSync = rows[0].email === 'sync@egypro.com';
+    }
+
+    if (user.failed_login_attempts || user.locked_until) {
+      await pool.query('UPDATE users SET failed_login_attempts=0, locked_until=NULL WHERE id=$1', [user.id]);
+    }
+    const isSync = user.email === 'sync@egypro.com';
     const tokenOptions = isSync ? {} : { expiresIn: '8h' };
-    const token = jwt.sign({ id: rows[0].id, email: rows[0].email, role: rows[0].role, name: rows[0].full_name, project_access: rows[0].project_access || [], client_access: rows[0].client_access || [], page_access: rows[0].page_access || [], sync: isSync }, JWT_SECRET, tokenOptions);
-    res.json({ token, user: { id: rows[0].id, name: rows[0].full_name, email: rows[0].email, role: rows[0].role, project_access: rows[0].project_access || [], client_access: rows[0].client_access || [], page_access: rows[0].page_access || [], must_reset_password: rows[0].must_reset_password || false } });
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role, name: user.full_name, project_access: user.project_access || [], client_access: user.client_access || [], page_access: user.page_access || [], sync: isSync }, JWT_SECRET, tokenOptions);
+    res.json({ token, user: { id: user.id, name: user.full_name, email: user.email, role: user.role, project_access: user.project_access || [], client_access: user.client_access || [], page_access: user.page_access || [], must_reset_password: user.must_reset_password || false } });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -2456,8 +2484,19 @@ app.get('/api/graphs', auth, async (req, res) => {
 
 app.get('/api/users', auth, async (req, res) => {
   if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
-  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access, must_reset_password, created_at FROM users ORDER BY created_at DESC');
+  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access, must_reset_password, failed_login_attempts, locked_until, created_at FROM users ORDER BY created_at DESC');
   res.json(rows);
+});
+
+// Clear a locked-out account (admin only)
+app.put('/api/users/:id/unlock', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { rows } = await pool.query(
+    'UPDATE users SET failed_login_attempts=0, locked_until=NULL WHERE id=$1 RETURNING id, failed_login_attempts, locked_until',
+    [req.params.id]
+  );
+  if (!rows.length) return res.status(404).json({ error: 'Not found' });
+  res.json(rows[0]);
 });
 
 // Force all non-service accounts to change their password on next login (admin only)

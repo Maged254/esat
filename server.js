@@ -161,6 +161,7 @@ async function setupDB() {
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS project_access TEXT[] DEFAULT '{}'")
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS client_access TEXT[] DEFAULT '{}'");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS page_access TEXT[] DEFAULT '{}'");
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS must_reset_password BOOLEAN DEFAULT FALSE");
 
     // Ensure distribution columns exist on ppe_requests
     await client.query('ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS distribution_method VARCHAR(50)');
@@ -359,13 +360,13 @@ app.post('/api/auth/login', async (req, res) => {
     const isSync = rows[0].email === 'sync@egypro.com';
     const tokenOptions = isSync ? {} : { expiresIn: '8h' };
     const token = jwt.sign({ id: rows[0].id, email: rows[0].email, role: rows[0].role, name: rows[0].full_name, project_access: rows[0].project_access || [], client_access: rows[0].client_access || [], page_access: rows[0].page_access || [], sync: isSync }, JWT_SECRET, tokenOptions);
-    res.json({ token, user: { id: rows[0].id, name: rows[0].full_name, email: rows[0].email, role: rows[0].role, project_access: rows[0].project_access || [], client_access: rows[0].client_access || [], page_access: rows[0].page_access || [] } });
+    res.json({ token, user: { id: rows[0].id, name: rows[0].full_name, email: rows[0].email, role: rows[0].role, project_access: rows[0].project_access || [], client_access: rows[0].client_access || [], page_access: rows[0].page_access || [], must_reset_password: rows[0].must_reset_password || false } });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
 // Me
 app.get('/api/auth/me', auth, async (req, res) => {
-  const { rows } = await pool.query('SELECT id,full_name,email,role,profile_picture,project_access,page_access,client_access FROM users WHERE id=$1', [req.user.id]);
+  const { rows } = await pool.query('SELECT id,full_name,email,role,profile_picture,project_access,page_access,client_access,must_reset_password FROM users WHERE id=$1', [req.user.id]);
   res.json(rows[0]);
 });
 
@@ -2455,8 +2456,22 @@ app.get('/api/graphs', auth, async (req, res) => {
 
 app.get('/api/users', auth, async (req, res) => {
   if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
-  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access, created_at FROM users ORDER BY created_at DESC');
+  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access, must_reset_password, created_at FROM users ORDER BY created_at DESC');
   res.json(rows);
+});
+
+// Force all non-service accounts to change their password on next login (admin only)
+app.post('/api/admin/force-password-reset', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  // Excludes the acting admin (so they aren't immediately kicked into the reset
+  // screen mid-session) and the long-lived sync service accounts.
+  const { rows } = await pool.query(
+    `UPDATE users SET must_reset_password=TRUE
+     WHERE email NOT IN ('sync@egypro.com','eats-sync@egypro.app') AND id != $1
+     RETURNING id`,
+    [req.user.id]
+  );
+  res.json({ count: rows.length });
 });
 
 // POST create new user (admin only)
@@ -2484,7 +2499,7 @@ app.post('/api/users', auth, async (req, res) => {
 // PUT update user (admin only)
 app.put('/api/users/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  const { full_name, email, role, is_active, password, profile_picture, project_access, page_access } = req.body;
+  const { full_name, email, role, is_active, password, profile_picture, project_access, page_access, must_reset_password } = req.body;
   if (email && !EMAIL_RE.test(email)) return res.status(400).json({ error: 'Invalid email format' });
   if (role && !VALID_ROLES.includes(role)) return res.status(400).json({ error: 'Invalid role' });
   if (password) {
@@ -2495,13 +2510,13 @@ app.put('/api/users/:id', auth, async (req, res) => {
   try {
     if (password) {
       const hash = await bcrypt.hash(password, 10);
-      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, password_hash=$5, profile_picture=$6, project_access=$7, page_access=$8, client_access=$9, updated_at=NOW() WHERE id=$10',
-        [full_name, email, role, is_active, hash, profile_picture || null, project_access || [], page_access || [], req.body.client_access || [], req.params.id]);
+      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, password_hash=$5, profile_picture=$6, project_access=$7, page_access=$8, client_access=$9, must_reset_password=$10, updated_at=NOW() WHERE id=$11',
+        [full_name, email, role, is_active, hash, profile_picture || null, project_access || [], page_access || [], req.body.client_access || [], must_reset_password || false, req.params.id]);
     } else {
-      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, profile_picture=$5, project_access=$6, page_access=$7, client_access=$8, updated_at=NOW() WHERE id=$9',
-        [full_name, email, role, is_active, profile_picture || null, project_access || [], page_access || [], req.body.client_access || [], req.params.id]);
+      await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, profile_picture=$5, project_access=$6, page_access=$7, client_access=$8, must_reset_password=$9, updated_at=NOW() WHERE id=$10',
+        [full_name, email, role, is_active, profile_picture || null, project_access || [], page_access || [], req.body.client_access || [], must_reset_password || false, req.params.id]);
     }
-    const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access FROM users WHERE id=$1', [req.params.id]);
+    const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access, must_reset_password FROM users WHERE id=$1', [req.params.id]);
     res.json(rows[0]);
   } catch(e) { console.error("PUT users error:", e.message); res.status(500).json({ error: e.message }); }
 });
@@ -2517,7 +2532,7 @@ app.post('/api/auth/change-password', auth, async (req, res) => {
     if (!(await bcrypt.compare(currentPassword, rows[0].password_hash)))
       return res.status(401).json({ error: 'Current password incorrect' });
     const hash = await bcrypt.hash(newPassword, 10);
-    await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, req.user.id]);
+    await pool.query('UPDATE users SET password_hash=$1, must_reset_password=FALSE WHERE id=$2', [hash, req.user.id]);
     res.json({ message: 'Password updated' });
   } catch(e) { console.error("PUT users error:", e.message); res.status(500).json({ error: e.message }); }
 });

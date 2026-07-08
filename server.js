@@ -15,7 +15,11 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === "production" ? { rejectUnauthorized: false, checkServerIdentity: () => undefined } : false
 });
 
-const JWT_SECRET = process.env.JWT_SECRET || 'esat-secret-2026';
+if (!process.env.JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET environment variable is not set. Refusing to start with a predictable secret.');
+  process.exit(1);
+}
+const JWT_SECRET = process.env.JWT_SECRET;
 // Any token issued before this process started is rejected, forcing everyone
 // to re-login after a backend deploy (except the long-lived sync account).
 const SERVER_BOOT_TIME = Math.floor(Date.now() / 1000);

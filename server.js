@@ -263,6 +263,19 @@ const VALID_ROLES = ['admin', 'ehs_manager', 'ehs_officer', 'supervisor', 'scm_o
 // (no client-side resize happens before upload, so this must stay generous).
 const isValidProfilePicture = (s) => typeof s === 'string' && s.startsWith('data:image/') && s.length <= 9 * 1024 * 1024;
 
+// Returns an error message if the password fails policy, or null if it passes.
+const PASSWORD_MIN_LENGTH = 12;
+const validatePassword = (pw) => {
+  if (typeof pw !== 'string' || pw.length < PASSWORD_MIN_LENGTH) {
+    return `Password must be at least ${PASSWORD_MIN_LENGTH} characters`;
+  }
+  if (!/[A-Z]/.test(pw)) return 'Password must include an uppercase letter';
+  if (!/[a-z]/.test(pw)) return 'Password must include a lowercase letter';
+  if (!/[0-9]/.test(pw)) return 'Password must include a number';
+  if (!/[^A-Za-z0-9]/.test(pw)) return 'Password must include a special character';
+  return null;
+};
+
 const VALID_CONDITIONS = ['good', 'not_good', 'missing'];
 // Returns a whole number 1-9999, or null if the input isn't a valid quantity.
 const sanitizeQuantity = (q) => {
@@ -2453,7 +2466,8 @@ app.post('/api/users', auth, async (req, res) => {
   if (!full_name || !email || !password || !role) return res.status(400).json({ error: 'All fields required' });
   if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'Invalid email format' });
   if (!VALID_ROLES.includes(role)) return res.status(400).json({ error: 'Invalid role' });
-  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  const pwError = validatePassword(password);
+  if (pwError) return res.status(400).json({ error: pwError });
   try {
     const hash = await bcrypt.hash(password, 10);
     const { rows } = await pool.query(
@@ -2473,7 +2487,10 @@ app.put('/api/users/:id', auth, async (req, res) => {
   const { full_name, email, role, is_active, password, profile_picture, project_access, page_access } = req.body;
   if (email && !EMAIL_RE.test(email)) return res.status(400).json({ error: 'Invalid email format' });
   if (role && !VALID_ROLES.includes(role)) return res.status(400).json({ error: 'Invalid role' });
-  if (password && password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  if (password) {
+    const pwError = validatePassword(password);
+    if (pwError) return res.status(400).json({ error: pwError });
+  }
   if (profile_picture && !isValidProfilePicture(profile_picture)) return res.status(400).json({ error: 'Invalid profile picture' });
   try {
     if (password) {
@@ -2492,8 +2509,9 @@ app.put('/api/users/:id', auth, async (req, res) => {
 // Change own password
 app.post('/api/auth/change-password', auth, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
-  if (!currentPassword || !newPassword || newPassword.length < 8)
-    return res.status(400).json({ error: 'Invalid password data' });
+  if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Invalid password data' });
+  const pwError = validatePassword(newPassword);
+  if (pwError) return res.status(400).json({ error: pwError });
   try {
     const { rows } = await pool.query('SELECT * FROM users WHERE id=$1', [req.user.id]);
     if (!(await bcrypt.compare(currentPassword, rows[0].password_hash)))

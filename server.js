@@ -241,6 +241,17 @@ async function setupDB() {
   }
 }
 
+// Always logs the full error server-side. Only echoes err.message to the
+// client when it's a deliberately-thrown application error (no Postgres/
+// system error code attached) — raw DB/system exceptions never reach the
+// client, just a generic message.
+const GENERIC_ERROR_MESSAGE = 'Something went wrong. Please contact support.';
+const sendError = (res, err, status = 500) => {
+  console.error(err);
+  const safeMessage = err.code ? GENERIC_ERROR_MESSAGE : (err.message || GENERIC_ERROR_MESSAGE);
+  res.status(status).json({ error: safeMessage });
+};
+
 // ── Auth middleware ──────────────────────────────────────────
 const auth = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
@@ -571,7 +582,7 @@ app.get('/api/audit-coverage', auth, async (req, res) => {
       last_month_audited: parseInt(m.last_month) || 0,
       by_project: byProject.rows.map(r => ({ project: r.project, san_total: parseInt(r.san_total), overdue: parseInt(r.overdue) }))
     });
-  } catch(e) { console.error('Audit coverage error:', e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { sendError(res, e); }
 });
 app.get('/api/employees/overdue', auth, async (req, res) => {
   try {
@@ -647,7 +658,7 @@ app.put('/api/employees/:id/ppe-assignments', auth, async (req, res) => {
     res.json({ success: true });
   } catch (e) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: e.message });
+    sendError(res, e);
   } finally {
     client.release();
   }
@@ -730,7 +741,7 @@ app.get('/api/casuals', auth, async (req, res) => {
     q += ' GROUP BY c.id, u.full_name, u2.full_name ORDER BY c.created_at DESC';
     const { rows } = await pool.query(q, params);
     res.json(rows);
-  } catch(e) { console.error('Casuals list error:', e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { sendError(res, e); }
 });
 
 // Batch add casuals (admin, supervisor only)
@@ -807,7 +818,7 @@ app.post('/api/casuals/batch', auth, async (req, res) => {
       }).catch(e => console.error('Casuals batch email error:', e.message));
     }
     res.json({ inserted, reactivated, skipped });
-  } catch(e) { await client_db.query('ROLLBACK'); console.error('Casuals batch add error:', e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { await client_db.query('ROLLBACK'); sendError(res, e); }
   finally { client_db.release(); }
 });
 
@@ -889,7 +900,7 @@ app.put('/api/casuals/:id/ppe-assignments', auth, async (req, res) => {
   } catch (e) {
     await client_db.query('ROLLBACK');
     console.error('Casual PPE assignment error:', e.message);
-    res.status(500).json({ error: e.message });
+    sendError(res, e);
   } finally { client_db.release(); }
 });
 
@@ -899,7 +910,7 @@ app.delete('/api/employees/all/purge', auth, async (req, res) => {
   try {
     await pool.query('DELETE FROM employees');
     res.json({ message: 'All employees deleted' });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) { sendError(res, e); }
 });
 
 app.delete('/api/employees/:id', auth, async (req, res) => {
@@ -909,7 +920,7 @@ app.delete('/api/employees/:id', auth, async (req, res) => {
     res.json({ message: 'Deleted' });
   } catch (e) {
     if (e.code === '23503') return res.status(400).json({ error: 'Cannot delete: employee has existing audits or records. Deactivate them instead.' });
-    res.status(500).json({ error: e.message });
+    sendError(res, e);
   }
 });
 
@@ -921,7 +932,7 @@ app.delete('/api/casuals/:id', auth, async (req, res) => {
     res.json({ message: 'Deleted' });
   } catch (e) {
     if (e.code === '23503') return res.status(400).json({ error: 'Cannot delete: this casual has existing audits, NCR items, or PPE requests. Exit them instead.' });
-    res.status(500).json({ error: e.message });
+    sendError(res, e);
   }
 });
 
@@ -1022,7 +1033,7 @@ app.delete('/api/audits/:id', auth, async (req, res) => {
     }
     await client.query('COMMIT');
     res.json({ message: 'Deleted' });
-  } catch(e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: e.message }); }
+  } catch(e) { await client.query('ROLLBACK'); sendError(res, e); }
   finally { client.release(); }
 });
 
@@ -1286,8 +1297,7 @@ app.put('/api/audits/:id', auth, async (req, res) => {
     res.json(updated);
   } catch(e) {
     await client.query('ROLLBACK');
-    console.error(e);
-    res.status(400).json({ error: e.message || 'Server error' });
+    sendError(res, e, 400);
   } finally { client.release(); }
 });
 
@@ -1322,7 +1332,7 @@ app.get('/api/ncr', auth, async (req, res) => {
       ncrRows = _ncrRows;
     }
     res.json(ncrRows);
-  } catch(e) { console.error('NCR error:', e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { sendError(res, e); }
 });
 
 app.get('/api/ncr/stats', auth, async (req, res) => {
@@ -1385,7 +1395,7 @@ app.put('/api/ncr/:id/status', auth, async (req, res) => {
     }
     await client.query('COMMIT');
     res.json(ncr);
-  } catch(e) { await client.query('ROLLBACK'); console.error('NCR status error:', e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { await client.query('ROLLBACK'); sendError(res, e); }
   finally { client.release(); }
 });
 
@@ -1423,7 +1433,7 @@ app.post('/api/admin/fix-statuses', auth, async (req, res) => {
     const r2 = await pool.query("UPDATE ncr_items SET status='ehs_purchase_requested' WHERE status IN ('purchase_requested','ordered') RETURNING id");
     const r3 = await pool.query("UPDATE ncr_items SET status='distributed' WHERE status='resolved' RETURNING id");
     res.json({ ppe_fixed: r1.rowCount, ncr_fixed: r2.rowCount, resolved_fixed: r3.rowCount });
-  } catch(e) { console.error('fix-statuses error:', e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { sendError(res, e); }
 });
 
 // Delete NCR item (admin only)
@@ -1433,7 +1443,7 @@ app.delete('/api/ncr/:id', auth, async (req, res) => {
     await pool.query('DELETE FROM ppe_requests WHERE ncr_item_id=$1', [req.params.id]);
     await pool.query('DELETE FROM ncr_items WHERE id=$1', [req.params.id]);
     res.json({ message: 'Deleted' });
-  } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
+  } catch(e) { sendError(res, e); }
 });
 
 // PPE Request Tracker
@@ -1445,7 +1455,7 @@ app.delete('/api/ppe/:id', auth, async (req, res) => {
     res.json({ success: true });
   } catch (e) {
     if (e.code === '23503') return res.status(400).json({ error: 'Cannot delete: this PPE item is referenced in existing audits. Set it to Inactive instead.' });
-    res.status(500).json({ error: e.message });
+    sendError(res, e);
   }
 });
 
@@ -1528,7 +1538,7 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
       else filteredRows = filteredRows.filter(r => ppeClients.includes(r.client));
     }
     res.json(filteredRows);
-  } catch(e) { console.error('PPE requests error:', e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { sendError(res, e); }
 });
 
 app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
@@ -1597,7 +1607,7 @@ app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
     }
     await client.query('COMMIT');
     res.json(r);
-  } catch(e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: e.message }); }
+  } catch(e) { await client.query('ROLLBACK'); sendError(res, e); }
   finally { client.release(); }
 });
 
@@ -1607,7 +1617,7 @@ app.post('/api/admin/fix-ppe-dates', auth, async (req, res) => {
   try {
     await pool.query("UPDATE ppe_requests SET date_purchase_requested=updated_at WHERE status='ehs_purchase_requested' AND date_purchase_requested IS NULL");
     res.json({ message: 'Dates fixed' });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } catch(e) { sendError(res, e); }
 });
 
 // One-time backfill NCR items to PPE requests (admin only)
@@ -1624,7 +1634,7 @@ app.post('/api/admin/backfill-ppe-requests', auth, async (req, res) => {
       RETURNING id
     `);
     res.json({ backfilled: rows.length });
-  } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
+  } catch(e) { sendError(res, e); }
 });
 
 
@@ -1710,7 +1720,7 @@ app.post('/api/admin/seed-locations', auth, async (req, res) => {
     `);
     const { rows } = await pool.query('SELECT COUNT(*) FROM locations');
     res.json({ success: true, count: rows[0].count });
-  } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
+  } catch(e) { sendError(res, e); }
 });
 
 app.post('/api/admin/backfill-page-access', auth, async (req, res) => {
@@ -1723,7 +1733,7 @@ app.post('/api/admin/backfill-page-access', auth, async (req, res) => {
       [fullPages]
     );
     res.json({ success: true, updated: rowCount });
-  } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
+  } catch(e) { sendError(res, e); }
 });
 
 
@@ -1828,7 +1838,7 @@ app.post('/api/admin/replace-ppe-items', async (req, res) => {
     await client.query('COMMIT');
     const { rows } = await client.query('SELECT COUNT(*) FROM ppe_items');
     res.json({ success: true, count: rows[0].count });
-  } catch(e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: e.message }); }
+  } catch(e) { await client.query('ROLLBACK'); sendError(res, e); }
   finally { client.release(); }
 });
 
@@ -2192,7 +2202,7 @@ app.post('/api/admin/test-bts-digest', auth, async (req, res) => {
   try {
     await sendDailyBTSDigest();
     res.json({ success: true });
-  } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
+  } catch(e) { sendError(res, e); }
 });
 
 app.post('/api/admin/test-fibre-digest', auth, async (req, res) => {
@@ -2200,7 +2210,7 @@ app.post('/api/admin/test-fibre-digest', auth, async (req, res) => {
   try {
     await sendDailyFibreDigest();
     res.json({ success: true });
-  } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
+  } catch(e) { sendError(res, e); }
 });
 
 app.post('/api/admin/test-ehs-digest', auth, async (req, res) => {
@@ -2240,7 +2250,7 @@ app.post('/api/admin/test-ehs-digest', auth, async (req, res) => {
       `
     });
     res.json({ success: true, count, oldestDays });
-  } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
+  } catch(e) { sendError(res, e); }
 });
 
 app.post('/api/admin/test-scm-digest', auth, async (req, res) => {
@@ -2291,7 +2301,7 @@ app.post('/api/admin/test-scm-digest', auth, async (req, res) => {
       `
     });
     res.json({ success: true, count, oldestDays, orderedCount, orderedOldestDays });
-  } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
+  } catch(e) { sendError(res, e); }
 });
 
 setupDB().then(() => {
@@ -2361,7 +2371,7 @@ app.post('/api/audit-documents/upload', auth, (req, res) => {
       res.json({ url: result.secure_url, public_id: result.public_id });
     } catch (err) {
       console.error('Upload error:', err);
-      res.status(500).json({ message: 'Upload failed', error: err.message });
+      res.status(500).json({ message: 'Upload failed', error: GENERIC_ERROR_MESSAGE });
     }
   });
 });
@@ -2426,7 +2436,7 @@ app.post('/api/admin/test-overdue-digest', auth, async (req, res) => {
   try {
     await sendDailyOverdueDigest();
     res.json({ success: true });
-  } catch(e) { console.error(e); res.status(500).json({ error: e.message }); }
+  } catch(e) { sendError(res, e); }
 });
 
 app.listen(PORT, () => { console.log(`ESAT running on port ${PORT}`); scheduleDailyDigest(); });
@@ -2557,7 +2567,7 @@ app.put('/api/users/:id', auth, async (req, res) => {
     }
     const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access, must_reset_password FROM users WHERE id=$1', [req.params.id]);
     res.json(rows[0]);
-  } catch(e) { console.error("PUT users error:", e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { sendError(res, e); }
 });
 
 // Change own password
@@ -2573,5 +2583,14 @@ app.post('/api/auth/change-password', auth, async (req, res) => {
     const hash = await bcrypt.hash(newPassword, 10);
     await pool.query('UPDATE users SET password_hash=$1, must_reset_password=FALSE WHERE id=$2', [hash, req.user.id]);
     res.json({ message: 'Password updated' });
-  } catch(e) { console.error("PUT users error:", e.message); res.status(500).json({ error: e.message }); }
+  } catch(e) { sendError(res, e); }
+});
+
+// Catch-all safety net for anything that reaches Express's default error
+// handling (e.g. a synchronous throw in a route with no try/catch) — never
+// let a raw stack trace or exception message reach the client.
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: GENERIC_ERROR_MESSAGE });
 });

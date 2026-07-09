@@ -279,6 +279,7 @@ async function setupDB() {
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS available_by UUID REFERENCES users(id)");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS distributed_by UUID REFERENCES users(id)");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()");
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ");
     console.log("Database setup complete");
   } catch(e) {
     console.error('DB setup error:', e.message);
@@ -480,6 +481,7 @@ app.post('/api/auth/login', async (req, res) => {
     if (user.failed_login_attempts || user.locked_until) {
       await pool.query('UPDATE users SET failed_login_attempts=0, locked_until=NULL WHERE id=$1', [user.id]);
     }
+    await pool.query('UPDATE users SET last_login=NOW() WHERE id=$1', [user.id]);
     const isSync = user.email === 'sync@egypro.com';
     const tokenOptions = isSync ? {} : { expiresIn: '8h' };
     const token = jwt.sign({ id: user.id, email: user.email, role: user.role, name: user.full_name, project_access: user.project_access || [], client_access: user.client_access || [], page_access: user.page_access || [], sync: isSync }, JWT_SECRET, tokenOptions);
@@ -2597,7 +2599,7 @@ app.get('/api/graphs', auth, async (req, res) => {
 
 app.get('/api/users', auth, async (req, res) => {
   if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
-  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access, must_reset_password, failed_login_attempts, locked_until, created_at FROM users ORDER BY created_at DESC');
+  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access, must_reset_password, failed_login_attempts, locked_until, last_login, created_at FROM users ORDER BY created_at DESC');
   res.json(rows);
 });
 

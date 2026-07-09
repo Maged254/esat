@@ -184,6 +184,32 @@ async function setupDB() {
       )
     `);
     await client.query('CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at DESC)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_request_logs_user_id ON request_logs(user_id)');
+
+    // Foreign-key / frequently-filtered columns had no indexes at all — every
+    // join or WHERE on these was a full table scan.
+    await client.query('CREATE INDEX IF NOT EXISTS idx_audits_employee_id ON audits(employee_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_audits_casual_id ON audits(casual_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_audits_audited_by ON audits(audited_by)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_audits_location_id ON audits(location_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_audit_items_audit_id ON audit_items(audit_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_audit_items_ppe_item_id ON audit_items(ppe_item_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_ncr_items_employee_id ON ncr_items(employee_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_ncr_items_casual_id ON ncr_items(casual_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_ncr_items_audit_item_id ON ncr_items(audit_item_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_ncr_items_ppe_item_id ON ncr_items(ppe_item_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_ppe_requests_employee_id ON ppe_requests(employee_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_ppe_requests_casual_id ON ppe_requests(casual_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_ppe_requests_ncr_item_id ON ppe_requests(ncr_item_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_ppe_requests_ppe_item_id ON ppe_requests(ppe_item_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_employees_project ON employees(project)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_employees_client ON employees(client)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_employees_national_id ON employees(national_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_employees_status_san ON employees(employment_status, san)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_casuals_project ON casuals(project)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_casuals_client ON casuals(client)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_casuals_national_id ON casuals(national_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_casuals_employment_status ON casuals(employment_status)');
 
     // Ensure distribution columns exist on ppe_requests
     await client.query('ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS distribution_method VARCHAR(50)');
@@ -336,11 +362,18 @@ const sanitizeQuantity = (q) => {
 };
 
 const RESTRICTED_ROLES = ['ehs_officer', 'supervisor', 'scm_officer', 'project_director', 'ehs_manager'];
-const getProjectFilter = async (user) => {
-  if (!RESTRICTED_ROLES.includes(user.role)) return null; // unrestricted
-  const projects = user.project_access || [];
-  if (projects.length === 0) return []; // no access
-  // Check if user has all projects
+
+// getProjectFilter/getClientFilter run on nearly every authenticated request
+// (list endpoints + all the by-id scope checks). The "does this user's access
+// list cover everything" check only needs the set of distinct projects/clients,
+// which changes rarely — cache it for a short TTL instead of re-scanning
+// employees+casuals on every single call.
+const DISTINCT_VALUES_CACHE_TTL_MS = 60 * 1000;
+let _allProjectsCache = { data: null, expiresAt: 0 };
+let _allClientsCache = { data: null, expiresAt: 0 };
+
+const getAllProjects = async () => {
+  if (_allProjectsCache.data && Date.now() < _allProjectsCache.expiresAt) return _allProjectsCache.data;
   const { rows } = await pool.query(`
     SELECT ARRAY_AGG(DISTINCT project) as all_projects FROM (
       SELECT project FROM employees WHERE project IS NOT NULL
@@ -348,15 +381,13 @@ const getProjectFilter = async (user) => {
       SELECT project FROM casuals WHERE project IS NOT NULL
     ) combined
   `);
-  const allProjects = rows[0].all_projects || [];
-  if (allProjects.every(p => projects.includes(p))) return null; // has all projects = unrestricted
-  return projects;
+  const data = rows[0].all_projects || [];
+  _allProjectsCache = { data, expiresAt: Date.now() + DISTINCT_VALUES_CACHE_TTL_MS };
+  return data;
 };
-const getClientFilter = async (user) => {
-  if (!RESTRICTED_ROLES.includes(user.role)) return null; // unrestricted
-  const clients = user.client_access || [];
-  if (clients.length === 0) return []; // no access
-  // Check if user has all clients
+
+const getAllClients = async () => {
+  if (_allClientsCache.data && Date.now() < _allClientsCache.expiresAt) return _allClientsCache.data;
   const { rows } = await pool.query(`
     SELECT ARRAY_AGG(DISTINCT client) as all_clients FROM (
       SELECT client FROM employees WHERE client IS NOT NULL
@@ -364,7 +395,24 @@ const getClientFilter = async (user) => {
       SELECT client FROM casuals WHERE client IS NOT NULL
     ) combined
   `);
-  const allClients = rows[0].all_clients || [];
+  const data = rows[0].all_clients || [];
+  _allClientsCache = { data, expiresAt: Date.now() + DISTINCT_VALUES_CACHE_TTL_MS };
+  return data;
+};
+
+const getProjectFilter = async (user) => {
+  if (!RESTRICTED_ROLES.includes(user.role)) return null; // unrestricted
+  const projects = user.project_access || [];
+  if (projects.length === 0) return []; // no access
+  const allProjects = await getAllProjects();
+  if (allProjects.every(p => projects.includes(p))) return null; // has all projects = unrestricted
+  return projects;
+};
+const getClientFilter = async (user) => {
+  if (!RESTRICTED_ROLES.includes(user.role)) return null; // unrestricted
+  const clients = user.client_access || [];
+  if (clients.length === 0) return []; // no access
+  const allClients = await getAllClients();
   if (allClients.every(c => clients.includes(c))) return null; // has all clients = unrestricted
   return clients;
 };
@@ -793,17 +841,21 @@ app.post('/api/casuals/batch', auth, async (req, res) => {
     const inserted = [];
     const reactivated = [];
     const skipped = [];
+
+    // One lookup for the whole batch instead of one SELECT per casual.
+    const nationalIds = casuals.map(c => c.national_id).filter(Boolean);
+    const { rows: existingRows } = nationalIds.length
+      ? await client_db.query('SELECT * FROM casuals WHERE national_id = ANY($1::text[])', [nationalIds])
+      : { rows: [] };
+    const existingByNationalId = new Map(existingRows.map(r => [r.national_id, r]));
+
     for (const c of casuals) {
       if (!c.full_name || !c.national_id) {
         skipped.push({ full_name: c.full_name || '(no name)', reason: 'Full name and National ID are required' });
         continue;
       }
-      const { rows: existing } = await client_db.query(
-        'SELECT * FROM casuals WHERE national_id=$1',
-        [c.national_id]
-      );
-      if (existing.length > 0) {
-        const match = existing[0];
+      const match = existingByNationalId.get(c.national_id);
+      if (match) {
         if (match.employment_status === 'active') {
           skipped.push({ full_name: c.full_name, reason: `National ID ${c.national_id} already exists as an active casual (${match.full_name})` });
           continue;
@@ -813,6 +865,7 @@ app.post('/api/casuals/batch', auth, async (req, res) => {
              WHERE id=$6 RETURNING *`,
             [c.full_name, project, client, organization || 'Egypro', req.user.id, match.id]
           );
+          existingByNationalId.set(c.national_id, rows[0]); // catch duplicate national_ids within this same batch
           reactivated.push(rows[0]);
           continue;
         }
@@ -822,6 +875,7 @@ app.post('/api/casuals/batch', auth, async (req, res) => {
          VALUES ($1,$2,'Casual',$3,$4,$5,$6,$6) RETURNING *`,
         [c.full_name, c.national_id, project, client, organization || 'Egypro', req.user.id]
       );
+      existingByNationalId.set(c.national_id, rows[0]); // catch duplicate national_ids within this same batch
       inserted.push(rows[0]);
     }
     await client_db.query('COMMIT');
@@ -1061,12 +1115,17 @@ app.delete('/api/audits/:id', auth, async (req, res) => {
       'UPDATE audits SET is_deleted=TRUE, deleted_at=NOW(), deleted_by=$1 WHERE id=$2',
       [req.user.id, req.params.id]
     );
-    // Cancel all linked PPE requests and NCR items
-    const { rows: auditItems } = await client.query('SELECT id FROM audit_items WHERE audit_id=$1', [req.params.id]);
-    for (const ai of auditItems) {
-      await client.query('UPDATE ppe_requests SET status=$1 WHERE ncr_item_id IN (SELECT id FROM ncr_items WHERE audit_item_id=$2)', ['canceled', ai.id]);
-      await client.query('UPDATE ncr_items SET status=$1 WHERE audit_item_id=$2', ['canceled', ai.id]);
-    }
+    // Cancel all linked PPE requests and NCR items (2 queries total, not 2 per item)
+    await client.query(
+      `UPDATE ppe_requests SET status='canceled' WHERE ncr_item_id IN (
+         SELECT id FROM ncr_items WHERE audit_item_id IN (SELECT id FROM audit_items WHERE audit_id=$1)
+       )`,
+      [req.params.id]
+    );
+    await client.query(
+      `UPDATE ncr_items SET status='canceled' WHERE audit_item_id IN (SELECT id FROM audit_items WHERE audit_id=$1)`,
+      [req.params.id]
+    );
     await client.query('COMMIT');
     res.json({ message: 'Deleted' });
   } catch(e) { await client.query('ROLLBACK'); sendError(res, e); }

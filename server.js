@@ -1294,6 +1294,27 @@ app.put('/api/audits/:id', auth, async (req, res) => {
       'SELECT * FROM audit_items WHERE audit_id=$1', [id]
     );
 
+    // Items present in the DB but dropped from the submitted list are being
+    // removed outright — admin only, since it deletes the line (and any
+    // linked NCR/PPE request) everywhere, not just marks it resolved.
+    const submittedIds = new Set(items.map(i => i.ppe_item_id));
+    const removedItems = existingItems.filter(ai => !submittedIds.has(ai.ppe_item_id));
+    if (removedItems.length > 0 && !isAdmin) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'Only an admin can remove a line item from an audit.' });
+    }
+    for (const removedAI of removedItems) {
+      const { rows: ncrRows } = await client.query(
+        'SELECT n.id, pr.id as pr_id FROM ncr_items n LEFT JOIN ppe_requests pr ON pr.ncr_item_id=n.id WHERE n.audit_item_id=$1',
+        [removedAI.id]
+      );
+      for (const ncr of ncrRows) {
+        if (ncr.pr_id) await client.query('DELETE FROM ppe_requests WHERE id=$1', [ncr.pr_id]);
+        await client.query('DELETE FROM ncr_items WHERE id=$1', [ncr.id]);
+      }
+      await client.query('DELETE FROM audit_items WHERE id=$1', [removedAI.id]);
+    }
+
     for (const item of items) {
       const existingAI = existingItems.find(ai => ai.ppe_item_id === item.ppe_item_id);
       const oldCondition = existingAI ? existingAI.condition : null;

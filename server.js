@@ -353,7 +353,7 @@ const validatePassword = (pw) => {
   return null;
 };
 
-const VALID_CONDITIONS = ['good', 'not_good', 'missing'];
+const VALID_CONDITIONS = ['good', 'not_good', 'not_present'];
 // Returns a whole number 1-9999, or null if the input isn't a valid quantity.
 const sanitizeQuantity = (q) => {
   if (q === undefined || q === null) return null;

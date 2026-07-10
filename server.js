@@ -1708,6 +1708,34 @@ app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
   finally { client.release(); }
 });
 
+app.put('/api/ppe-requests/:id/size', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Not authorized' });
+  const { size_value } = req.body;
+  if (!size_value) return res.status(400).json({ error: 'size_value required' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: [r] } = await client.query(
+      'UPDATE ppe_requests SET size_value=$1, updated_at=NOW() WHERE id=$2 RETURNING ncr_item_id',
+      [size_value, req.params.id]
+    );
+    if (!r) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'PPE request not found' });
+    }
+    if (r.ncr_item_id) {
+      await client.query('UPDATE ncr_items SET size_value=$1 WHERE id=$2', [size_value, r.ncr_item_id]);
+      await client.query(
+        'UPDATE audit_items SET size_value=$1 WHERE id=(SELECT audit_item_id FROM ncr_items WHERE id=$2)',
+        [size_value, r.ncr_item_id]
+      );
+    }
+    await client.query('COMMIT');
+    res.json({ success: true, size_value });
+  } catch(e) { await client.query('ROLLBACK'); sendError(res, e); }
+  finally { client.release(); }
+});
+
 // Fix missing dates on existing PPE requests (admin only)
 app.post('/api/admin/fix-ppe-dates', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });

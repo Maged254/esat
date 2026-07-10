@@ -1141,7 +1141,7 @@ app.get('/api/audits/leaderboard', auth, async (req, res) => {
         COUNT(a.id) as total_audits,
         COUNT(a.id) FILTER (WHERE date_trunc('month', a.audit_date) = date_trunc('month', NOW())) as this_month
       FROM users u
-      LEFT JOIN audits a ON a.audited_by = u.id AND a.is_deleted IS NOT TRUE
+      LEFT JOIN audits a ON a.audited_by = u.id AND a.is_deleted IS NOT TRUE AND a.employee_present = TRUE
       WHERE u.is_active = true
         AND u.email NOT IN ('admin@egypro.com', 'sync@egypro.com', 'eats-sync@egypro.app')
         AND u.role != 'scm_officer'

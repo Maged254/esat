@@ -1139,7 +1139,8 @@ app.get('/api/audits/leaderboard', auth, async (req, res) => {
     const { rows } = await pool.query(`
       SELECT u.id, u.full_name, u.role, u.profile_picture,
         COUNT(a.id) as total_audits,
-        COUNT(a.id) FILTER (WHERE date_trunc('month', a.audit_date) = date_trunc('month', NOW())) as this_month
+        COUNT(a.id) FILTER (WHERE date_trunc('month', a.audit_date) = date_trunc('month', NOW())) as this_month,
+        COUNT(a.id) FILTER (WHERE date_trunc('month', a.audit_date) = date_trunc('month', NOW()) - interval '1 month') as last_month
       FROM users u
       LEFT JOIN audits a ON a.audited_by = u.id AND a.is_deleted IS NOT TRUE AND a.employee_present = TRUE
       WHERE u.is_active = true

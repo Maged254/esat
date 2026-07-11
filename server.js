@@ -2578,48 +2578,84 @@ app.get('/api/graphs', auth, async (req, res) => {
   try {
     const graphProjects = await getProjectFilter(req.user);
     const graphClients = await getClientFilter(req.user);
-    const delayConditions = [];
-    const delayParams = [];
+    const requestedProject = String(req.query.project || '').trim();
+    const requestedClient = String(req.query.client || '').trim();
+
+    if (requestedProject && graphProjects !== null && !graphProjects.includes(requestedProject)) {
+      return res.status(403).json({ error: 'Project is outside your permitted access' });
+    }
+    if (requestedClient && graphClients !== null && !graphClients.includes(requestedClient)) {
+      return res.status(403).json({ error: 'Client is outside your permitted access' });
+    }
+
+    const scopeParams = [];
+    const scopeConditions = [];
+    if (requestedProject) {
+      scopeParams.push(requestedProject);
+      scopeConditions.push(`COALESCE(e.project, c.project) = $${scopeParams.length}`);
+    } else if (graphProjects !== null) {
+      scopeParams.push(graphProjects);
+      scopeConditions.push(`COALESCE(e.project, c.project) = ANY($${scopeParams.length}::text[])`);
+    }
+    if (requestedClient) {
+      scopeParams.push(requestedClient);
+      scopeConditions.push(`COALESCE(e.client, c.client) = $${scopeParams.length}`);
+    } else if (graphClients !== null) {
+      scopeParams.push(graphClients);
+      scopeConditions.push(`COALESCE(e.client, c.client) = ANY($${scopeParams.length}::text[])`);
+    }
+    const scopeWhere = scopeConditions.length ? `AND ${scopeConditions.join(' AND ')}` : '';
+
+    const accessParams = [];
+    const accessConditions = [];
     if (graphProjects !== null) {
-      delayParams.push(graphProjects);
-      delayConditions.push(`COALESCE(e.project, c.project) = ANY($${delayParams.length}::text[])`);
+      accessParams.push(graphProjects);
+      accessConditions.push(`person.project = ANY($${accessParams.length}::text[])`);
     }
     if (graphClients !== null) {
-      delayParams.push(graphClients);
-      delayConditions.push(`COALESCE(e.client, c.client) = ANY($${delayParams.length}::text[])`);
+      accessParams.push(graphClients);
+      accessConditions.push(`person.client = ANY($${accessParams.length}::text[])`);
     }
-    const delayWhere = delayConditions.length ? `AND ${delayConditions.join(' AND ')}` : '';
+    const accessWhere = accessConditions.length ? `WHERE ${accessConditions.join(' AND ')}` : '';
 
-    const [ppeByEmployee, auditsByMonth, ncrByMonth, ppeStageDelays] = await Promise.all([
+    const [ppeByEmployee, auditsByMonth, ncrByMonth, ppeStageDelays, filterOptions] = await Promise.all([
       pool.query(`
-        SELECT e.full_name as employee_name, COUNT(r.id) as ppe_count
-        FROM employees e
-        JOIN ppe_requests r ON r.employee_id = e.id
+        SELECT COALESCE(e.full_name, c.full_name) as employee_name, COUNT(r.id) as ppe_count
+        FROM ppe_requests r
+        LEFT JOIN employees e ON e.id = r.employee_id
+        LEFT JOIN casuals c ON c.id = r.casual_id
         WHERE r.status NOT IN ('distributed','resolved','canceled')
-        AND e.employment_status = 'active'
-        GROUP BY e.id, e.full_name
+        AND COALESCE(e.employment_status, c.employment_status) = 'active'
+        ${scopeWhere}
+        GROUP BY COALESCE(e.id, c.id), COALESCE(e.full_name, c.full_name)
         ORDER BY ppe_count DESC
         LIMIT 20
-      `),
+      `, scopeParams),
       pool.query(`
-        SELECT TO_CHAR(DATE_TRUNC('month', audit_date), 'Mon YYYY') as month,
-               DATE_TRUNC('month', audit_date) as month_date,
+        SELECT TO_CHAR(DATE_TRUNC('month', a.audit_date), 'Mon YYYY') as month,
+               DATE_TRUNC('month', a.audit_date) as month_date,
                COUNT(*) as count
-        FROM audits
-        WHERE audit_date >= NOW() - INTERVAL '6 months'
+        FROM audits a
+        LEFT JOIN employees e ON e.id = a.employee_id
+        LEFT JOIN casuals c ON c.id = a.casual_id
+        WHERE a.audit_date >= NOW() - INTERVAL '6 months'
+        ${scopeWhere}
         GROUP BY month_date, month
         ORDER BY month_date ASC
-      `),
+      `, scopeParams),
       pool.query(`
-        SELECT TO_CHAR(DATE_TRUNC('month', created_at), 'Mon YYYY') as month,
-               DATE_TRUNC('month', created_at) as month_date,
+        SELECT TO_CHAR(DATE_TRUNC('month', n.created_at), 'Mon YYYY') as month,
+               DATE_TRUNC('month', n.created_at) as month_date,
                COUNT(*) as created,
-               COUNT(*) FILTER (WHERE status IN ('resolved','distributed')) as resolved
-        FROM ncr_items
-        WHERE created_at >= NOW() - INTERVAL '6 months'
+               COUNT(*) FILTER (WHERE n.status IN ('resolved','distributed')) as resolved
+        FROM ncr_items n
+        LEFT JOIN employees e ON e.id = n.employee_id
+        LEFT JOIN casuals c ON c.id = n.casual_id
+        WHERE n.created_at >= NOW() - INTERVAL '6 months'
+        ${scopeWhere}
         GROUP BY month_date, month
         ORDER BY month_date ASC
-      `),
+      `, scopeParams),
       pool.query(`
         WITH months AS (
           SELECT generate_series(
@@ -2633,7 +2669,7 @@ app.get('/api/graphs', auth, async (req, res) => {
           FROM ppe_requests r
           LEFT JOIN employees e ON e.id = r.employee_id
           LEFT JOIN casuals c ON c.id = r.casual_id
-          WHERE 1=1 ${delayWhere}
+          WHERE 1=1 ${scopeWhere}
         ),
         stage_events AS (
           SELECT 'ehs' AS stage, date_purchase_requested AS completed_at,
@@ -2676,7 +2712,20 @@ app.get('/api/graphs', auth, async (req, res) => {
         LEFT JOIN stage_events s ON DATE_TRUNC('month', s.completed_at) = m.month_date
         GROUP BY m.month_date
         ORDER BY m.month_date ASC
-      `, delayParams)
+      `, scopeParams),
+      pool.query(`
+        WITH person AS (
+          SELECT project, client FROM employees
+          UNION ALL
+          SELECT project, client FROM casuals
+        )
+        SELECT ARRAY_AGG(DISTINCT person.project ORDER BY person.project)
+                 FILTER (WHERE person.project IS NOT NULL AND person.project <> '') AS projects,
+               ARRAY_AGG(DISTINCT person.client ORDER BY person.client)
+                 FILTER (WHERE person.client IS NOT NULL AND person.client <> '') AS clients
+        FROM person
+        ${accessWhere}
+      `, accessParams)
     ]);
 
     const counts = ppeByEmployee.rows.map(r => parseInt(r.ppe_count));
@@ -2685,6 +2734,11 @@ app.get('/api/graphs', auth, async (req, res) => {
     res.json({
       ppe_by_employee: ppeByEmployee.rows.map(r => ({ name: r.employee_name, count: parseInt(r.ppe_count) })),
       ppe_average: avg,
+      filter_options: {
+        projects: filterOptions.rows[0]?.projects || [],
+        clients: filterOptions.rows[0]?.clients || [],
+      },
+      active_filters: { project: requestedProject, client: requestedClient },
       audits_by_month: auditsByMonth.rows.map(r => ({ month: r.month, count: parseInt(r.count) })),
       ncr_by_month: ncrByMonth.rows.map(r => ({ month: r.month, created: parseInt(r.created), resolved: parseInt(r.resolved) })),
       ppe_stage_delays_by_month: ppeStageDelays.rows.map(r => ({

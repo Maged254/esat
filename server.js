@@ -2576,7 +2576,21 @@ app.listen(PORT, () => { console.log(`ESAT running on port ${PORT}`); scheduleDa
 
 app.get('/api/graphs', auth, async (req, res) => {
   try {
-    const [ppeByEmployee, auditsByMonth, ncrByMonth] = await Promise.all([
+    const graphProjects = await getProjectFilter(req.user);
+    const graphClients = await getClientFilter(req.user);
+    const delayConditions = [];
+    const delayParams = [];
+    if (graphProjects !== null) {
+      delayParams.push(graphProjects);
+      delayConditions.push(`COALESCE(e.project, c.project) = ANY($${delayParams.length}::text[])`);
+    }
+    if (graphClients !== null) {
+      delayParams.push(graphClients);
+      delayConditions.push(`COALESCE(e.client, c.client) = ANY($${delayParams.length}::text[])`);
+    }
+    const delayWhere = delayConditions.length ? `AND ${delayConditions.join(' AND ')}` : '';
+
+    const [ppeByEmployee, auditsByMonth, ncrByMonth, ppeStageDelays] = await Promise.all([
       pool.query(`
         SELECT e.full_name as employee_name, COUNT(r.id) as ppe_count
         FROM employees e
@@ -2605,7 +2619,64 @@ app.get('/api/graphs', auth, async (req, res) => {
         WHERE created_at >= NOW() - INTERVAL '6 months'
         GROUP BY month_date, month
         ORDER BY month_date ASC
-      `)
+      `),
+      pool.query(`
+        WITH months AS (
+          SELECT generate_series(
+            DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '5 months',
+            DATE_TRUNC('month', CURRENT_DATE),
+            INTERVAL '1 month'
+          ) AS month_date
+        ),
+        scoped_requests AS (
+          SELECT r.*
+          FROM ppe_requests r
+          LEFT JOIN employees e ON e.id = r.employee_id
+          LEFT JOIN casuals c ON c.id = r.casual_id
+          WHERE 1=1 ${delayWhere}
+        ),
+        stage_events AS (
+          SELECT 'ehs' AS stage, date_purchase_requested AS completed_at,
+                 EXTRACT(EPOCH FROM (date_purchase_requested - date_flagged)) / 86400.0 AS delay_days
+          FROM scoped_requests
+          WHERE date_flagged IS NOT NULL AND date_purchase_requested IS NOT NULL
+          UNION ALL
+          SELECT 'pm', pda_approved_date,
+                 EXTRACT(EPOCH FROM (pda_approved_date - date_purchase_requested)) / 86400.0
+          FROM scoped_requests
+          WHERE date_purchase_requested IS NOT NULL AND pda_approved_date IS NOT NULL
+          UNION ALL
+          SELECT 'scm', date_ordered,
+                 EXTRACT(EPOCH FROM (date_ordered - COALESCE(pda_approved_date, date_purchase_requested))) / 86400.0
+          FROM scoped_requests
+          WHERE COALESCE(pda_approved_date, date_purchase_requested) IS NOT NULL AND date_ordered IS NOT NULL
+          UNION ALL
+          SELECT 'supplier', date_available,
+                 EXTRACT(EPOCH FROM (date_available - date_ordered)) / 86400.0
+          FROM scoped_requests
+          WHERE date_ordered IS NOT NULL AND date_available IS NOT NULL
+          UNION ALL
+          SELECT 'project', date_distributed,
+                 EXTRACT(EPOCH FROM (date_distributed - date_available)) / 86400.0
+          FROM scoped_requests
+          WHERE date_available IS NOT NULL AND date_distributed IS NOT NULL
+        )
+        SELECT TO_CHAR(m.month_date, 'Mon YYYY') AS month,
+               ROUND(AVG(delay_days) FILTER (WHERE stage = 'ehs')::numeric, 1) AS ehs,
+               COUNT(*) FILTER (WHERE stage = 'ehs')::int AS ehs_count,
+               ROUND(AVG(delay_days) FILTER (WHERE stage = 'pm')::numeric, 1) AS pm,
+               COUNT(*) FILTER (WHERE stage = 'pm')::int AS pm_count,
+               ROUND(AVG(delay_days) FILTER (WHERE stage = 'scm')::numeric, 1) AS scm,
+               COUNT(*) FILTER (WHERE stage = 'scm')::int AS scm_count,
+               ROUND(AVG(delay_days) FILTER (WHERE stage = 'supplier')::numeric, 1) AS supplier,
+               COUNT(*) FILTER (WHERE stage = 'supplier')::int AS supplier_count,
+               ROUND(AVG(delay_days) FILTER (WHERE stage = 'project')::numeric, 1) AS project,
+               COUNT(*) FILTER (WHERE stage = 'project')::int AS project_count
+        FROM months m
+        LEFT JOIN stage_events s ON DATE_TRUNC('month', s.completed_at) = m.month_date
+        GROUP BY m.month_date
+        ORDER BY m.month_date ASC
+      `, delayParams)
     ]);
 
     const counts = ppeByEmployee.rows.map(r => parseInt(r.ppe_count));
@@ -2615,7 +2686,20 @@ app.get('/api/graphs', auth, async (req, res) => {
       ppe_by_employee: ppeByEmployee.rows.map(r => ({ name: r.employee_name, count: parseInt(r.ppe_count) })),
       ppe_average: avg,
       audits_by_month: auditsByMonth.rows.map(r => ({ month: r.month, count: parseInt(r.count) })),
-      ncr_by_month: ncrByMonth.rows.map(r => ({ month: r.month, created: parseInt(r.created), resolved: parseInt(r.resolved) }))
+      ncr_by_month: ncrByMonth.rows.map(r => ({ month: r.month, created: parseInt(r.created), resolved: parseInt(r.resolved) })),
+      ppe_stage_delays_by_month: ppeStageDelays.rows.map(r => ({
+        month: r.month,
+        ehs: r.ehs === null ? null : parseFloat(r.ehs),
+        ehs_count: parseInt(r.ehs_count),
+        pm: r.pm === null ? null : parseFloat(r.pm),
+        pm_count: parseInt(r.pm_count),
+        scm: r.scm === null ? null : parseFloat(r.scm),
+        scm_count: parseInt(r.scm_count),
+        supplier: r.supplier === null ? null : parseFloat(r.supplier),
+        supplier_count: parseInt(r.supplier_count),
+        project: r.project === null ? null : parseFloat(r.project),
+        project_count: parseInt(r.project_count),
+      }))
     });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });

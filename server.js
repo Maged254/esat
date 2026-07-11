@@ -2692,14 +2692,19 @@ app.get('/api/graphs', auth, async (req, res) => {
         )
         SELECT TO_CHAR(DATE_TRUNC('month', completed_at), 'Mon YYYY') AS month,
                ROUND(AVG(delay_days) FILTER (WHERE stage = 'ehs')::numeric, 1) AS ehs,
+               ROUND(MAX(delay_days) FILTER (WHERE stage = 'ehs')::numeric, 1) AS ehs_max,
                COUNT(*) FILTER (WHERE stage = 'ehs')::int AS ehs_count,
                ROUND(AVG(delay_days) FILTER (WHERE stage = 'pm')::numeric, 1) AS pm,
+               ROUND(MAX(delay_days) FILTER (WHERE stage = 'pm')::numeric, 1) AS pm_max,
                COUNT(*) FILTER (WHERE stage = 'pm')::int AS pm_count,
                ROUND(AVG(delay_days) FILTER (WHERE stage = 'scm')::numeric, 1) AS scm,
+               ROUND(MAX(delay_days) FILTER (WHERE stage = 'scm')::numeric, 1) AS scm_max,
                COUNT(*) FILTER (WHERE stage = 'scm')::int AS scm_count,
                ROUND(AVG(delay_days) FILTER (WHERE stage = 'supplier')::numeric, 1) AS supplier,
+               ROUND(MAX(delay_days) FILTER (WHERE stage = 'supplier')::numeric, 1) AS supplier_max,
                COUNT(*) FILTER (WHERE stage = 'supplier')::int AS supplier_count,
                ROUND(AVG(delay_days) FILTER (WHERE stage = 'project')::numeric, 1) AS project,
+               ROUND(MAX(delay_days) FILTER (WHERE stage = 'project')::numeric, 1) AS project_max,
                COUNT(*) FILTER (WHERE stage = 'project')::int AS project_count
         FROM stage_events
         WHERE completed_at >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '5 months'
@@ -2738,14 +2743,19 @@ app.get('/api/graphs', auth, async (req, res) => {
       ppe_stage_delays_by_month: ppeStageDelays.rows.map(r => ({
         month: r.month,
         ehs: r.ehs === null ? null : parseFloat(r.ehs),
+        ehs_max: r.ehs_max === null ? null : parseFloat(r.ehs_max),
         ehs_count: parseInt(r.ehs_count),
         pm: r.pm === null ? null : parseFloat(r.pm),
+        pm_max: r.pm_max === null ? null : parseFloat(r.pm_max),
         pm_count: parseInt(r.pm_count),
         scm: r.scm === null ? null : parseFloat(r.scm),
+        scm_max: r.scm_max === null ? null : parseFloat(r.scm_max),
         scm_count: parseInt(r.scm_count),
         supplier: r.supplier === null ? null : parseFloat(r.supplier),
+        supplier_max: r.supplier_max === null ? null : parseFloat(r.supplier_max),
         supplier_count: parseInt(r.supplier_count),
         project: r.project === null ? null : parseFloat(r.project),
+        project_max: r.project_max === null ? null : parseFloat(r.project_max),
         project_count: parseInt(r.project_count),
       }))
     });

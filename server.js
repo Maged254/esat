@@ -1147,6 +1147,7 @@ app.get('/api/audits/leaderboard', auth, async (req, res) => {
         AND u.email NOT IN ('admin@egypro.com', 'sync@egypro.com', 'eats-sync@egypro.app')
         AND u.role != 'scm_officer'
       GROUP BY u.id
+      HAVING COUNT(a.id) > 0
       ORDER BY total_audits DESC
     `);
     res.json(rows);

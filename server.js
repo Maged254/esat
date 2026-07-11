@@ -2657,14 +2657,7 @@ app.get('/api/graphs', auth, async (req, res) => {
         ORDER BY month_date ASC
       `, scopeParams),
       pool.query(`
-        WITH months AS (
-          SELECT generate_series(
-            DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '5 months',
-            DATE_TRUNC('month', CURRENT_DATE),
-            INTERVAL '1 month'
-          ) AS month_date
-        ),
-        scoped_requests AS (
+        WITH scoped_requests AS (
           SELECT r.*
           FROM ppe_requests r
           LEFT JOIN employees e ON e.id = r.employee_id
@@ -2697,7 +2690,7 @@ app.get('/api/graphs', auth, async (req, res) => {
           FROM scoped_requests
           WHERE date_available IS NOT NULL AND date_distributed IS NOT NULL
         )
-        SELECT TO_CHAR(m.month_date, 'Mon YYYY') AS month,
+        SELECT TO_CHAR(DATE_TRUNC('month', completed_at), 'Mon YYYY') AS month,
                ROUND(AVG(delay_days) FILTER (WHERE stage = 'ehs')::numeric, 1) AS ehs,
                COUNT(*) FILTER (WHERE stage = 'ehs')::int AS ehs_count,
                ROUND(AVG(delay_days) FILTER (WHERE stage = 'pm')::numeric, 1) AS pm,
@@ -2708,10 +2701,11 @@ app.get('/api/graphs', auth, async (req, res) => {
                COUNT(*) FILTER (WHERE stage = 'supplier')::int AS supplier_count,
                ROUND(AVG(delay_days) FILTER (WHERE stage = 'project')::numeric, 1) AS project,
                COUNT(*) FILTER (WHERE stage = 'project')::int AS project_count
-        FROM months m
-        LEFT JOIN stage_events s ON DATE_TRUNC('month', s.completed_at) = m.month_date
-        GROUP BY m.month_date
-        ORDER BY m.month_date ASC
+        FROM stage_events
+        WHERE completed_at >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '5 months'
+          AND completed_at < DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
+        GROUP BY DATE_TRUNC('month', completed_at)
+        ORDER BY DATE_TRUNC('month', completed_at) ASC
       `, scopeParams),
       pool.query(`
         WITH person AS (

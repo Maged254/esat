@@ -2658,54 +2658,100 @@ app.get('/api/graphs', auth, async (req, res) => {
       `, scopeParams),
       pool.query(`
         WITH scoped_requests AS (
-          SELECT r.*
+          SELECT r.*, p.needs_pda
           FROM ppe_requests r
           LEFT JOIN employees e ON e.id = r.employee_id
           LEFT JOIN casuals c ON c.id = r.casual_id
+          LEFT JOIN ppe_items p ON p.id = r.ppe_item_id
           WHERE 1=1 ${scopeWhere}
         ),
         stage_events AS (
           SELECT 'ehs' AS stage, date_purchase_requested AS completed_at,
-                 EXTRACT(EPOCH FROM (date_purchase_requested - date_flagged)) / 86400.0 AS delay_days
+                 EXTRACT(EPOCH FROM (date_purchase_requested - date_flagged)) / 86400.0 AS delay_days,
+                 FALSE AS is_open
           FROM scoped_requests
           WHERE date_flagged IS NOT NULL AND date_purchase_requested IS NOT NULL
           UNION ALL
           SELECT 'pm', pda_approved_date,
-                 EXTRACT(EPOCH FROM (pda_approved_date - date_purchase_requested)) / 86400.0
+                 EXTRACT(EPOCH FROM (pda_approved_date - date_purchase_requested)) / 86400.0,
+                 FALSE
           FROM scoped_requests
           WHERE date_purchase_requested IS NOT NULL AND pda_approved_date IS NOT NULL
           UNION ALL
           SELECT 'scm', date_ordered,
-                 EXTRACT(EPOCH FROM (date_ordered - COALESCE(pda_approved_date, date_purchase_requested))) / 86400.0
+                 EXTRACT(EPOCH FROM (date_ordered - COALESCE(pda_approved_date, date_purchase_requested))) / 86400.0,
+                 FALSE
           FROM scoped_requests
           WHERE COALESCE(pda_approved_date, date_purchase_requested) IS NOT NULL AND date_ordered IS NOT NULL
           UNION ALL
           SELECT 'supplier', date_available,
-                 EXTRACT(EPOCH FROM (date_available - date_ordered)) / 86400.0
+                 EXTRACT(EPOCH FROM (date_available - date_ordered)) / 86400.0,
+                 FALSE
           FROM scoped_requests
           WHERE date_ordered IS NOT NULL AND date_available IS NOT NULL
           UNION ALL
           SELECT 'project', date_distributed,
-                 EXTRACT(EPOCH FROM (date_distributed - date_available)) / 86400.0
+                 EXTRACT(EPOCH FROM (date_distributed - date_available)) / 86400.0,
+                 FALSE
           FROM scoped_requests
           WHERE date_available IS NOT NULL AND date_distributed IS NOT NULL
+          UNION ALL
+          SELECT 'ehs', CURRENT_TIMESTAMP,
+                 (CURRENT_DATE - date_flagged::date)::numeric,
+                 TRUE
+          FROM scoped_requests
+          WHERE status = 'pending' AND date_flagged IS NOT NULL
+          UNION ALL
+          SELECT 'pm', CURRENT_TIMESTAMP,
+                 (CURRENT_DATE - date_purchase_requested::date)::numeric,
+                 TRUE
+          FROM scoped_requests
+          WHERE status = 'ehs_purchase_requested'
+            AND needs_pda IS TRUE
+            AND pda_approved_date IS NULL
+            AND date_purchase_requested IS NOT NULL
+          UNION ALL
+          SELECT 'scm', CURRENT_TIMESTAMP,
+                 (CURRENT_DATE - COALESCE(pda_approved_date, date_purchase_requested)::date)::numeric,
+                 TRUE
+          FROM scoped_requests
+          WHERE status IN ('ehs_purchase_requested', 'pda_approved')
+            AND (needs_pda IS NOT TRUE OR pda_approved_date IS NOT NULL)
+            AND COALESCE(pda_approved_date, date_purchase_requested) IS NOT NULL
+          UNION ALL
+          SELECT 'supplier', CURRENT_TIMESTAMP,
+                 (CURRENT_DATE - date_ordered::date)::numeric,
+                 TRUE
+          FROM scoped_requests
+          WHERE status = 'scm_ordered' AND date_ordered IS NOT NULL
+          UNION ALL
+          SELECT 'project', CURRENT_TIMESTAMP,
+                 (CURRENT_DATE - date_available::date)::numeric,
+                 TRUE
+          FROM scoped_requests
+          WHERE status = 'warehouse_available' AND date_available IS NOT NULL
         )
         SELECT TO_CHAR(DATE_TRUNC('month', completed_at), 'Mon YYYY') AS month,
                ROUND(AVG(delay_days) FILTER (WHERE stage = 'ehs')::numeric, 1) AS ehs,
                ROUND(MAX(delay_days) FILTER (WHERE stage = 'ehs')::numeric, 1) AS ehs_max,
                COUNT(*) FILTER (WHERE stage = 'ehs')::int AS ehs_count,
+               COUNT(*) FILTER (WHERE stage = 'ehs' AND is_open)::int AS ehs_open_count,
                ROUND(AVG(delay_days) FILTER (WHERE stage = 'pm')::numeric, 1) AS pm,
                ROUND(MAX(delay_days) FILTER (WHERE stage = 'pm')::numeric, 1) AS pm_max,
                COUNT(*) FILTER (WHERE stage = 'pm')::int AS pm_count,
+               COUNT(*) FILTER (WHERE stage = 'pm' AND is_open)::int AS pm_open_count,
                ROUND(AVG(delay_days) FILTER (WHERE stage = 'scm')::numeric, 1) AS scm,
                ROUND(MAX(delay_days) FILTER (WHERE stage = 'scm')::numeric, 1) AS scm_max,
                COUNT(*) FILTER (WHERE stage = 'scm')::int AS scm_count,
+               COUNT(*) FILTER (WHERE stage = 'scm' AND is_open)::int AS scm_open_count,
                ROUND(AVG(delay_days) FILTER (WHERE stage = 'supplier')::numeric, 1) AS supplier,
                ROUND(MAX(delay_days) FILTER (WHERE stage = 'supplier')::numeric, 1) AS supplier_max,
                COUNT(*) FILTER (WHERE stage = 'supplier')::int AS supplier_count,
+               COUNT(*) FILTER (WHERE stage = 'supplier' AND is_open)::int AS supplier_open_count,
                ROUND(AVG(delay_days) FILTER (WHERE stage = 'project')::numeric, 1) AS project,
                ROUND(MAX(delay_days) FILTER (WHERE stage = 'project')::numeric, 1) AS project_max,
-               COUNT(*) FILTER (WHERE stage = 'project')::int AS project_count
+               COUNT(*) FILTER (WHERE stage = 'project')::int AS project_count,
+               COUNT(*) FILTER (WHERE stage = 'project' AND is_open)::int AS project_open_count
         FROM stage_events
         WHERE completed_at >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '5 months'
           AND completed_at < DATE_TRUNC('month', CURRENT_DATE) + INTERVAL '1 month'
@@ -2745,18 +2791,23 @@ app.get('/api/graphs', auth, async (req, res) => {
         ehs: r.ehs === null ? null : parseFloat(r.ehs),
         ehs_max: r.ehs_max === null ? null : parseFloat(r.ehs_max),
         ehs_count: parseInt(r.ehs_count),
+        ehs_open_count: parseInt(r.ehs_open_count),
         pm: r.pm === null ? null : parseFloat(r.pm),
         pm_max: r.pm_max === null ? null : parseFloat(r.pm_max),
         pm_count: parseInt(r.pm_count),
+        pm_open_count: parseInt(r.pm_open_count),
         scm: r.scm === null ? null : parseFloat(r.scm),
         scm_max: r.scm_max === null ? null : parseFloat(r.scm_max),
         scm_count: parseInt(r.scm_count),
+        scm_open_count: parseInt(r.scm_open_count),
         supplier: r.supplier === null ? null : parseFloat(r.supplier),
         supplier_max: r.supplier_max === null ? null : parseFloat(r.supplier_max),
         supplier_count: parseInt(r.supplier_count),
+        supplier_open_count: parseInt(r.supplier_open_count),
         project: r.project === null ? null : parseFloat(r.project),
         project_max: r.project_max === null ? null : parseFloat(r.project_max),
         project_count: parseInt(r.project_count),
+        project_open_count: parseInt(r.project_open_count),
       }))
     });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }

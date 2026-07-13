@@ -1639,6 +1639,7 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
         COALESCE(e.client, c.client) as client,
         (r.casual_id IS NOT NULL) as is_casual,
         p.name as ppe_name, p.category, p.needs_pda,
+        n.comment,
         u0.full_name as flagged_by_name,
         u1.full_name as purchase_requested_by_name,
         u2.full_name as ordered_by_name,
@@ -1646,12 +1647,14 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
         u4.full_name as distributed_by_name,
         u5.full_name as pda_approved_by_name,
         l.name as location_name,
-        COALESCE((SELECT ai3.quantity FROM audit_items ai3 JOIN ncr_items n3 ON n3.audit_item_id=ai3.id WHERE n3.id=r.ncr_item_id LIMIT 1), 1) as quantity
+        COALESCE(ai.quantity, 1) as quantity
       FROM ppe_requests r
       LEFT JOIN employees e ON e.id=r.employee_id
       LEFT JOIN casuals c ON c.id=r.casual_id
       JOIN ppe_items p ON p.id=r.ppe_item_id
-      LEFT JOIN audits a ON a.id=(SELECT ai2.audit_id FROM audit_items ai2 JOIN ncr_items n2 ON n2.audit_item_id=ai2.id WHERE n2.id=r.ncr_item_id LIMIT 1)
+      LEFT JOIN ncr_items n ON n.id=r.ncr_item_id
+      LEFT JOIN audit_items ai ON ai.id=n.audit_item_id
+      LEFT JOIN audits a ON a.id=ai.audit_id
       LEFT JOIN locations l ON l.id=a.location_id
       LEFT JOIN users u0 ON u0.id=r.flagged_by
       LEFT JOIN users u1 ON u1.id=r.purchase_requested_by

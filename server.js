@@ -354,12 +354,33 @@ const validatePassword = (pw) => {
 };
 
 const VALID_CONDITIONS = ['good', 'not_good', 'not_present'];
+const FIRE_EXTINGUISHER_ITEM = 'Fire Extinguisher - 6KG - Dry Powder With Inspection Sticker';
+const FIRE_EXTINGUISHER_COMMENT_OPTIONS = ['New Issuance', 'Replacement'];
 // Returns a whole number 1-9999, or null if the input isn't a valid quantity.
 const sanitizeQuantity = (q) => {
   if (q === undefined || q === null) return null;
   const n = Number(q);
   if (!Number.isInteger(n) || n < 1 || n > 9999) return null;
   return n;
+};
+
+const validateRequiredPpeComments = async (items) => {
+  const itemIds = items.map(item => item.ppe_item_id).filter(Boolean);
+  if (itemIds.length === 0) return null;
+  const { rows } = await pool.query(
+    'SELECT id FROM ppe_items WHERE name=$1 AND id=ANY($2::uuid[])',
+    [FIRE_EXTINGUISHER_ITEM, itemIds]
+  );
+  if (rows.length === 0) return null;
+  const fireExtinguisherIds = new Set(rows.map(row => row.id));
+  const invalidItem = items.find(item =>
+    fireExtinguisherIds.has(item.ppe_item_id)
+    && item.condition === 'not_good'
+    && !FIRE_EXTINGUISHER_COMMENT_OPTIONS.includes(String(item.comment || '').trim())
+  );
+  return invalidItem
+    ? `Select New Issuance or Replacement for ${FIRE_EXTINGUISHER_ITEM}`
+    : null;
 };
 
 const RESTRICTED_ROLES = ['ehs_officer', 'supervisor', 'scm_officer', 'project_director', 'ehs_manager'];
@@ -1211,6 +1232,8 @@ app.post('/api/audits', auth, async (req, res) => {
       return res.status(400).json({ error: 'quantity must be a whole number between 1 and 9999' });
     }
   }
+  const requiredCommentError = await validateRequiredPpeComments(items);
+  if (requiredCommentError) return res.status(400).json({ error: requiredCommentError });
   if (audit_date && isNaN(Date.parse(audit_date))) return res.status(400).json({ error: 'Invalid audit_date' });
   const client = await pool.connect();
   try {
@@ -1277,6 +1300,8 @@ app.put('/api/audits/:id', auth, async (req, res) => {
       return res.status(400).json({ error: 'quantity must be a whole number between 1 and 9999' });
     }
   }
+  const requiredCommentError = await validateRequiredPpeComments(items);
+  if (requiredCommentError) return res.status(400).json({ error: requiredCommentError });
 
   const client = await pool.connect();
   try {

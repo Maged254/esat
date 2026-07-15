@@ -516,6 +516,11 @@ app.get('/api/auth/me', auth, async (req, res) => {
   res.json(rows[0]);
 });
 
+// Cheap session-validity check (no DB hit) — polled periodically so a backend
+// redeploy logs out idle-but-open tabs promptly instead of waiting for the
+// user's next real API call.
+app.get('/api/auth/ping', auth, (req, res) => res.sendStatus(204));
+
 // Dashboard
 app.get('/api/dashboard', auth, async (req, res) => {
   try {

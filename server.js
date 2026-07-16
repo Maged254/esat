@@ -4,9 +4,11 @@ const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
+const compression = require('compression');
 
 const app = express();
 app.set('trust proxy', true); // so req.ip reflects the real client IP behind Render's proxy
+app.use(compression());
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: "10mb" }));
 

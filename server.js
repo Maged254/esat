@@ -784,7 +784,12 @@ app.get('/api/employees/:id/ppe-assignments', auth, async (req, res) => {
   if (!scope || !(await inScope(req.user, scope.project, scope.client))) {
     return res.status(404).json({ error: 'Not found' });
   }
-  const { rows } = await pool.query(`SELECT p.* FROM ppe_items p JOIN employee_ppe_assignments epa ON epa.ppe_item_id=p.id WHERE epa.employee_id=$1 AND p.is_active=true ORDER BY p.sort_order`, [req.params.id]);
+  const { rows } = await pool.query(`
+    SELECT p.*,
+      (SELECT MAX(pr.date_distributed) FROM ppe_requests pr WHERE pr.employee_id=$1 AND pr.ppe_item_id=p.id AND pr.date_distributed IS NOT NULL) as last_distributed
+    FROM ppe_items p JOIN employee_ppe_assignments epa ON epa.ppe_item_id=p.id
+    WHERE epa.employee_id=$1 AND p.is_active=true ORDER BY p.sort_order
+  `, [req.params.id]);
   res.json(rows);
 });
 
@@ -1037,7 +1042,12 @@ app.get('/api/casuals/:id/ppe-assignments', auth, async (req, res) => {
   if (!scope || !(await inScope(req.user, scope.project, scope.client))) {
     return res.status(404).json({ error: 'Not found' });
   }
-  const { rows } = await pool.query(`SELECT p.* FROM ppe_items p JOIN casual_ppe_assignments cpa ON cpa.ppe_item_id=p.id WHERE cpa.casual_id=$1 AND p.is_active=true ORDER BY p.sort_order`, [req.params.id]);
+  const { rows } = await pool.query(`
+    SELECT p.*,
+      (SELECT MAX(pr.date_distributed) FROM ppe_requests pr WHERE pr.casual_id=$1 AND pr.ppe_item_id=p.id AND pr.date_distributed IS NOT NULL) as last_distributed
+    FROM ppe_items p JOIN casual_ppe_assignments cpa ON cpa.ppe_item_id=p.id
+    WHERE cpa.casual_id=$1 AND p.is_active=true ORDER BY p.sort_order
+  `, [req.params.id]);
   res.json(rows);
 });
 // Set casual PPE assignments (admin, ehs_manager only)

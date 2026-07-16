@@ -286,6 +286,7 @@ async function setupDB() {
     // delivery, resource_type 'image'. New uploads override both explicitly.
     await client.query("ALTER TABLE audit_documents ADD COLUMN IF NOT EXISTS resource_type VARCHAR(20) DEFAULT 'image'");
     await client.query("ALTER TABLE audit_documents ADD COLUMN IF NOT EXISTS delivery_type VARCHAR(20) DEFAULT 'upload'");
+    await client.query("ALTER TABLE audits ADD COLUMN IF NOT EXISTS delete_reason TEXT");
     console.log("Database setup complete");
   } catch(e) {
     console.error('DB setup error:', e.message);
@@ -1184,6 +1185,10 @@ app.get('/api/audits/stats', auth, async (req, res) => {
 
 app.delete('/api/audits/:id', auth, async (req, res) => {
   const isAdmin = req.user.role === 'admin';
+  const { delete_reason } = req.body;
+  if (!delete_reason || !delete_reason.trim()) {
+    return res.status(400).json({ error: 'A reason is required to delete an audit.' });
+  }
   const { rows: [existing] } = await pool.query('SELECT * FROM audits WHERE id=$1', [req.params.id]);
   if (!existing) return res.status(404).json({ error: 'Audit not found' });
 
@@ -1198,8 +1203,8 @@ app.delete('/api/audits/:id', auth, async (req, res) => {
     await client.query('BEGIN');
     // Soft delete the audit
     await client.query(
-      'UPDATE audits SET is_deleted=TRUE, deleted_at=NOW(), deleted_by=$1 WHERE id=$2',
-      [req.user.id, req.params.id]
+      'UPDATE audits SET is_deleted=TRUE, deleted_at=NOW(), deleted_by=$1, delete_reason=$2 WHERE id=$3',
+      [req.user.id, delete_reason.trim(), req.params.id]
     );
     // Cancel all linked PPE requests and NCR items (2 queries total, not 2 per item)
     await client.query(
@@ -1254,13 +1259,15 @@ app.get('/api/audits/:id', auth, async (req, res) => {
         (a.casual_id IS NOT NULL) as is_casual,
         u.full_name as audited_by_name,
         l.name as location_name,
-        u2.full_name as last_edited_by_name
+        u2.full_name as last_edited_by_name,
+        ud.full_name as deleted_by_name
       FROM audits a
       LEFT JOIN employees e ON e.id=a.employee_id
       LEFT JOIN casuals c ON c.id=a.casual_id
       JOIN users u ON u.id=a.audited_by
       LEFT JOIN locations l ON l.id=a.location_id
       LEFT JOIN users u2 ON u2.id=a.last_edited_by
+      LEFT JOIN users ud ON ud.id=a.deleted_by
       WHERE a.id=$1
     `, [req.params.id]);
     if (!audit) return res.status(404).json({ error: 'Not found' });

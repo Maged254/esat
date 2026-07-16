@@ -280,6 +280,10 @@ async function setupDB() {
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS distributed_by UUID REFERENCES users(id)");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ");
+    // Existing rows default to how they were actually uploaded: public 'upload'
+    // delivery, resource_type 'image'. New uploads override both explicitly.
+    await client.query("ALTER TABLE audit_documents ADD COLUMN IF NOT EXISTS resource_type VARCHAR(20) DEFAULT 'image'");
+    await client.query("ALTER TABLE audit_documents ADD COLUMN IF NOT EXISTS delivery_type VARCHAR(20) DEFAULT 'upload'");
     console.log("Database setup complete");
   } catch(e) {
     console.error('DB setup error:', e.message);
@@ -2556,19 +2560,22 @@ app.post('/api/audit-documents/upload', auth, (req, res) => {
       const folder = `esat/${safeNationalId}_${safeName}/${safeDate}`;
       const publicId = `${folder}/${safeDate}_${safeName}_${safeField}`;
 
+      // 'authenticated' delivery: the raw Cloudinary URL is useless without a
+      // signed, expiring token (generated per-download below) — unlike the old
+      // 'upload' type, it can't be accessed just by knowing/guessing the URL.
       const result = await new Promise((resolve, reject) => {
         const stream = cloudinary.uploader.upload_stream(
-          { public_id: publicId, overwrite: true, resource_type: 'auto' },
+          { public_id: publicId, overwrite: true, resource_type: 'auto', type: 'authenticated' },
           (error, result) => { if (error) reject(error); else resolve(result); }
         );
         stream.end(req.file.buffer);
       });
 
       await pool.query(
-        `INSERT INTO audit_documents (audit_id, employee_id, field_name, cloudinary_url, cloudinary_public_id)
-         VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (audit_id, field_name) DO UPDATE SET cloudinary_url=EXCLUDED.cloudinary_url, cloudinary_public_id=EXCLUDED.cloudinary_public_id`,
-        [audit_id, employee_id, field_name, result.secure_url, result.public_id]
+        `INSERT INTO audit_documents (audit_id, employee_id, field_name, cloudinary_url, cloudinary_public_id, resource_type, delivery_type)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (audit_id, field_name) DO UPDATE SET cloudinary_url=EXCLUDED.cloudinary_url, cloudinary_public_id=EXCLUDED.cloudinary_public_id, resource_type=EXCLUDED.resource_type, delivery_type=EXCLUDED.delivery_type`,
+        [audit_id, employee_id, field_name, result.secure_url, result.public_id, result.resource_type, 'authenticated']
       );
 
       res.json({ url: result.secure_url, public_id: result.public_id });
@@ -2580,21 +2587,32 @@ app.post('/api/audit-documents/upload', auth, (req, res) => {
 });
 
 
-// ── Download Audit Document (proxy) ─────────────────────────
+// ── Download Audit Document (redirect — not proxied through Render) ──
 app.get('/api/audit-documents/:id/download', auth, async (req, res) => {
   try {
     const doc = await pool.query('SELECT * FROM audit_documents WHERE id = $1', [req.params.id]);
     if (!doc.rows.length) return res.status(404).json({ message: 'Not found' });
-    const scope = await getAuditScope(doc.rows[0].audit_id);
+    const row = doc.rows[0];
+    const scope = await getAuditScope(row.audit_id);
     if (!scope || !(await inScope(req.user, scope.project, scope.client))) {
       return res.status(404).json({ message: 'Not found' });
     }
-    const url = doc.rows[0].cloudinary_url;
-    const rawFilename = url.split('/').pop().split('?')[0];
-    const filename = rawFilename.replace(/[^a-zA-Z0-9._-]/g, '_');
-    const https = require('https');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    https.get(url, (stream) => stream.pipe(res));
+
+    if (row.delivery_type === 'authenticated') {
+      // Short-lived signed URL: valid for 5 minutes, useless to anyone it leaks to afterward.
+      const signedUrl = cloudinary.url(row.cloudinary_public_id, {
+        type: 'authenticated',
+        resource_type: row.resource_type || 'image',
+        sign_url: true,
+        expires_at: Math.floor(Date.now() / 1000) + 300,
+      });
+      return res.redirect(signedUrl);
+    }
+
+    // Legacy documents were uploaded under the old public 'upload' type —
+    // their URL was never protected by anything beyond this permission check,
+    // so redirecting instead of proxying doesn't reduce their security.
+    res.redirect(row.cloudinary_url);
   } catch (err) {
     res.status(500).json({ message: 'Download failed' });
   }
@@ -2626,7 +2644,10 @@ app.delete('/api/audit-documents/:id', auth, async (req, res) => {
     if (!scope || !(await inScope(req.user, scope.project, scope.client))) {
       return res.status(404).json({ message: 'Not found' });
     }
-    await cloudinary.uploader.destroy(doc.rows[0].cloudinary_public_id);
+    await cloudinary.uploader.destroy(doc.rows[0].cloudinary_public_id, {
+      resource_type: doc.rows[0].resource_type || 'image',
+      type: doc.rows[0].delivery_type || 'upload',
+    });
     await pool.query(`DELETE FROM audit_documents WHERE id = $1`, [req.params.id]);
     res.json({ message: 'Deleted' });
   } catch (err) {

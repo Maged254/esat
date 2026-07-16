@@ -328,6 +328,41 @@ const auth = (req, res, next) => {
   } catch { res.status(401).json({ error: 'Invalid token' }); }
 };
 
+// ── Live updates (SSE) ────────────────────────────────────────
+// Replaces frontend polling: connected clients are pushed a message whenever
+// an employee record changes (Power Automate sync, or a manual edit), instead
+// of every open tab re-fetching the full employee list on a timer.
+const sseClients = new Set();
+const broadcastEmployeesChanged = () => {
+  for (const client of sseClients) client.write('data: employees-changed\n\n');
+};
+
+// EventSource can't send custom headers, so the token travels as a query param here.
+app.get('/api/events', (req, res) => {
+  const token = req.query.token;
+  if (!token) return res.status(401).end();
+  try {
+    const user = jwt.verify(token, JWT_SECRET);
+    if (!user.sync && user.iat < SERVER_BOOT_TIME) return res.status(401).end();
+  } catch {
+    return res.status(401).end();
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  res.write('\n');
+  sseClients.add(res);
+
+  const heartbeat = setInterval(() => res.write(': ping\n\n'), 30000);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    sseClients.delete(res);
+  });
+});
+
 // ── Project / client access helpers ──────────────────────────
 // Escapes free-text values before they're interpolated into HTML email templates.
 const escapeHtml = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({
@@ -767,6 +802,7 @@ app.put('/api/employees/:id/ppe-assignments', auth, async (req, res) => {
     }
     await client.query('UPDATE employees SET ppe_last_edited_by=$1, ppe_last_edited_at=NOW() WHERE id=$2', [req.user.id, employeeId]);
     await client.query('COMMIT');
+    broadcastEmployeesChanged();
     res.json({ success: true });
   } catch (e) {
     await client.query('ROLLBACK');
@@ -791,11 +827,13 @@ app.post('/api/employees', auth, async (req, res) => {
           `UPDATE employees SET full_name=$1, job_title=$2, department=$3, project=$4, client=$5, organization=$6, resource_type=$7, employment_status=$8 WHERE national_id=$9 RETURNING *`,
           [full_name, job_title, department, project, client, organization, resource_type, employment_status || 'active', national_id]
         );
+        broadcastEmployeesChanged();
         return res.json(rows[0]);
       }
     }
     const empNumber = employee_number || national_id || ('EMP-' + Date.now());
     const { rows } = await pool.query(`INSERT INTO employees (employee_number,full_name,national_id,job_title,department,project,client,organization,resource_type,employment_status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`, [empNumber, full_name, national_id, job_title, department, project, client, organization, resource_type, employment_status || 'active']);
+    broadcastEmployeesChanged();
     res.status(201).json(rows[0]);
   } catch(e) {
     if (e.code === '23505') return res.status(409).json({ error: 'Employee number exists' });
@@ -821,6 +859,7 @@ app.put('/api/employees/:id/status', auth, async (req, res) => {
     }
     await client.query('COMMIT');
     const { rows } = await pool.query('SELECT * FROM employees WHERE id=$1', [req.params.id]);
+    broadcastEmployeesChanged();
     res.json(rows[0]);
   } catch(e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: 'Server error' }); }
   finally { client.release(); }
@@ -831,6 +870,7 @@ app.put('/api/employees/:id/san', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const { san } = req.body;
   const { rows } = await pool.query('UPDATE employees SET san=$1, updated_at=NOW() WHERE id=$2 RETURNING *', [san, req.params.id]);
+  broadcastEmployeesChanged();
   res.json(rows[0]);
 });
 
@@ -1027,6 +1067,7 @@ app.delete('/api/employees/all/purge', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   try {
     await pool.query('DELETE FROM employees');
+    broadcastEmployeesChanged();
     res.json({ message: 'All employees deleted' });
   } catch (e) { sendError(res, e); }
 });
@@ -1035,6 +1076,7 @@ app.delete('/api/employees/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   try {
     await pool.query('DELETE FROM employees WHERE id=$1', [req.params.id]);
+    broadcastEmployeesChanged();
     res.json({ message: 'Deleted' });
   } catch (e) {
     if (e.code === '23503') return res.status(400).json({ error: 'Cannot delete: employee has existing audits or records. Deactivate them instead.' });

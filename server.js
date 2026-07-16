@@ -2589,8 +2589,22 @@ app.post('/api/audit-documents/upload', auth, (req, res) => {
 });
 
 
-// ── Download Audit Document (redirect — not proxied through Render) ──
-app.get('/api/audit-documents/:id/download', auth, async (req, res) => {
+// ── Download / preview Audit Document (redirect — not proxied through Render) ──
+// Not using the `auth` middleware here: a plain <img src> (used for inline
+// previews) can't send an Authorization header, so the token is also accepted
+// as a query param — same reasoning as the /api/events SSE endpoint.
+app.get('/api/audit-documents/:id/download', async (req, res) => {
+  const token = req.headers.authorization?.split(' ')[1] || req.query.token;
+  if (!token) return res.status(401).json({ message: 'No token' });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    if (!req.user.sync && req.user.iat < SERVER_BOOT_TIME) {
+      return res.status(401).json({ message: 'Session expired, please log in again' });
+    }
+  } catch {
+    return res.status(401).json({ message: 'Invalid token' });
+  }
+
   try {
     const doc = await pool.query('SELECT * FROM audit_documents WHERE id = $1', [req.params.id]);
     if (!doc.rows.length) return res.status(404).json({ message: 'Not found' });
@@ -2600,13 +2614,22 @@ app.get('/api/audit-documents/:id/download', auth, async (req, res) => {
       return res.status(404).json({ message: 'Not found' });
     }
 
+    // Inline preview only needs a screen-sized image, not the full original —
+    // same fix as the profile-picture/logo bandwidth issue, applied here too.
+    // Real downloads (no ?preview) still get the untouched original file.
+    const resourceType = row.resource_type || 'image';
+    const previewTransform = (req.query.preview && resourceType === 'image')
+      ? { width: 1200, crop: 'limit', quality: 'auto', fetch_format: 'auto' }
+      : {};
+
     if (row.delivery_type === 'authenticated') {
       // Short-lived signed URL: valid for 5 minutes, useless to anyone it leaks to afterward.
       const signedUrl = cloudinary.url(row.cloudinary_public_id, {
         type: 'authenticated',
-        resource_type: row.resource_type || 'image',
+        resource_type: resourceType,
         sign_url: true,
         expires_at: Math.floor(Date.now() / 1000) + 300,
+        ...previewTransform,
       });
       return res.redirect(signedUrl);
     }
@@ -2614,7 +2637,10 @@ app.get('/api/audit-documents/:id/download', auth, async (req, res) => {
     // Legacy documents were uploaded under the old public 'upload' type —
     // their URL was never protected by anything beyond this permission check,
     // so redirecting instead of proxying doesn't reduce their security.
-    res.redirect(row.cloudinary_url);
+    const legacyUrl = Object.keys(previewTransform).length
+      ? cloudinary.url(row.cloudinary_public_id, { resource_type: resourceType, ...previewTransform })
+      : row.cloudinary_url;
+    res.redirect(legacyUrl);
   } catch (err) {
     res.status(500).json({ message: 'Download failed' });
   }

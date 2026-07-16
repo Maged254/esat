@@ -1524,7 +1524,11 @@ app.get('/api/ncr', auth, async (req, res) => {
           COALESCE(e.national_id, c.national_id) as employee_national_id,
           COALESCE(e.project, c.project) as project,
           (n.casual_id IS NOT NULL) as is_casual,
-          p.name as ppe_name,p.category,p.needs_pda,u.full_name as audited_by_name,COALESCE(ai.quantity,1) as quantity
+          p.name as ppe_name,p.category,p.needs_pda,u.full_name as audited_by_name,COALESCE(ai.quantity,1) as quantity,
+          (SELECT MAX(pr.date_distributed) FROM ppe_requests pr
+           WHERE pr.ppe_item_id=n.ppe_item_id AND pr.date_distributed IS NOT NULL
+             AND ((n.employee_id IS NOT NULL AND pr.employee_id=n.employee_id) OR (n.casual_id IS NOT NULL AND pr.casual_id=n.casual_id))
+          ) as last_distributed
         FROM ncr_items n
         LEFT JOIN employees e ON e.id=n.employee_id
         LEFT JOIN casuals c ON c.id=n.casual_id
@@ -1710,7 +1714,11 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
         u4.full_name as distributed_by_name,
         u5.full_name as pda_approved_by_name,
         l.name as location_name,
-        COALESCE(ai.quantity, 1) as quantity
+        COALESCE(ai.quantity, 1) as quantity,
+        (SELECT MAX(pr2.date_distributed) FROM ppe_requests pr2
+         WHERE pr2.ppe_item_id=r.ppe_item_id AND pr2.date_distributed IS NOT NULL AND pr2.id != r.id
+           AND ((r.employee_id IS NOT NULL AND pr2.employee_id=r.employee_id) OR (r.casual_id IS NOT NULL AND pr2.casual_id=r.casual_id))
+        ) as last_distributed
       FROM ppe_requests r
       LEFT JOIN employees e ON e.id=r.employee_id
       LEFT JOIN casuals c ON c.id=r.casual_id

@@ -1127,6 +1127,7 @@ app.get('/api/audits', auth, async (req, res) => {
         COALESCE(e.full_name, c.full_name) as employee_name,
         e.employee_number,
         COALESCE(e.national_id, c.national_id) as national_id,
+        COALESCE(e.job_title, c.job_title) as job_title,
         e.department,
         COALESCE(e.project, c.project) as project,
         COALESCE(e.client, c.client) as client,
@@ -1161,7 +1162,7 @@ app.get('/api/audits', auth, async (req, res) => {
       if (auditClients.length === 0) { return res.json([]); }
       params.push(auditClients); q += ` AND COALESCE(e.client, c.client) = ANY($${params.length})`;
     }
-    q += ` GROUP BY a.id,e.full_name,c.full_name,e.employee_number,e.national_id,c.national_id,e.department,e.project,c.project,e.client,c.client,e.organization,c.organization,e.resource_type,u.full_name,a.employee_present,a.casual_id,ud.full_name ORDER BY a.created_at DESC`;
+    q += ` GROUP BY a.id,e.full_name,c.full_name,e.employee_number,e.national_id,c.national_id,e.job_title,c.job_title,e.department,e.project,c.project,e.client,c.client,e.organization,c.organization,e.resource_type,u.full_name,a.employee_present,a.casual_id,ud.full_name ORDER BY a.created_at DESC`;
     const { rows } = await pool.query(q, params);
     res.json(rows);
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }

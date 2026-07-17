@@ -623,12 +623,12 @@ app.get('/api/employees', auth, async (req, res) => {
     if (resource_type) { params.push(resource_type); q += ` AND e.resource_type=$${params.length}`; }
     const empProjects = await getProjectFilter(req.user);
     if (empProjects !== null) {
-      if (empProjects.length === 0) { return res.json([]); }
+      if (empProjects.length === 0) { return res.json({ rows: [], total: 0, page: pageNum, pageSize: limit }); }
       params.push(empProjects); q += ` AND e.project = ANY($${params.length})`;
     }
     const empClients = await getClientFilter(req.user);
     if (empClients !== null) {
-      if (empClients.length === 0) { return res.json([]); }
+      if (empClients.length === 0) { return res.json({ rows: [], total: 0, page: pageNum, pageSize: limit }); }
       params.push(empClients); q += ` AND e.client = ANY($${params.length})`;
     }
     q += ` GROUP BY e.id, u.full_name ORDER BY e.full_name`;
@@ -1122,7 +1122,11 @@ app.get('/api/ppe', auth, async (req, res) => {
 // Audits
 app.get('/api/audits', auth, async (req, res) => {
   try {
-    const { search, national_id, resource_type, project, client, status, audited_by } = req.query;
+    const { search, national_id, resource_type, project, client, status, audited_by, page, pageSize, export: isExport } = req.query;
+    // CSV export needs every matching row, not just one page -- bypass the cap for that one case.
+    const limit = isExport === 'true' ? 100000 : Math.min(Math.max(parseInt(pageSize) || 25, 1), 100);
+    const pageNum = isExport === 'true' ? 1 : Math.max(parseInt(page) || 1, 1);
+    const offset = (pageNum - 1) * limit;
     let q = `SELECT a.*,
         COALESCE(e.full_name, c.full_name) as employee_name,
         e.employee_number,
@@ -1136,7 +1140,8 @@ app.get('/api/audits', auth, async (req, res) => {
         (a.casual_id IS NOT NULL) as is_casual,
         u.full_name as audited_by_name,
         ud.full_name as deleted_by_name,
-        COUNT(ai.id) as total_items, COUNT(CASE WHEN ai.condition!='good' THEN 1 END) as issues_count
+        COUNT(ai.id) as total_items, COUNT(CASE WHEN ai.condition!='good' THEN 1 END) as issues_count,
+        COUNT(*) OVER() as full_count
       FROM audits a
       LEFT JOIN employees e ON e.id=a.employee_id
       LEFT JOIN casuals c ON c.id=a.casual_id
@@ -1154,32 +1159,70 @@ app.get('/api/audits', auth, async (req, res) => {
     if (audited_by) { params.push(audited_by); q += ` AND a.audited_by=$${params.length}`; }
     const auditProjects = await getProjectFilter(req.user);
     if (auditProjects !== null) {
-      if (auditProjects.length === 0) { return res.json([]); }
+      if (auditProjects.length === 0) { return res.json({ rows: [], total: 0, page: pageNum, pageSize: limit }); }
       params.push(auditProjects); q += ` AND COALESCE(e.project, c.project) = ANY($${params.length})`;
     }
     const auditClients = await getClientFilter(req.user);
     if (auditClients !== null) {
-      if (auditClients.length === 0) { return res.json([]); }
+      if (auditClients.length === 0) { return res.json({ rows: [], total: 0, page: pageNum, pageSize: limit }); }
       params.push(auditClients); q += ` AND COALESCE(e.client, c.client) = ANY($${params.length})`;
     }
     q += ` GROUP BY a.id,e.full_name,c.full_name,e.employee_number,e.national_id,c.national_id,e.job_title,c.job_title,e.department,e.project,c.project,e.client,c.client,e.organization,c.organization,e.resource_type,u.full_name,a.employee_present,a.casual_id,ud.full_name ORDER BY a.created_at DESC`;
+    params.push(limit, offset);
+    q += ` LIMIT $${params.length - 1} OFFSET $${params.length}`;
     const { rows } = await pool.query(q, params);
-    res.json(rows);
+    const total = rows.length ? parseInt(rows[0].full_count) : 0;
+    res.json({ rows, total, page: pageNum, pageSize: limit });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// Distinct project/client values for the history filter dropdowns -- needed
+// as a separate call now that the main list is paginated and can't be relied
+// on to enumerate every value itself.
+app.get('/api/audits/filter-options', auth, async (req, res) => {
+  try {
+    const scopedProjects = await getProjectFilter(req.user);
+    const scopedClients = await getClientFilter(req.user);
+    const projects = scopedProjects !== null ? scopedProjects : await getAllProjects();
+    const clients = scopedClients !== null ? scopedClients : await getAllClients();
+    res.json({ projects: projects.sort(), clients: clients.sort() });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
 app.get('/api/audits/stats', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT
+    const { search, national_id, resource_type, project, client, status, audited_by } = req.query;
+    let q = `SELECT
         COUNT(*) as total,
         COUNT(*) FILTER (WHERE overall_status='compliant') as compliant,
         COUNT(*) FILTER (WHERE overall_status='partial') as partial,
         COUNT(*) FILTER (WHERE overall_status='non_compliant') as non_compliant,
-        COUNT(*) FILTER (WHERE date_trunc('month', audit_date) = date_trunc('month', NOW())) as this_month,
-        COUNT(*) FILTER (WHERE date_trunc('month', audit_date) = date_trunc('month', NOW() - INTERVAL '1 month')) as last_month
-      FROM audits WHERE is_deleted IS NOT TRUE
-    `);
+        COUNT(*) FILTER (WHERE date_trunc('month', a.audit_date) = date_trunc('month', NOW())) as this_month,
+        COUNT(*) FILTER (WHERE date_trunc('month', a.audit_date) = date_trunc('month', NOW() - INTERVAL '1 month')) as last_month
+      FROM audits a
+      LEFT JOIN employees e ON e.id=a.employee_id
+      LEFT JOIN casuals c ON c.id=a.casual_id
+      WHERE a.is_deleted IS NOT TRUE`;
+    const params = [];
+    if (search) { params.push(`%${search}%`); q += ` AND COALESCE(e.full_name, c.full_name) ILIKE $${params.length}`; }
+    if (national_id) { params.push(`%${national_id}%`); q += ` AND COALESCE(e.national_id, c.national_id) ILIKE $${params.length}`; }
+    if (resource_type === 'casual') { q += ` AND a.casual_id IS NOT NULL`; }
+    else if (resource_type) { params.push(resource_type); q += ` AND e.resource_type=$${params.length}`; }
+    if (project) { params.push(project); q += ` AND COALESCE(e.project, c.project)=$${params.length}`; }
+    if (client) { params.push(client); q += ` AND COALESCE(e.client, c.client)=$${params.length}`; }
+    if (status) { params.push(status); q += ` AND COALESCE(e.employment_status, c.employment_status)=$${params.length}`; }
+    if (audited_by) { params.push(audited_by); q += ` AND a.audited_by=$${params.length}`; }
+    const statsProjects = await getProjectFilter(req.user);
+    if (statsProjects !== null) {
+      if (statsProjects.length === 0) return res.json({ total:0, compliant:0, partial:0, non_compliant:0, this_month:0, last_month:0 });
+      params.push(statsProjects); q += ` AND COALESCE(e.project, c.project) = ANY($${params.length})`;
+    }
+    const statsClients = await getClientFilter(req.user);
+    if (statsClients !== null) {
+      if (statsClients.length === 0) return res.json({ total:0, compliant:0, partial:0, non_compliant:0, this_month:0, last_month:0 });
+      params.push(statsClients); q += ` AND COALESCE(e.client, c.client) = ANY($${params.length})`;
+    }
+    const { rows } = await pool.query(q, params);
     res.json(rows[0]);
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });

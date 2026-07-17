@@ -1749,8 +1749,11 @@ app.put('/api/ppe/:id', auth, async (req, res) => {
 
 app.get('/api/ppe-requests', auth, async (req, res) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT r.*,
+    const { status, search, national_id, po_number, location, ppe, period, page, pageSize, export: isExport } = req.query;
+    const projects = req.query.projects ? req.query.projects.split(',').filter(Boolean) : [];
+    const clients = req.query.clients ? req.query.clients.split(',').filter(Boolean) : [];
+
+    let q = `SELECT r.*,
         COALESCE(e.full_name, c.full_name) as employee_name,
         e.employee_number,
         COALESCE(e.national_id, c.national_id) as employee_national_id,
@@ -1772,7 +1775,8 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
         (SELECT MAX(pr2.date_distributed) FROM ppe_requests pr2
          WHERE pr2.ppe_item_id=r.ppe_item_id AND pr2.date_distributed IS NOT NULL AND pr2.id != r.id
            AND ((r.employee_id IS NOT NULL AND pr2.employee_id=r.employee_id) OR (r.casual_id IS NOT NULL AND pr2.casual_id=r.casual_id))
-        ) as last_distributed
+        ) as last_distributed,
+        COUNT(*) OVER() as full_count
       FROM ppe_requests r
       LEFT JOIN employees e ON e.id=r.employee_id
       LEFT JOIN casuals c ON c.id=r.casual_id
@@ -1787,7 +1791,35 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
       LEFT JOIN users u3 ON u3.id=r.available_by
       LEFT JOIN users u4 ON u4.id=r.distributed_by
       LEFT JOIN users u5 ON u5.id=r.pda_approved_by
-      ORDER BY
+      WHERE 1=1`;
+    const params = [];
+
+    if (status === 'pda_pending') { q += ` AND r.status='ehs_purchase_requested' AND p.needs_pda=true`; }
+    else if (status === 'ehs_purchase_requested') { q += ` AND r.status='ehs_purchase_requested' AND NOT (p.needs_pda=true AND r.pda_approved_date IS NULL)`; }
+    else if (status) { params.push(status); q += ` AND r.status=$${params.length}`; }
+
+    if (search) { params.push(`%${search}%`); q += ` AND COALESCE(e.full_name, c.full_name) ILIKE $${params.length}`; }
+    if (national_id) { params.push(`%${national_id}%`); q += ` AND COALESCE(e.national_id, c.national_id) ILIKE $${params.length}`; }
+    if (po_number) { params.push(`%${po_number}%`); q += ` AND r.po_number ILIKE $${params.length}`; }
+    if (location) { params.push(location); q += ` AND l.name=$${params.length}`; }
+    if (ppe) { params.push(ppe); q += ` AND p.name=$${params.length}`; }
+    if (projects.length) { params.push(projects); q += ` AND COALESCE(e.project, c.project) = ANY($${params.length})`; }
+    if (clients.length) { params.push(clients); q += ` AND COALESCE(e.client, c.client) = ANY($${params.length})`; }
+    if (period === 'current') { q += ` AND date_trunc('month', r.date_flagged) = date_trunc('month', NOW())`; }
+    else if (period === 'previous') { q += ` AND date_trunc('month', r.date_flagged) = date_trunc('month', NOW() - INTERVAL '1 month')`; }
+
+    const ppeProjects = await getProjectFilter(req.user);
+    if (ppeProjects !== null) {
+      if (ppeProjects.length === 0) return res.json({ rows: [], total: 0, page: 1, pageSize: 0 });
+      params.push(ppeProjects); q += ` AND COALESCE(e.project, c.project) = ANY($${params.length})`;
+    }
+    const ppeClients = await getClientFilter(req.user);
+    if (ppeClients !== null) {
+      if (ppeClients.length === 0) return res.json({ rows: [], total: 0, page: 1, pageSize: 0 });
+      params.push(ppeClients); q += ` AND COALESCE(e.client, c.client) = ANY($${params.length})`;
+    }
+
+    q += ` ORDER BY
         CASE r.status
           WHEN 'pending' THEN 1
           WHEN 'ehs_purchase_requested' THEN 2
@@ -1797,20 +1829,103 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
           WHEN 'canceled' THEN 6
           ELSE 7
         END,
-        r.date_flagged DESC
-    `);
+        r.date_flagged DESC`;
+
+    // Pagination only applies to the flat/ungrouped view -- grouped views and
+    // CSV export need every matching row to compute correct subtotals/exports,
+    // so they simply omit `page` and get everything back.
+    let limit = null, offset = 0, pageNum = 1;
+    if (isExport !== 'true' && page) {
+      limit = Math.min(Math.max(parseInt(pageSize) || 25, 1), 100);
+      pageNum = Math.max(parseInt(page) || 1, 1);
+      offset = (pageNum - 1) * limit;
+      params.push(limit, offset);
+      q += ` LIMIT $${params.length - 1} OFFSET $${params.length}`;
+    }
+
+    const { rows } = await pool.query(q, params);
+    const total = rows.length ? parseInt(rows[0].full_count) : 0;
+    res.json({ rows, total, page: pageNum, pageSize: limit || total });
+  } catch(e) { sendError(res, e); }
+});
+
+// Global (unfiltered) bucket counts + oldest-item age for the stat cards --
+// intentionally ignores whatever filters are active in the UI so the cards
+// always reflect the true overall pending counts, not the current search.
+app.get('/api/ppe-requests/stats', auth, async (req, res) => {
+  try {
+    let q = `SELECT
+        COUNT(*) FILTER (WHERE r.status='pending') as pending_ehs,
+        MIN(r.date_flagged) FILTER (WHERE r.status='pending') as pending_ehs_oldest,
+        COUNT(*) FILTER (WHERE r.status='ehs_purchase_requested' AND p.needs_pda=true) as pending_pm,
+        MIN(r.date_purchase_requested) FILTER (WHERE r.status='ehs_purchase_requested' AND p.needs_pda=true) as pending_pm_oldest,
+        COUNT(*) FILTER (WHERE r.status='ehs_purchase_requested' AND NOT (p.needs_pda=true AND r.pda_approved_date IS NULL)) as pending_scm,
+        MIN(CASE WHEN p.needs_pda THEN r.pda_approved_date ELSE r.date_purchase_requested END)
+          FILTER (WHERE r.status='ehs_purchase_requested' AND NOT (p.needs_pda=true AND r.pda_approved_date IS NULL)) as pending_scm_oldest,
+        COUNT(*) FILTER (WHERE r.status='scm_ordered') as pending_suppliers,
+        MIN(r.date_ordered) FILTER (WHERE r.status='scm_ordered') as pending_suppliers_oldest,
+        COUNT(*) FILTER (WHERE r.status='warehouse_available') as pending_projects,
+        MIN(r.date_available) FILTER (WHERE r.status='warehouse_available') as pending_projects_oldest
+      FROM ppe_requests r
+      JOIN ppe_items p ON p.id=r.ppe_item_id
+      LEFT JOIN employees e ON e.id=r.employee_id
+      LEFT JOIN casuals c ON c.id=r.casual_id
+      WHERE 1=1`;
+    const params = [];
+    const zero = { pending_ehs:0, pending_ehs_oldest:null, pending_pm:0, pending_pm_oldest:null, pending_scm:0, pending_scm_oldest:null, pending_suppliers:0, pending_suppliers_oldest:null, pending_projects:0, pending_projects_oldest:null };
     const ppeProjects = await getProjectFilter(req.user);
-    const ppeClients = await getClientFilter(req.user);
-    let filteredRows = rows;
     if (ppeProjects !== null) {
-      if (ppeProjects.length === 0) filteredRows = [];
-      else filteredRows = filteredRows.filter(r => ppeProjects.includes(r.project));
+      if (ppeProjects.length === 0) return res.json(zero);
+      params.push(ppeProjects); q += ` AND COALESCE(e.project, c.project) = ANY($${params.length})`;
     }
+    const ppeClients = await getClientFilter(req.user);
     if (ppeClients !== null) {
-      if (ppeClients.length === 0) filteredRows = [];
-      else filteredRows = filteredRows.filter(r => ppeClients.includes(r.client));
+      if (ppeClients.length === 0) return res.json(zero);
+      params.push(ppeClients); q += ` AND COALESCE(e.client, c.client) = ANY($${params.length})`;
     }
-    res.json(filteredRows);
+    const { rows } = await pool.query(q, params);
+    const toDays = (d) => d ? Math.floor((Date.now() - new Date(d).getTime()) / 86400000) : null;
+    const r = rows[0];
+    res.json({
+      pending_ehs: parseInt(r.pending_ehs), pending_ehs_oldest: toDays(r.pending_ehs_oldest),
+      pending_pm: parseInt(r.pending_pm), pending_pm_oldest: toDays(r.pending_pm_oldest),
+      pending_scm: parseInt(r.pending_scm), pending_scm_oldest: toDays(r.pending_scm_oldest),
+      pending_suppliers: parseInt(r.pending_suppliers), pending_suppliers_oldest: toDays(r.pending_suppliers_oldest),
+      pending_projects: parseInt(r.pending_projects), pending_projects_oldest: toDays(r.pending_projects_oldest),
+    });
+  } catch(e) { sendError(res, e); }
+});
+
+// Distinct PPE item / project / client values actually present in ppe_requests,
+// for the filter dropdowns -- needed now that the main list is paginated.
+app.get('/api/ppe-requests/filter-options', auth, async (req, res) => {
+  try {
+    let q = `SELECT
+        ARRAY_AGG(DISTINCT p.name) FILTER (WHERE p.name IS NOT NULL) as ppe_names,
+        ARRAY_AGG(DISTINCT COALESCE(e.project, c.project)) FILTER (WHERE COALESCE(e.project, c.project) IS NOT NULL) as projects,
+        ARRAY_AGG(DISTINCT COALESCE(e.client, c.client)) FILTER (WHERE COALESCE(e.client, c.client) IS NOT NULL) as clients
+      FROM ppe_requests r
+      JOIN ppe_items p ON p.id=r.ppe_item_id
+      LEFT JOIN employees e ON e.id=r.employee_id
+      LEFT JOIN casuals c ON c.id=r.casual_id
+      WHERE 1=1`;
+    const params = [];
+    const ppeProjects = await getProjectFilter(req.user);
+    if (ppeProjects !== null) {
+      if (ppeProjects.length === 0) return res.json({ ppe_names: [], projects: [], clients: [] });
+      params.push(ppeProjects); q += ` AND COALESCE(e.project, c.project) = ANY($${params.length})`;
+    }
+    const ppeClients = await getClientFilter(req.user);
+    if (ppeClients !== null) {
+      if (ppeClients.length === 0) return res.json({ ppe_names: [], projects: [], clients: [] });
+      params.push(ppeClients); q += ` AND COALESCE(e.client, c.client) = ANY($${params.length})`;
+    }
+    const { rows } = await pool.query(q, params);
+    res.json({
+      ppe_names: (rows[0].ppe_names || []).sort(),
+      projects: (rows[0].projects || []).sort(),
+      clients: (rows[0].clients || []).sort(),
+    });
   } catch(e) { sendError(res, e); }
 });
 

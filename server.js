@@ -608,8 +608,15 @@ app.get('/api/employees', auth, async (req, res) => {
     return res.status(403).json({ error: 'Not authorized' });
   }
   try {
-    const { status, search, national_id, project, client, san, job_title, department, resource_type } = req.query;
-    let q = `SELECT e.*, MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as days_since_audit, COUNT(epa.id) > 0 as ppe_assigned, u.full_name as ppe_last_edited_by_name FROM employees e LEFT JOIN audits a ON a.employee_id=e.id LEFT JOIN employee_ppe_assignments epa ON epa.employee_id=e.id LEFT JOIN users u ON u.id=e.ppe_last_edited_by WHERE 1=1`;
+    const { status, search, national_id, project, client, san, job_title, department, resource_type, audit_age, page, pageSize } = req.query;
+    // Other pages (pickers/dropdowns) call this endpoint without `page` and need
+    // the old bare-array shape with every matching row -- only paginate, and only
+    // switch to the {rows,total,...} shape, when a page param is actually sent.
+    const paginate = !!page;
+    const limit = paginate ? Math.min(Math.max(parseInt(pageSize) || 25, 1), 100) : null;
+    const pageNum = paginate ? Math.max(parseInt(page) || 1, 1) : 1;
+    const offset = paginate ? (pageNum - 1) * limit : 0;
+    let q = `SELECT e.*, MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as days_since_audit, COUNT(epa.id) > 0 as ppe_assigned, u.full_name as ppe_last_edited_by_name, COUNT(*) OVER() as full_count FROM employees e LEFT JOIN audits a ON a.employee_id=e.id LEFT JOIN employee_ppe_assignments epa ON epa.employee_id=e.id LEFT JOIN users u ON u.id=e.ppe_last_edited_by WHERE 1=1`;
     const params = [];
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
     if (search) { params.push(`%${search}%`); q += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length})`; }
@@ -623,17 +630,113 @@ app.get('/api/employees', auth, async (req, res) => {
     if (resource_type) { params.push(resource_type); q += ` AND e.resource_type=$${params.length}`; }
     const empProjects = await getProjectFilter(req.user);
     if (empProjects !== null) {
-      if (empProjects.length === 0) { return res.json({ rows: [], total: 0, page: pageNum, pageSize: limit }); }
+      if (empProjects.length === 0) { return res.json(paginate ? { rows: [], total: 0, page: pageNum, pageSize: limit } : []); }
       params.push(empProjects); q += ` AND e.project = ANY($${params.length})`;
     }
     const empClients = await getClientFilter(req.user);
     if (empClients !== null) {
-      if (empClients.length === 0) { return res.json({ rows: [], total: 0, page: pageNum, pageSize: limit }); }
+      if (empClients.length === 0) { return res.json(paginate ? { rows: [], total: 0, page: pageNum, pageSize: limit } : []); }
       params.push(empClients); q += ` AND e.client = ANY($${params.length})`;
     }
-    q += ` GROUP BY e.id, u.full_name ORDER BY e.full_name`;
+    q += ` GROUP BY e.id, u.full_name`;
+    // audit_age filters on an aggregate (days since the last audit), so it has
+    // to be a HAVING clause -- can't reference the SELECT alias here.
+    const auditAgeExpr = `CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE)`;
+    if (audit_age === '1month') q += ` HAVING ${auditAgeExpr} <= 30`;
+    else if (audit_age === '2months') q += ` HAVING ${auditAgeExpr} > 30 AND ${auditAgeExpr} <= 60`;
+    else if (audit_age === 'over2months') q += ` HAVING (MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) IS NULL OR ${auditAgeExpr} > 60)`;
+    q += ` ORDER BY e.full_name`;
+    if (paginate) { params.push(limit, offset); q += ` LIMIT $${params.length - 1} OFFSET $${params.length}`; }
     const { rows } = await pool.query(q, params);
-    res.json(rows);
+    if (!paginate) return res.json(rows);
+    const total = rows.length ? parseInt(rows[0].full_count) : 0;
+    res.json({ rows, total, page: pageNum, pageSize: limit });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// Filter-scoped stat card counts for the Employees page -- mirrors Audit
+// History's pattern since these cards already reflected active filters
+// before pagination (unlike PPE Tracker's global counts).
+app.get('/api/employees/stats', auth, async (req, res) => {
+  if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) {
+    return res.status(403).json({ error: 'Not authorized' });
+  }
+  try {
+    const { status, search, national_id, project, client, san, job_title, department, resource_type, audit_age } = req.query;
+    const zero = { total_active: 0, inhouse: 0, outsource: 0, exits: 0 };
+    let q = `WITH scoped AS (
+        SELECT e.employment_status, e.resource_type,
+          CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as days_since_audit
+        FROM employees e
+        LEFT JOIN audits a ON a.employee_id=e.id
+        WHERE 1=1`;
+    const params = [];
+    if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
+    if (search) { params.push(`%${search}%`); q += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length})`; }
+    if (national_id) { params.push(`%${national_id}%`); q += ` AND e.national_id ILIKE $${params.length}`; }
+    if (project) { params.push(project); q += ` AND e.project=$${params.length}`; }
+    if (client) { params.push(client); q += ` AND e.client=$${params.length}`; }
+    if (san === 'yes') { q += ` AND (e.san IS NULL OR e.san = TRUE)`; }
+    if (san === 'no') { q += ` AND e.san = FALSE`; }
+    if (job_title) { params.push(`%${job_title}%`); q += ` AND e.job_title ILIKE $${params.length}`; }
+    if (department) { params.push(department); q += ` AND e.department=$${params.length}`; }
+    if (resource_type) { params.push(resource_type); q += ` AND e.resource_type=$${params.length}`; }
+    const empProjects = await getProjectFilter(req.user);
+    if (empProjects !== null) {
+      if (empProjects.length === 0) return res.json(zero);
+      params.push(empProjects); q += ` AND e.project = ANY($${params.length})`;
+    }
+    const empClients = await getClientFilter(req.user);
+    if (empClients !== null) {
+      if (empClients.length === 0) return res.json(zero);
+      params.push(empClients); q += ` AND e.client = ANY($${params.length})`;
+    }
+    q += ` GROUP BY e.id
+      )
+      SELECT
+        COUNT(*) FILTER (WHERE employment_status='active') as total_active,
+        COUNT(*) FILTER (WHERE resource_type='inhouse') as inhouse,
+        COUNT(*) FILTER (WHERE resource_type='outsource') as outsource,
+        COUNT(*) FILTER (WHERE employment_status='exit') as exits
+      FROM scoped WHERE 1=1`;
+    if (audit_age === '1month') q += ` AND days_since_audit <= 30`;
+    else if (audit_age === '2months') q += ` AND days_since_audit > 30 AND days_since_audit <= 60`;
+    else if (audit_age === 'over2months') q += ` AND (days_since_audit IS NULL OR days_since_audit > 60)`;
+    const { rows } = await pool.query(q, params);
+    const r = rows[0];
+    res.json({ total_active: parseInt(r.total_active)||0, inhouse: parseInt(r.inhouse)||0, outsource: parseInt(r.outsource)||0, exits: parseInt(r.exits)||0 });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
+});
+
+// Distinct department/project/client values for the Employees filter
+// dropdowns -- needed now that the main list is paginated.
+app.get('/api/employees/filter-options', auth, async (req, res) => {
+  if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) {
+    return res.status(403).json({ error: 'Not authorized' });
+  }
+  try {
+    let q = `SELECT
+        ARRAY_AGG(DISTINCT e.department) FILTER (WHERE e.department IS NOT NULL) as departments,
+        ARRAY_AGG(DISTINCT e.project) FILTER (WHERE e.project IS NOT NULL) as projects,
+        ARRAY_AGG(DISTINCT e.client) FILTER (WHERE e.client IS NOT NULL) as clients
+      FROM employees e WHERE 1=1`;
+    const params = [];
+    const empProjects = await getProjectFilter(req.user);
+    if (empProjects !== null) {
+      if (empProjects.length === 0) return res.json({ departments: [], projects: [], clients: [] });
+      params.push(empProjects); q += ` AND e.project = ANY($${params.length})`;
+    }
+    const empClients = await getClientFilter(req.user);
+    if (empClients !== null) {
+      if (empClients.length === 0) return res.json({ departments: [], projects: [], clients: [] });
+      params.push(empClients); q += ` AND e.client = ANY($${params.length})`;
+    }
+    const { rows } = await pool.query(q, params);
+    res.json({
+      departments: (rows[0].departments || []).sort(),
+      projects: (rows[0].projects || []).sort(),
+      clients: (rows[0].clients || []).sort(),
+    });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -1563,47 +1666,122 @@ app.put('/api/audits/:id', auth, async (req, res) => {
 // NCR
 app.get('/api/ncr', auth, async (req, res) => {
   try {
-    let ncrRows;
+    const { search, project, ppe, period, status, page, pageSize, export: isExport } = req.query;
+    const limit = isExport === 'true' ? 100000 : Math.min(Math.max(parseInt(pageSize) || 25, 1), 100);
+    const pageNum = isExport === 'true' ? 1 : Math.max(parseInt(page) || 1, 1);
+    const offset = (pageNum - 1) * limit;
     const ncrProjects = await getProjectFilter(req.user);
     const ncrClients = await getClientFilter(req.user);
     if ((ncrProjects !== null && ncrProjects.length === 0) || (ncrClients !== null && ncrClients.length === 0)) {
-      ncrRows = [];
-    } else {
-      let ncrQ = `SELECT n.*,
-          COALESCE(e.full_name, c.full_name) as employee_name,
-          e.employee_number,
-          COALESCE(e.national_id, c.national_id) as employee_national_id,
-          COALESCE(e.job_title, c.job_title) as job_title,
-          COALESCE(e.project, c.project) as project,
-          COALESCE(e.client, c.client) as client,
-          COALESCE(e.organization, c.organization) as organization,
-          (n.casual_id IS NOT NULL) as is_casual,
-          p.name as ppe_name,p.category,p.needs_pda,u.full_name as audited_by_name,COALESCE(ai.quantity,1) as quantity,
-          (SELECT MAX(pr.date_distributed) FROM ppe_requests pr
-           WHERE pr.ppe_item_id=n.ppe_item_id AND pr.date_distributed IS NOT NULL
-             AND ((n.employee_id IS NOT NULL AND pr.employee_id=n.employee_id) OR (n.casual_id IS NOT NULL AND pr.casual_id=n.casual_id))
-          ) as last_distributed
-        FROM ncr_items n
-        LEFT JOIN employees e ON e.id=n.employee_id
-        LEFT JOIN casuals c ON c.id=n.casual_id
-        JOIN ppe_items p ON p.id=n.ppe_item_id
-        LEFT JOIN audit_items ai ON ai.id=n.audit_item_id
-        LEFT JOIN audits a ON a.id=ai.audit_id
-        LEFT JOIN users u ON u.id=a.audited_by WHERE 1=1`;
-      const ncrParams = [];
-      if (ncrProjects !== null) { ncrParams.push(ncrProjects); ncrQ += ` AND COALESCE(e.project, c.project) = ANY($${ncrParams.length})`; }
-      if (ncrClients !== null) { ncrParams.push(ncrClients); ncrQ += ` AND COALESCE(e.client, c.client) = ANY($${ncrParams.length})`; }
-      ncrQ += ` ORDER BY n.created_at DESC`;
-      const { rows: _ncrRows } = await pool.query(ncrQ, ncrParams);
-      ncrRows = _ncrRows;
+      return res.json({ rows: [], total: 0, page: pageNum, pageSize: limit });
     }
-    res.json(ncrRows);
+    let q = `SELECT n.*,
+        COALESCE(e.full_name, c.full_name) as employee_name,
+        e.employee_number,
+        COALESCE(e.national_id, c.national_id) as employee_national_id,
+        COALESCE(e.job_title, c.job_title) as job_title,
+        COALESCE(e.project, c.project) as project,
+        COALESCE(e.client, c.client) as client,
+        COALESCE(e.organization, c.organization) as organization,
+        (n.casual_id IS NOT NULL) as is_casual,
+        p.name as ppe_name,p.category,p.needs_pda,u.full_name as audited_by_name,COALESCE(ai.quantity,1) as quantity,
+        (SELECT MAX(pr.date_distributed) FROM ppe_requests pr
+         WHERE pr.ppe_item_id=n.ppe_item_id AND pr.date_distributed IS NOT NULL
+           AND ((n.employee_id IS NOT NULL AND pr.employee_id=n.employee_id) OR (n.casual_id IS NOT NULL AND pr.casual_id=n.casual_id))
+        ) as last_distributed,
+        COUNT(*) OVER() as full_count
+      FROM ncr_items n
+      LEFT JOIN employees e ON e.id=n.employee_id
+      LEFT JOIN casuals c ON c.id=n.casual_id
+      JOIN ppe_items p ON p.id=n.ppe_item_id
+      LEFT JOIN audit_items ai ON ai.id=n.audit_item_id
+      LEFT JOIN audits a ON a.id=ai.audit_id
+      LEFT JOIN users u ON u.id=a.audited_by WHERE 1=1`;
+    const params = [];
+    if (search) { params.push(`%${search}%`); q += ` AND COALESCE(e.full_name, c.full_name) ILIKE $${params.length}`; }
+    if (ppe) { params.push(ppe); q += ` AND p.name=$${params.length}`; }
+    if (project) { params.push(project); q += ` AND COALESCE(e.project, c.project)=$${params.length}`; }
+    if (period === 'current') { q += ` AND date_trunc('month', n.created_at) = date_trunc('month', NOW())`; }
+    else if (period === 'previous') { q += ` AND date_trunc('month', n.created_at) = date_trunc('month', NOW() - INTERVAL '1 month')`; }
+    if (status === 'pda_pending') { q += ` AND n.status='ehs_purchase_requested' AND p.needs_pda=true`; }
+    else if (status === 'ehs_purchase_requested') { q += ` AND n.status='ehs_purchase_requested' AND p.needs_pda IS NOT TRUE`; }
+    else if (status === 'distributed_this_month') { q += ` AND n.status IN ('resolved','distributed') AND date_trunc('month', n.updated_at) = date_trunc('month', NOW())`; }
+    else if (status) { params.push(status); q += ` AND n.status=$${params.length}`; }
+    if (ncrProjects !== null) { params.push(ncrProjects); q += ` AND COALESCE(e.project, c.project) = ANY($${params.length})`; }
+    if (ncrClients !== null) { params.push(ncrClients); q += ` AND COALESCE(e.client, c.client) = ANY($${params.length})`; }
+    q += ` ORDER BY n.created_at DESC`;
+    params.push(limit, offset);
+    q += ` LIMIT $${params.length - 1} OFFSET $${params.length}`;
+    const { rows } = await pool.query(q, params);
+    const total = rows.length ? parseInt(rows[0].full_count) : 0;
+    res.json({ rows, total, page: pageNum, pageSize: limit });
   } catch(e) { sendError(res, e); }
 });
 
+// Distinct PPE item / project values for the NCR filter dropdowns -- needed
+// now that the main list is paginated. No client dropdown exists in the UI
+// for this page, so only these two are exposed.
+app.get('/api/ncr/filter-options', auth, async (req, res) => {
+  try {
+    let q = `SELECT
+        ARRAY_AGG(DISTINCT p.name) FILTER (WHERE p.name IS NOT NULL) as ppe_names,
+        ARRAY_AGG(DISTINCT COALESCE(e.project, c.project)) FILTER (WHERE COALESCE(e.project, c.project) IS NOT NULL) as projects
+      FROM ncr_items n
+      JOIN ppe_items p ON p.id=n.ppe_item_id
+      LEFT JOIN employees e ON e.id=n.employee_id
+      LEFT JOIN casuals c ON c.id=n.casual_id
+      WHERE 1=1`;
+    const params = [];
+    const ncrProjects = await getProjectFilter(req.user);
+    if (ncrProjects !== null) {
+      if (ncrProjects.length === 0) return res.json({ ppe_names: [], projects: [] });
+      params.push(ncrProjects); q += ` AND COALESCE(e.project, c.project) = ANY($${params.length})`;
+    }
+    const ncrClients = await getClientFilter(req.user);
+    if (ncrClients !== null) {
+      if (ncrClients.length === 0) return res.json({ ppe_names: [], projects: [] });
+      params.push(ncrClients); q += ` AND COALESCE(e.client, c.client) = ANY($${params.length})`;
+    }
+    const { rows } = await pool.query(q, params);
+    res.json({
+      ppe_names: (rows[0].ppe_names || []).sort(),
+      projects: (rows[0].projects || []).sort(),
+    });
+  } catch(e) { sendError(res, e); }
+});
+
+// Global (unfiltered) bucket counts for the stat cards -- these were already
+// computed from the full unfiltered item list client-side before pagination
+// (only clickable as row filters, not reflecting the search/period/ppe/project
+// filters), so this keeps that behavior. Only project/client access scoping applies.
 app.get('/api/ncr/stats', auth, async (req, res) => {
-  const { rows } = await pool.query(`SELECT COUNT(*) FILTER (WHERE status='pending') as pending, COUNT(*) FILTER (WHERE status='ehs_purchase_requested') as ordered, COUNT(*) FILTER (WHERE status IN ('resolved','distributed') AND updated_at >= date_trunc('month',NOW())) as resolved_this_month, COUNT(*) FILTER (WHERE status NOT IN ('resolved','distributed','canceled')) as total_open FROM ncr_items`);
-  res.json(rows[0]);
+  try {
+    let q = `SELECT
+        COUNT(*) FILTER (WHERE n.status NOT IN ('resolved','distributed','canceled')) as total_open,
+        COUNT(*) FILTER (WHERE n.status='pending') as pending,
+        COUNT(*) FILTER (WHERE n.status='ehs_purchase_requested' AND p.needs_pda=true) as pending_pm,
+        COUNT(*) FILTER (WHERE n.status IN ('resolved','distributed') AND date_trunc('month', n.updated_at) = date_trunc('month', NOW())) as resolved_this_month
+      FROM ncr_items n
+      JOIN ppe_items p ON p.id = n.ppe_item_id
+      LEFT JOIN employees e ON e.id = n.employee_id
+      LEFT JOIN casuals c ON c.id = n.casual_id
+      WHERE 1=1`;
+    const params = [];
+    const zero = { total_open: 0, pending: 0, pending_pm: 0, resolved_this_month: 0 };
+    const ncrProjects = await getProjectFilter(req.user);
+    if (ncrProjects !== null) {
+      if (ncrProjects.length === 0) return res.json(zero);
+      params.push(ncrProjects); q += ` AND COALESCE(e.project, c.project) = ANY($${params.length})`;
+    }
+    const ncrClients = await getClientFilter(req.user);
+    if (ncrClients !== null) {
+      if (ncrClients.length === 0) return res.json(zero);
+      params.push(ncrClients); q += ` AND COALESCE(e.client, c.client) = ANY($${params.length})`;
+    }
+    const { rows } = await pool.query(q, params);
+    const r = rows[0];
+    res.json({ total_open: parseInt(r.total_open)||0, pending: parseInt(r.pending)||0, pending_pm: parseInt(r.pending_pm)||0, resolved_this_month: parseInt(r.resolved_this_month)||0 });
+  } catch(e) { sendError(res, e); }
 });
 
 app.put('/api/ncr/:id/status', auth, async (req, res) => {

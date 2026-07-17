@@ -1529,7 +1529,10 @@ app.get('/api/ncr', auth, async (req, res) => {
           COALESCE(e.full_name, c.full_name) as employee_name,
           e.employee_number,
           COALESCE(e.national_id, c.national_id) as employee_national_id,
+          COALESCE(e.job_title, c.job_title) as job_title,
           COALESCE(e.project, c.project) as project,
+          COALESCE(e.client, c.client) as client,
+          COALESCE(e.organization, c.organization) as organization,
           (n.casual_id IS NOT NULL) as is_casual,
           p.name as ppe_name,p.category,p.needs_pda,u.full_name as audited_by_name,COALESCE(ai.quantity,1) as quantity,
           (SELECT MAX(pr.date_distributed) FROM ppe_requests pr

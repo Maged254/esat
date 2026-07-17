@@ -2132,6 +2132,49 @@ async function sendDailySCMDigest() {
 }
 
 
+async function sendDailyPMDigest() {
+  try {
+    const { rows: pending } = await pool.query(`
+      SELECT COUNT(*) as count, MAX(CURRENT_DATE - r.date_purchase_requested::date) as oldest_days
+      FROM ppe_requests r
+      JOIN ppe_items p ON p.id = r.ppe_item_id
+      WHERE r.status = 'ehs_purchase_requested' AND p.needs_pda = true AND r.pda_approved_date IS NULL
+    `);
+    const count = parseInt(pending[0].count);
+    const oldestDays = parseInt(pending[0].oldest_days) || 0;
+    if (count === 0) return;
+
+    await resend.emails.send({
+        from: 'ESAT <esat@egypro.app>',
+        to: 'e.maged@outlook.com',
+        subject: `ESAT Daily PM — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Your Approval`,
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
+            <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
+              <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="110" height="50" style="height:50px; width:110px; display:block; margin:0 auto;" />
+            </td></tr></table>
+            <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
+              <p style="font-size: 15px; color: #374151;">Hello Isaac,</p>
+              <p style="font-size: 15px; color: #374151;">
+                We have <strong style="color: #0f2a4a;">${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong>
+                that require your approval. The oldest item has been waiting for
+                <strong style="color: ${oldestDays > 0 ? '#e53e3e' : '#374151'};">${oldestDays} day${oldestDays !== 1 ? 's' : ''}</strong>.
+              </p>
+              <p style="font-size: 15px; color: #374151;">Please check the ESAT system to clear the pending list.</p>
+              <a href="https://esat.egypro.app"
+                style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">
+                Open ESAT
+              </a>
+              <p style="font-size: 14px; color: #374151; margin-top: 24px;">Thanks,<br/>Maged Ezzat</p>
+            </div>
+          </div>
+        `
+      });
+    console.log('PM digest sent — ' + count + ' pending');
+  } catch(e) {
+    console.error('PM digest error:', e.message);
+  }
+}
 
 
 async function sendDailyBTSDigest() {
@@ -2429,6 +2472,7 @@ async function pruneOldRequestLogs() {
 function scheduleDailyDigest() {
   scheduleAt(5, 30, 'Fibre digest', sendDailyFibreDigest);  // 8:30am EAT
   scheduleAt(5, 35, 'BTS digest', sendDailyBTSDigest);      // 8:35am EAT
+  scheduleAt(5, 40, 'PM digest', sendDailyPMDigest);        // 8:40am EAT
   scheduleAt(5, 45, 'EHS digest', sendDailyEHSDigest);      // 8:45am EAT
   scheduleAt(6,  0, 'SCM digest', sendDailySCMDigest);      // 9:00am EAT
   scheduleAt(13, 0, 'Overdue digest', sendDailyOverdueDigest); // 4:00pm EAT
@@ -2439,6 +2483,14 @@ app.post('/api/admin/test-bts-digest', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   try {
     await sendDailyBTSDigest();
+    res.json({ success: true });
+  } catch(e) { sendError(res, e); }
+});
+
+app.post('/api/admin/test-pm-digest', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    await sendDailyPMDigest();
     res.json({ success: true });
   } catch(e) { sendError(res, e); }
 });

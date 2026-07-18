@@ -3174,7 +3174,9 @@ app.get('/api/graphs', auth, async (req, res) => {
       pool.query(`
         SELECT TO_CHAR(DATE_TRUNC('month', a.audit_date), 'Mon YYYY') as month,
                DATE_TRUNC('month', a.audit_date) as month_date,
-               COUNT(*) as count
+               COUNT(*) as count,
+               COUNT(*) FILTER (WHERE a.employee_present = TRUE) as audits_count,
+               COUNT(*) FILTER (WHERE a.employee_present = FALSE) as requests_count
         FROM audits a
         LEFT JOIN employees e ON e.id = a.employee_id
         LEFT JOIN casuals c ON c.id = a.casual_id
@@ -3324,7 +3326,7 @@ app.get('/api/graphs', auth, async (req, res) => {
         clients: filterOptions.rows[0]?.clients || [],
       },
       active_filters: { project: requestedProject, client: requestedClient },
-      audits_by_month: auditsByMonth.rows.map(r => ({ month: r.month, count: parseInt(r.count) })),
+      audits_by_month: auditsByMonth.rows.map(r => ({ month: r.month, count: parseInt(r.count), audits_count: parseInt(r.audits_count), requests_count: parseInt(r.requests_count) })),
       ncr_by_month: ncrByMonth.rows.map(r => ({ month: r.month, created: parseInt(r.created), resolved: parseInt(r.resolved) })),
       ppe_stage_delays_by_month: ppeStageDelays.rows.map(r => ({
         month: r.month,

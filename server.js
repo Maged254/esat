@@ -3165,8 +3165,7 @@ app.get('/api/graphs', auth, async (req, res) => {
         FROM ppe_requests r
         LEFT JOIN employees e ON e.id = r.employee_id
         LEFT JOIN casuals c ON c.id = r.casual_id
-        WHERE r.status NOT IN ('distributed','resolved','canceled')
-        AND COALESCE(e.employment_status, c.employment_status) = 'active'
+        WHERE COALESCE(e.employment_status, c.employment_status) = 'active'
         ${scopeWhere}
         GROUP BY COALESCE(e.id, c.id), COALESCE(e.full_name, c.full_name)
         ORDER BY ppe_count DESC

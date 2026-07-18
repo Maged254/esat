@@ -3159,7 +3159,7 @@ app.get('/api/graphs', auth, async (req, res) => {
     }
     const accessWhere = accessConditions.length ? `WHERE ${accessConditions.join(' AND ')}` : '';
 
-    const [ppeByEmployee, auditsByMonth, ncrByMonth, ppeStageDelays, filterOptions] = await Promise.all([
+    const [ppeByEmployee, auditsByMonth, ncrByMonth, ppeStageDelays, filterOptions, auditsByAuditor] = await Promise.all([
       pool.query(`
         SELECT COALESCE(e.full_name, c.full_name) as employee_name, COUNT(r.id) as ppe_count
         FROM ppe_requests r
@@ -3312,11 +3312,40 @@ app.get('/api/graphs', auth, async (req, res) => {
                  FILTER (WHERE person.client IS NOT NULL AND person.client <> '') AS clients
         FROM person
         ${accessWhere}
-      `, accessParams)
+      `, accessParams),
+      pool.query(`
+        SELECT TO_CHAR(DATE_TRUNC('month', a.audit_date), 'Mon YYYY') as month,
+               DATE_TRUNC('month', a.audit_date) as month_date,
+               u.full_name as auditor,
+               COUNT(*) as count
+        FROM audits a
+        LEFT JOIN employees e ON e.id = a.employee_id
+        LEFT JOIN casuals c ON c.id = a.casual_id
+        JOIN users u ON u.id = a.audited_by
+        WHERE a.audit_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '11 months'
+          AND a.employee_present = TRUE
+        ${scopeWhere}
+        GROUP BY month_date, month, u.id, u.full_name
+        ORDER BY month_date ASC
+      `, scopeParams)
     ]);
 
     const counts = ppeByEmployee.rows.map(r => parseInt(r.ppe_count));
     const avg = counts.length > 0 ? Math.round(counts.reduce((a,b) => a+b, 0) / counts.length) : 0;
+
+    // Pivot (month, auditor, count) rows into one row per month with each
+    // auditor as its own key, e.g. { month: 'Jan 2026', 'Jane Doe': 5 }.
+    const auditorMonthRows = {};
+    const auditorNames = new Set();
+    auditsByAuditor.rows.forEach(r => {
+      if (!auditorMonthRows[r.month]) auditorMonthRows[r.month] = { month: r.month, _sort: r.month_date };
+      auditorMonthRows[r.month][r.auditor] = parseInt(r.count);
+      auditorNames.add(r.auditor);
+    });
+    const auditsByAuditorMonth = Object.values(auditorMonthRows)
+      .sort((a, b) => new Date(a._sort) - new Date(b._sort))
+      .map(({ _sort, ...rest }) => rest);
+    const auditors = [...auditorNames].sort();
 
     res.json({
       ppe_by_employee: ppeByEmployee.rows.map(r => ({ name: r.employee_name, count: parseInt(r.ppe_count) })),
@@ -3350,7 +3379,9 @@ app.get('/api/graphs', auth, async (req, res) => {
         project_max: r.project_max === null ? null : parseFloat(r.project_max),
         project_count: parseInt(r.project_count),
         project_open_count: parseInt(r.project_open_count),
-      }))
+      })),
+      audits_by_auditor_month: auditsByAuditorMonth,
+      auditors,
     });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });

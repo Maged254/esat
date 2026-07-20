@@ -3312,13 +3312,20 @@ app.get('/api/graphs', auth, async (req, res) => {
           SELECT project, client FROM employees
           UNION ALL
           SELECT project, client FROM casuals
-        )
-        SELECT ARRAY_AGG(DISTINCT person.project ORDER BY person.project)
-                 FILTER (WHERE person.project IS NOT NULL AND person.project <> '') AS projects,
-               ARRAY_AGG(DISTINCT person.client ORDER BY person.client)
-                 FILTER (WHERE person.client IS NOT NULL AND person.client <> '') AS clients
-        FROM person
-        ${accessWhere}
+        ),
+        scoped_person AS (SELECT * FROM person ${accessWhere})
+        SELECT
+          (SELECT ARRAY_AGG(DISTINCT project ORDER BY project) FILTER (WHERE project IS NOT NULL AND project <> '') FROM scoped_person) AS projects,
+          (SELECT ARRAY_AGG(DISTINCT client ORDER BY client) FILTER (WHERE client IS NOT NULL AND client <> '') FROM scoped_person) AS clients,
+          (
+            SELECT COALESCE(json_object_agg(client, projects), '{}'::json)
+            FROM (
+              SELECT client, ARRAY_AGG(DISTINCT project ORDER BY project) FILTER (WHERE project IS NOT NULL AND project <> '') AS projects
+              FROM scoped_person
+              WHERE client IS NOT NULL AND client <> ''
+              GROUP BY client
+            ) t
+          ) AS client_projects
       `, accessParams),
       pool.query(`
         SELECT TO_CHAR(DATE_TRUNC('month', a.audit_date), 'Mon YYYY') as month,
@@ -3389,6 +3396,7 @@ app.get('/api/graphs', auth, async (req, res) => {
       filter_options: {
         projects: filterOptions.rows[0]?.projects || [],
         clients: filterOptions.rows[0]?.clients || [],
+        client_projects: filterOptions.rows[0]?.client_projects || {},
       },
       active_filters: { project: requestedProjects, client: requestedClients },
       audits_by_month: auditsByMonth.rows.map(r => ({ month: r.month, count: parseInt(r.count), audits_count: parseInt(r.audits_count), requests_count: parseInt(r.requests_count) })),

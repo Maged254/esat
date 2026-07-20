@@ -168,6 +168,12 @@ async function setupDB() {
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS project_access TEXT[] DEFAULT '{}'")
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS client_access TEXT[] DEFAULT '{}'");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS page_access TEXT[] DEFAULT '{}'");
+
+    // The Graphs page was split into separate Audits/Requests pages -- carry
+    // forward access for anyone who had '/graphs' so they aren't locked out.
+    await client.query("UPDATE users SET page_access = array_append(page_access, '/audits') WHERE '/graphs' = ANY(page_access) AND NOT ('/audits' = ANY(page_access))");
+    await client.query("UPDATE users SET page_access = array_append(page_access, '/requests') WHERE '/graphs' = ANY(page_access) AND NOT ('/requests' = ANY(page_access))");
+    await client.query("UPDATE users SET page_access = array_remove(page_access, '/graphs') WHERE '/graphs' = ANY(page_access)");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS must_reset_password BOOLEAN DEFAULT FALSE");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_attempts INTEGER DEFAULT 0");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ");
@@ -2293,7 +2299,7 @@ app.post('/api/admin/seed-locations', auth, async (req, res) => {
 app.post('/api/admin/backfill-page-access', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   try {
-    const fullPages = ['/','/employees','/audit/new','/history','/ncr','/ppe-tracker','/graphs'];
+    const fullPages = ['/','/employees','/audit/new','/history','/ncr','/ppe-tracker','/audits','/requests'];
     const { rowCount } = await pool.query(
       `UPDATE users SET page_access=$1, updated_at=NOW()
        WHERE role <> 'admin' AND (page_access IS NULL OR page_access = '{}')`,

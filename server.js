@@ -3324,6 +3324,7 @@ app.get('/api/graphs', auth, async (req, res) => {
         SELECT TO_CHAR(DATE_TRUNC('month', a.audit_date), 'Mon YYYY') as month,
                DATE_TRUNC('month', a.audit_date) as month_date,
                u.full_name as auditor,
+               u.profile_picture as photo,
                COUNT(*) as count
         FROM audits a
         LEFT JOIN employees e ON e.id = a.employee_id
@@ -3332,7 +3333,7 @@ app.get('/api/graphs', auth, async (req, res) => {
         WHERE a.audit_date >= DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '11 months'
           AND a.employee_present = TRUE
         ${scopeWhere}
-        GROUP BY month_date, month, u.id, u.full_name
+        GROUP BY month_date, month, u.id, u.full_name, u.profile_picture
         ORDER BY month_date ASC
       `, scopeParams),
       pool.query(`
@@ -3358,10 +3359,12 @@ app.get('/api/graphs', auth, async (req, res) => {
     // auditor as its own key, e.g. { month: 'Jan 2026', 'Jane Doe': 5 }.
     const auditorMonthRows = {};
     const auditorNames = new Set();
+    const auditorPhotos = {};
     auditsByAuditor.rows.forEach(r => {
       if (!auditorMonthRows[r.month]) auditorMonthRows[r.month] = { month: r.month, _sort: r.month_date };
       auditorMonthRows[r.month][r.auditor] = parseInt(r.count);
       auditorNames.add(r.auditor);
+      if (r.photo) auditorPhotos[r.auditor] = r.photo;
     });
     const auditsByAuditorMonth = Object.values(auditorMonthRows)
       .sort((a, b) => new Date(a._sort) - new Date(b._sort))
@@ -3415,6 +3418,7 @@ app.get('/api/graphs', auth, async (req, res) => {
       })),
       audits_by_auditor_month: auditsByAuditorMonth,
       auditors,
+      auditor_photos: auditorPhotos,
       audits_by_auditor_project: auditsByAuditorProjectOut,
       audit_projects: auditProjects,
     });

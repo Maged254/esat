@@ -3119,28 +3119,28 @@ app.get('/api/graphs', auth, async (req, res) => {
   try {
     const graphProjects = await getProjectFilter(req.user);
     const graphClients = await getClientFilter(req.user);
-    const requestedProject = String(req.query.project || '').trim();
-    const requestedClient = String(req.query.client || '').trim();
+    const requestedProjects = String(req.query.project || '').split(',').map(s => s.trim()).filter(Boolean);
+    const requestedClients = String(req.query.client || '').split(',').map(s => s.trim()).filter(Boolean);
 
-    if (requestedProject && graphProjects !== null && !graphProjects.includes(requestedProject)) {
+    if (requestedProjects.length && graphProjects !== null && !requestedProjects.every(p => graphProjects.includes(p))) {
       return res.status(403).json({ error: 'Project is outside your permitted access' });
     }
-    if (requestedClient && graphClients !== null && !graphClients.includes(requestedClient)) {
+    if (requestedClients.length && graphClients !== null && !requestedClients.every(c => graphClients.includes(c))) {
       return res.status(403).json({ error: 'Client is outside your permitted access' });
     }
 
     const scopeParams = [];
     const scopeConditions = [];
-    if (requestedProject) {
-      scopeParams.push(requestedProject);
-      scopeConditions.push(`COALESCE(e.project, c.project) = $${scopeParams.length}`);
+    if (requestedProjects.length) {
+      scopeParams.push(requestedProjects);
+      scopeConditions.push(`COALESCE(e.project, c.project) = ANY($${scopeParams.length}::text[])`);
     } else if (graphProjects !== null) {
       scopeParams.push(graphProjects);
       scopeConditions.push(`COALESCE(e.project, c.project) = ANY($${scopeParams.length}::text[])`);
     }
-    if (requestedClient) {
-      scopeParams.push(requestedClient);
-      scopeConditions.push(`COALESCE(e.client, c.client) = $${scopeParams.length}`);
+    if (requestedClients.length) {
+      scopeParams.push(requestedClients);
+      scopeConditions.push(`COALESCE(e.client, c.client) = ANY($${scopeParams.length}::text[])`);
     } else if (graphClients !== null) {
       scopeParams.push(graphClients);
       scopeConditions.push(`COALESCE(e.client, c.client) = ANY($${scopeParams.length}::text[])`);
@@ -3380,7 +3380,7 @@ app.get('/api/graphs', auth, async (req, res) => {
         projects: filterOptions.rows[0]?.projects || [],
         clients: filterOptions.rows[0]?.clients || [],
       },
-      active_filters: { project: requestedProject, client: requestedClient },
+      active_filters: { project: requestedProjects, client: requestedClients },
       audits_by_month: auditsByMonth.rows.map(r => ({ month: r.month, count: parseInt(r.count), audits_count: parseInt(r.audits_count), requests_count: parseInt(r.requests_count) })),
       ncr_by_month: ncrByMonth.rows.map(r => ({ month: r.month, created: parseInt(r.created), resolved: parseInt(r.resolved) })),
       ppe_stage_delays_by_month: ppeStageDelays.rows.map(r => ({

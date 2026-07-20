@@ -1973,6 +1973,7 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
     const params = [];
 
     if (status === 'pda_pending') { q += ` AND r.status='ehs_purchase_requested' AND p.needs_pda=true`; }
+    else if (status === 'pending_scm') { q += ` AND (r.status='pda_approved' OR (r.status='ehs_purchase_requested' AND NOT (p.needs_pda=true AND r.pda_approved_date IS NULL)))`; }
     else if (status === 'ehs_purchase_requested') { q += ` AND r.status='ehs_purchase_requested' AND NOT (p.needs_pda=true AND r.pda_approved_date IS NULL)`; }
     else if (status) { params.push(status); q += ` AND r.status=$${params.length}`; }
 
@@ -2037,9 +2038,9 @@ app.get('/api/ppe-requests/stats', auth, async (req, res) => {
         MIN(r.date_flagged) FILTER (WHERE r.status='pending') as pending_ehs_oldest,
         COUNT(*) FILTER (WHERE r.status='ehs_purchase_requested' AND p.needs_pda=true) as pending_pm,
         MIN(r.date_purchase_requested) FILTER (WHERE r.status='ehs_purchase_requested' AND p.needs_pda=true) as pending_pm_oldest,
-        COUNT(*) FILTER (WHERE r.status='ehs_purchase_requested' AND NOT (p.needs_pda=true AND r.pda_approved_date IS NULL)) as pending_scm,
+        COUNT(*) FILTER (WHERE r.status='pda_approved' OR (r.status='ehs_purchase_requested' AND NOT (p.needs_pda=true AND r.pda_approved_date IS NULL))) as pending_scm,
         MIN(CASE WHEN p.needs_pda THEN r.pda_approved_date ELSE r.date_purchase_requested END)
-          FILTER (WHERE r.status='ehs_purchase_requested' AND NOT (p.needs_pda=true AND r.pda_approved_date IS NULL)) as pending_scm_oldest,
+          FILTER (WHERE r.status='pda_approved' OR (r.status='ehs_purchase_requested' AND NOT (p.needs_pda=true AND r.pda_approved_date IS NULL))) as pending_scm_oldest,
         COUNT(*) FILTER (WHERE r.status='scm_ordered') as pending_suppliers,
         MIN(r.date_ordered) FILTER (WHERE r.status='scm_ordered') as pending_suppliers_oldest,
         COUNT(*) FILTER (WHERE r.status='warehouse_available') as pending_projects,

@@ -3182,7 +3182,8 @@ app.get('/api/graphs', auth, async (req, res) => {
         SELECT COALESCE(e.full_name, c.full_name) as employee_name,
                p.name as item_name,
                COUNT(r.id) as request_count,
-               MAX(r.date_flagged) as last_flagged
+               MAX(r.date_flagged) as last_flagged,
+               ARRAY_AGG(r.date_flagged ORDER BY r.date_flagged DESC) as flagged_dates
         FROM ppe_requests r
         LEFT JOIN employees e ON e.id = r.employee_id
         LEFT JOIN casuals c ON c.id = r.casual_id
@@ -3415,6 +3416,7 @@ app.get('/api/graphs', auth, async (req, res) => {
         item: r.item_name,
         count: parseInt(r.request_count),
         last_flagged: r.last_flagged,
+        flagged_dates: r.flagged_dates,
       })),
       filter_options: {
         projects: filterOptions.rows[0]?.projects || [],

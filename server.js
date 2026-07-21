@@ -3166,7 +3166,7 @@ app.get('/api/graphs', auth, async (req, res) => {
     }
     const accessWhere = accessConditions.length ? `WHERE ${accessConditions.join(' AND ')}` : '';
 
-    const [ppeByEmployee, auditsByMonth, ncrByMonth, ppeStageDelays, filterOptions, auditsByAuditor, auditsByAuditorProject] = await Promise.all([
+    const [ppeByEmployee, ppeRepeatedByEmployee, auditsByMonth, ncrByMonth, ppeStageDelays, filterOptions, auditsByAuditor, auditsByAuditorProject] = await Promise.all([
       pool.query(`
         SELECT COALESCE(e.full_name, c.full_name) as employee_name, COUNT(r.id) as ppe_count
         FROM ppe_requests r
@@ -3177,6 +3177,23 @@ app.get('/api/graphs', auth, async (req, res) => {
         GROUP BY COALESCE(e.id, c.id), COALESCE(e.full_name, c.full_name)
         ORDER BY ppe_count DESC
         LIMIT 20
+      `, scopeParams),
+      pool.query(`
+        SELECT COALESCE(e.full_name, c.full_name) as employee_name,
+               p.name as item_name,
+               COUNT(r.id) as request_count,
+               MAX(r.date_flagged) as last_flagged
+        FROM ppe_requests r
+        LEFT JOIN employees e ON e.id = r.employee_id
+        LEFT JOIN casuals c ON c.id = r.casual_id
+        LEFT JOIN ppe_items p ON p.id = r.ppe_item_id
+        WHERE COALESCE(e.employment_status, c.employment_status) = 'active'
+          AND r.date_flagged >= NOW() - INTERVAL '12 months'
+        ${scopeWhere}
+        GROUP BY COALESCE(e.id, c.id), COALESCE(e.full_name, c.full_name), p.id, p.name
+        HAVING COUNT(r.id) > 1
+        ORDER BY request_count DESC, employee_name ASC
+        LIMIT 200
       `, scopeParams),
       pool.query(`
         SELECT TO_CHAR(DATE_TRUNC('month', a.audit_date), 'Mon YYYY') as month,
@@ -3393,6 +3410,12 @@ app.get('/api/graphs', auth, async (req, res) => {
     res.json({
       ppe_by_employee: ppeByEmployee.rows.map(r => ({ name: r.employee_name, count: parseInt(r.ppe_count) })),
       ppe_average: avg,
+      ppe_repeat_items: ppeRepeatedByEmployee.rows.map(r => ({
+        employee: r.employee_name,
+        item: r.item_name,
+        count: parseInt(r.request_count),
+        last_flagged: r.last_flagged,
+      })),
       filter_options: {
         projects: filterOptions.rows[0]?.projects || [],
         clients: filterOptions.rows[0]?.clients || [],

@@ -223,6 +223,17 @@ async function setupDB() {
     await client.query('ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS distribution_method VARCHAR(50)');
     await client.query('ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS courier_tracking_number VARCHAR(200)');
 
+    // Backfill: requests that were canceled by an exit before 'exit' existed
+    // as its own status should read as Exit, not Canceled. Safe to re-run --
+    // once relabeled they no longer match status='canceled'.
+    await client.query(`
+      UPDATE ppe_requests SET status='exit', updated_at=NOW()
+      WHERE status='canceled' AND (
+        employee_id IN (SELECT id FROM employees WHERE employment_status='exit')
+        OR casual_id IN (SELECT id FROM casuals WHERE employment_status='exit')
+      )
+    `);
+
     // Ensure location_id column exists on audits
     await client.query('ALTER TABLE audits ADD COLUMN IF NOT EXISTS location_id INTEGER REFERENCES locations(id)');
 

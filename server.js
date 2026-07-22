@@ -584,9 +584,9 @@ app.get('/api/dashboard', auth, async (req, res) => {
           MAX(CASE WHEN status='ehs_purchase_requested' THEN CURRENT_DATE - date_purchase_requested::date END) as scm_delay,
           MAX(CASE WHEN status='scm_ordered' THEN CURRENT_DATE - date_ordered::date END) as suppliers_delay,
           MAX(CASE WHEN status='warehouse_available' THEN CURRENT_DATE - date_available::date END) as projects_delay,
-          MAX(CASE WHEN status NOT IN ('distributed','resolved','canceled') THEN CURRENT_DATE - date_flagged::date END) as total_delay
+          MAX(CASE WHEN status NOT IN ('distributed','resolved','canceled','exit') THEN CURRENT_DATE - date_flagged::date END) as total_delay
         FROM ppe_requests
-        WHERE status NOT IN ('distributed','resolved','canceled')
+        WHERE status NOT IN ('distributed','resolved','canceled','exit')
       `),
       pool.query(`SELECT a.id,a.audit_date,a.overall_status,COALESCE(e.full_name,c.full_name) as employee_name,e.employee_number,COALESCE(e.national_id,c.national_id) as national_id,e.department,COALESCE(e.project,c.project) as project,u.full_name as audited_by_name,COUNT(ai.id) as total_items,COUNT(CASE WHEN ai.condition!='good' THEN 1 END) as issues_count FROM audits a LEFT JOIN employees e ON e.id=a.employee_id LEFT JOIN casuals c ON c.id=a.casual_id JOIN users u ON u.id=a.audited_by LEFT JOIN audit_items ai ON ai.audit_id=a.id GROUP BY a.id,e.full_name,c.full_name,e.employee_number,e.national_id,c.national_id,e.department,e.project,c.project,u.full_name ORDER BY a.created_at DESC LIMIT 5`)
     ]);
@@ -939,26 +939,40 @@ app.post('/api/employees', auth, async (req, res) => {
   resource_type = resource_type?.toLowerCase();
   employment_status = employment_status?.toLowerCase();
 
+  const dbClient = await pool.connect();
   try {
     // Upsert: if national_id exists, update instead of insert
     if (national_id) {
-      const existing = await pool.query('SELECT id FROM employees WHERE national_id=$1', [national_id]);
+      const existing = await dbClient.query('SELECT id FROM employees WHERE national_id=$1', [national_id]);
       if (existing.rows.length > 0) {
-        const { rows } = await pool.query(
+        await dbClient.query('BEGIN');
+        const { rows } = await dbClient.query(
           `UPDATE employees SET full_name=$1, job_title=$2, department=$3, project=$4, client=$5, organization=$6, resource_type=$7, employment_status=$8 WHERE national_id=$9 RETURNING *`,
           [full_name, job_title, department, project, client, organization, resource_type, employment_status || 'active', national_id]
         );
+        const empId = rows[0].id;
+        // Employment status can flip to 'exit' via automated sync (e.g. ETMS),
+        // not just the admin exit dialog -- cascade the same way here so
+        // synced exits also close out any open PPE requests.
+        if (employment_status === 'exit') {
+          await dbClient.query(`UPDATE ppe_requests SET status='exit', updated_at=NOW() WHERE employee_id=$1 AND status NOT IN ('distributed','canceled','exit')`, [empId]);
+          await dbClient.query(`UPDATE ncr_items SET status='canceled', updated_at=NOW() WHERE employee_id=$1 AND status NOT IN ('resolved','canceled')`, [empId]);
+        }
+        await dbClient.query('COMMIT');
         broadcastEmployeesChanged();
         return res.json(rows[0]);
       }
     }
     const empNumber = employee_number || national_id || ('EMP-' + Date.now());
-    const { rows } = await pool.query(`INSERT INTO employees (employee_number,full_name,national_id,job_title,department,project,client,organization,resource_type,employment_status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`, [empNumber, full_name, national_id, job_title, department, project, client, organization, resource_type, employment_status || 'active']);
+    const { rows } = await dbClient.query(`INSERT INTO employees (employee_number,full_name,national_id,job_title,department,project,client,organization,resource_type,employment_status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`, [empNumber, full_name, national_id, job_title, department, project, client, organization, resource_type, employment_status || 'active']);
     broadcastEmployeesChanged();
     res.status(201).json(rows[0]);
   } catch(e) {
+    await dbClient.query('ROLLBACK').catch(()=>{});
     if (e.code === '23505') return res.status(409).json({ error: 'Employee number exists' });
     res.status(500).json({ error: 'Server error' });
+  } finally {
+    dbClient.release();
   }
 });
 
@@ -975,7 +989,7 @@ app.put('/api/employees/:id/status', auth, async (req, res) => {
     await client.query('BEGIN');
     await client.query('UPDATE employees SET employment_status=$1, exit_date=$2, updated_at=NOW() WHERE id=$3', [employment_status, exit_date || null, req.params.id]);
     if (employment_status === 'exit') {
-      await client.query(`UPDATE ppe_requests SET status='canceled', updated_at=NOW() WHERE employee_id=$1 AND status NOT IN ('distributed','canceled')`, [req.params.id]);
+      await client.query(`UPDATE ppe_requests SET status='exit', updated_at=NOW() WHERE employee_id=$1 AND status NOT IN ('distributed','canceled','exit')`, [req.params.id]);
       await client.query(`UPDATE ncr_items SET status='canceled', updated_at=NOW() WHERE employee_id=$1 AND status NOT IN ('resolved','canceled')`, [req.params.id]);
     }
     await client.query('COMMIT');
@@ -1134,7 +1148,7 @@ app.put('/api/casuals/:id/status', auth, async (req, res) => {
     await client_db.query('BEGIN');
     await client_db.query('UPDATE casuals SET employment_status=$1, exit_date=$2, updated_at=NOW(), last_edited_by=$3 WHERE id=$4', [employment_status, exit_date || null, req.user.id, req.params.id]);
     if (employment_status === 'exit') {
-      await client_db.query(`UPDATE ppe_requests SET status='canceled' WHERE casual_id=$1 AND status NOT IN ('distributed','resolved','canceled')`, [req.params.id]);
+      await client_db.query(`UPDATE ppe_requests SET status='exit' WHERE casual_id=$1 AND status NOT IN ('distributed','resolved','canceled','exit')`, [req.params.id]);
     }
     await client_db.query('COMMIT');
     const { rows } = await pool.query('SELECT * FROM casuals WHERE id=$1', [req.params.id]);
@@ -1471,8 +1485,8 @@ app.post('/api/audits', auth, async (req, res) => {
         // Skip if open PPE request already exists for this person + PPE item
         const { rows: existing } = await client.query(
           employee_id
-            ? `SELECT id FROM ppe_requests WHERE employee_id=$1 AND ppe_item_id=$2 AND status NOT IN ('distributed','resolved','canceled')`
-            : `SELECT id FROM ppe_requests WHERE casual_id=$1 AND ppe_item_id=$2 AND status NOT IN ('distributed','resolved','canceled')`,
+            ? `SELECT id FROM ppe_requests WHERE employee_id=$1 AND ppe_item_id=$2 AND status NOT IN ('distributed','resolved','canceled','exit')`
+            : `SELECT id FROM ppe_requests WHERE casual_id=$1 AND ppe_item_id=$2 AND status NOT IN ('distributed','resolved','canceled','exit')`,
           [employee_id || casual_id, item.ppe_item_id]
         );
         if (existing.length === 0) {
@@ -1510,7 +1524,7 @@ app.put('/api/audits/:id', auth, async (req, res) => {
       `SELECT pr.id FROM ppe_requests pr
        JOIN ncr_items n ON n.id = pr.ncr_item_id
        JOIN audit_items ai ON ai.id = n.audit_item_id
-       WHERE ai.audit_id=$1 AND pr.status NOT IN ('pending','canceled')`,
+       WHERE ai.audit_id=$1 AND pr.status NOT IN ('pending','canceled','exit')`,
       [id]
     );
     if (blocked.length > 0) return res.status(403).json({ error: 'This request has already been actioned by EHS. Contact an admin to make changes.' });
@@ -1584,7 +1598,7 @@ app.put('/api/audits/:id', auth, async (req, res) => {
             [existingAI.id]
           );
           for (const ncr of ncrRows) {
-            if (!isAdmin && ncr.status && !['pending','canceled'].includes(ncr.status)) {
+            if (!isAdmin && ncr.status && !['pending','canceled','exit'].includes(ncr.status)) {
               throw new Error(`Cannot remove ${item.ppe_item_id} — PPE request already actioned (${ncr.status}).`);
             }
             if (ncr.pr_id) await client.query('DELETE FROM ppe_requests WHERE id=$1', [ncr.pr_id]);
@@ -1597,7 +1611,7 @@ app.put('/api/audits/:id', auth, async (req, res) => {
           const personCol = existing.employee_id ? 'employee_id' : 'casual_id';
           const personId = existing.employee_id || existing.casual_id;
           const { rows: openReqs } = await client.query(
-            `SELECT id FROM ppe_requests WHERE ${personCol}=$1 AND ppe_item_id=$2 AND status NOT IN ('distributed','resolved','canceled')`,
+            `SELECT id FROM ppe_requests WHERE ${personCol}=$1 AND ppe_item_id=$2 AND status NOT IN ('distributed','resolved','canceled','exit')`,
             [personId, item.ppe_item_id]
           );
           if (openReqs.length === 0) {
@@ -1643,7 +1657,7 @@ app.put('/api/audits/:id', auth, async (req, res) => {
           const personCol = existing.employee_id ? 'employee_id' : 'casual_id';
           const personId = existing.employee_id || existing.casual_id;
           const { rows: openReqs } = await client.query(
-            `SELECT id FROM ppe_requests WHERE ${personCol}=$1 AND ppe_item_id=$2 AND status NOT IN ('distributed','resolved','canceled')`,
+            `SELECT id FROM ppe_requests WHERE ${personCol}=$1 AND ppe_item_id=$2 AND status NOT IN ('distributed','resolved','canceled','exit')`,
             [personId, item.ppe_item_id]
           );
           if (openReqs.length === 0) {
@@ -2012,6 +2026,7 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
           WHEN 'warehouse_available' THEN 4
           WHEN 'distributed' THEN 5
           WHEN 'canceled' THEN 6
+          WHEN 'exit' THEN 6
           ELSE 7
         END,
         r.date_flagged DESC`;

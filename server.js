@@ -644,7 +644,12 @@ app.get('/api/employees', auth, async (req, res) => {
     if (san === 'no') { q += ` AND e.san = FALSE`; }
     if (job_title) { params.push(`%${job_title}%`); q += ` AND e.job_title ILIKE $${params.length}`; }
     if (department) { params.push(department); q += ` AND e.department=$${params.length}`; }
-    if (resource_type) { params.push(resource_type); q += ` AND e.resource_type=$${params.length}`; }
+    // 'intern' isn't a real resource_type value -- interns are stored as
+    // resource_type='inhouse' and identified by job title. 'inhouse' has to
+    // explicitly exclude them so the two stat-card filters stay disjoint.
+    if (resource_type === 'intern') { q += ` AND e.job_title ILIKE '%intern%'`; }
+    else if (resource_type === 'inhouse') { q += ` AND e.resource_type='inhouse' AND e.job_title NOT ILIKE '%intern%'`; }
+    else if (resource_type) { params.push(resource_type); q += ` AND e.resource_type=$${params.length}`; }
     const empProjects = await getProjectFilter(req.user);
     if (empProjects !== null) {
       if (empProjects.length === 0) { return res.json(paginate ? { rows: [], total: 0, page: pageNum, pageSize: limit } : []); }
@@ -680,9 +685,9 @@ app.get('/api/employees/stats', auth, async (req, res) => {
   }
   try {
     const { status, search, national_id, project, client, san, job_title, department, resource_type, audit_age } = req.query;
-    const zero = { total_active: 0, inhouse: 0, outsource: 0, exits: 0 };
+    const zero = { total_active: 0, inhouse: 0, outsource: 0, interns: 0, exits: 0 };
     let q = `WITH scoped AS (
-        SELECT e.employment_status, e.resource_type,
+        SELECT e.employment_status, e.resource_type, e.job_title,
           CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as days_since_audit
         FROM employees e
         LEFT JOIN audits a ON a.employee_id=e.id
@@ -697,7 +702,12 @@ app.get('/api/employees/stats', auth, async (req, res) => {
     if (san === 'no') { q += ` AND e.san = FALSE`; }
     if (job_title) { params.push(`%${job_title}%`); q += ` AND e.job_title ILIKE $${params.length}`; }
     if (department) { params.push(department); q += ` AND e.department=$${params.length}`; }
-    if (resource_type) { params.push(resource_type); q += ` AND e.resource_type=$${params.length}`; }
+    // 'intern' isn't a real resource_type value -- interns are stored as
+    // resource_type='inhouse' and identified by job title. 'inhouse' has to
+    // explicitly exclude them so the two stat-card filters stay disjoint.
+    if (resource_type === 'intern') { q += ` AND e.job_title ILIKE '%intern%'`; }
+    else if (resource_type === 'inhouse') { q += ` AND e.resource_type='inhouse' AND e.job_title NOT ILIKE '%intern%'`; }
+    else if (resource_type) { params.push(resource_type); q += ` AND e.resource_type=$${params.length}`; }
     const empProjects = await getProjectFilter(req.user);
     if (empProjects !== null) {
       if (empProjects.length === 0) return res.json(zero);
@@ -712,8 +722,9 @@ app.get('/api/employees/stats', auth, async (req, res) => {
       )
       SELECT
         COUNT(*) FILTER (WHERE employment_status='active') as total_active,
-        COUNT(*) FILTER (WHERE resource_type='inhouse') as inhouse,
+        COUNT(*) FILTER (WHERE resource_type='inhouse' AND job_title NOT ILIKE '%intern%') as inhouse,
         COUNT(*) FILTER (WHERE resource_type='outsource') as outsource,
+        COUNT(*) FILTER (WHERE job_title ILIKE '%intern%') as interns,
         COUNT(*) FILTER (WHERE employment_status='exit') as exits
       FROM scoped WHERE 1=1`;
     if (audit_age === '1month') q += ` AND days_since_audit <= 30`;
@@ -721,7 +732,7 @@ app.get('/api/employees/stats', auth, async (req, res) => {
     else if (audit_age === 'over2months') q += ` AND (days_since_audit IS NULL OR days_since_audit > 60)`;
     const { rows } = await pool.query(q, params);
     const r = rows[0];
-    res.json({ total_active: parseInt(r.total_active)||0, inhouse: parseInt(r.inhouse)||0, outsource: parseInt(r.outsource)||0, exits: parseInt(r.exits)||0 });
+    res.json({ total_active: parseInt(r.total_active)||0, inhouse: parseInt(r.inhouse)||0, outsource: parseInt(r.outsource)||0, interns: parseInt(r.interns)||0, exits: parseInt(r.exits)||0 });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 

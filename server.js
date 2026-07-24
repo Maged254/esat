@@ -594,9 +594,11 @@ app.get('/api/dashboard', auth, async (req, res) => {
       pool.query(`SELECT COUNT(*) FILTER (WHERE employment_status='active') as active, COUNT(*) FILTER (WHERE employment_status='exit' AND exit_date >= date_trunc('year',NOW())) as exits_this_year FROM employees`),
       pool.query(`SELECT COUNT(*) as overdue FROM employees e LEFT JOIN (SELECT employee_id, MAX(audit_date) as last_audit FROM audits WHERE employee_present = TRUE AND is_deleted IS NOT TRUE GROUP BY employee_id) a ON e.id=a.employee_id WHERE e.employment_status='active' AND e.san=TRUE AND (a.last_audit IS NULL OR CURRENT_DATE - a.last_audit > 30)`),
       pool.query(`SELECT COUNT(*) FILTER (WHERE status!='resolved') as open, COUNT(*) FILTER (WHERE status='pending') as pending FROM ncr_items`),
-      // Item x month matrix for the NCR heat map -- top 8 items by total NCRs
+      // Item x month matrix for the NCR heat map -- top 20 items by total NCRs
       // raised in the last 6 months (not just currently-open ones, so the
       // heat map reflects real occurrence history rather than a snapshot).
+      // The dashboard card is full-width now, so it can afford more columns
+      // than the old 8-item cap.
       pool.query(`
         WITH item_totals AS (
           SELECT p.id, p.name, COUNT(*) as total
@@ -604,7 +606,7 @@ app.get('/api/dashboard', auth, async (req, res) => {
           WHERE n.status != 'canceled' AND n.created_at >= NOW() - INTERVAL '6 months'
           GROUP BY p.id, p.name
           ORDER BY total DESC
-          LIMIT 8
+          LIMIT 20
         )
         SELECT it.name as ppe_name, it.total,
                TO_CHAR(DATE_TRUNC('month', n.created_at), 'Mon YYYY') as month,

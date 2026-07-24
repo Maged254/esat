@@ -1861,7 +1861,7 @@ app.put('/api/ncr/:id/status', auth, async (req, res) => {
     const skippingPda = current.needs_pda
       && current.status === 'ehs_purchase_requested'
       && !current.pda_approved_date
-      && ['scm_ordered', 'warehouse_available', 'distributed'].includes(status);
+      && ['scm_ordered', 'warehouse_available', 'warehouse_unavailable', 'distributed'].includes(status);
     if (skippingPda) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'This PPE item requires Project Director Approval before it can move to SCM Ordered' });
@@ -2046,6 +2046,7 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
           WHEN 'ehs_purchase_requested' THEN 2
           WHEN 'scm_ordered' THEN 3
           WHEN 'warehouse_available' THEN 4
+          WHEN 'warehouse_unavailable' THEN 4
           WHEN 'distributed' THEN 5
           WHEN 'canceled' THEN 6
           WHEN 'exit' THEN 6
@@ -2181,7 +2182,7 @@ app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
     const skippingPda = current.needs_pda
       && current.status === 'ehs_purchase_requested'
       && !current.pda_approved_date
-      && ['scm_ordered', 'warehouse_available', 'distributed'].includes(status);
+      && ['scm_ordered', 'warehouse_available', 'warehouse_unavailable', 'distributed'].includes(status);
     if (skippingPda) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'This PPE item requires Project Director Approval before it can move to SCM Ordered' });
@@ -2195,7 +2196,9 @@ app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
     if (status === 'ehs_purchase_requested') extraFields = ', date_purchase_requested=NOW(), purchase_requested_by=$3';
     if (status === 'pda_approved') extraFields = ', pda_approved_date=NOW(), pda_approved_by=$3';
     if (status === 'scm_ordered') { extraParams.push(req.user.id); extraFields = ', date_ordered=NOW(), ordered_by=$3, po_number=$4'; extraParams.push(req.body.po_number || null); }
-    if (status === 'warehouse_available') extraFields = ', date_available=NOW(), available_by=$3, date_ordered=COALESCE(date_ordered,NOW()), ordered_by=COALESCE(ordered_by,$3)';
+    // Reuse the same date_available/available_by pair for both outcomes --
+    // it marks *when the warehouse was checked*, not that stock was found.
+    if (status === 'warehouse_available' || status === 'warehouse_unavailable') extraFields = ', date_available=NOW(), available_by=$3, date_ordered=COALESCE(date_ordered,NOW()), ordered_by=COALESCE(ordered_by,$3)';
     if (status === 'distributed') {
       extraParams.push(req.user.id); // $3
       extraFields = ', date_distributed=NOW(), distributed_by=$3, date_available=COALESCE(date_available,NOW()), available_by=COALESCE(available_by,$3), date_ordered=COALESCE(date_ordered,NOW()), ordered_by=COALESCE(ordered_by,$3)';

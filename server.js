@@ -594,7 +594,28 @@ app.get('/api/dashboard', auth, async (req, res) => {
       pool.query(`SELECT COUNT(*) FILTER (WHERE employment_status='active') as active, COUNT(*) FILTER (WHERE employment_status='exit' AND exit_date >= date_trunc('year',NOW())) as exits_this_year FROM employees`),
       pool.query(`SELECT COUNT(*) as overdue FROM employees e LEFT JOIN (SELECT employee_id, MAX(audit_date) as last_audit FROM audits WHERE employee_present = TRUE AND is_deleted IS NOT TRUE GROUP BY employee_id) a ON e.id=a.employee_id WHERE e.employment_status='active' AND e.san=TRUE AND (a.last_audit IS NULL OR CURRENT_DATE - a.last_audit > 30)`),
       pool.query(`SELECT COUNT(*) FILTER (WHERE status!='resolved') as open, COUNT(*) FILTER (WHERE status='pending') as pending FROM ncr_items`),
-      pool.query(`SELECT p.name as ppe_name, p.category, COUNT(*) as count FROM ncr_items n JOIN ppe_items p ON p.id=n.ppe_item_id WHERE n.status!='resolved' AND n.status!='canceled' GROUP BY p.name, p.category ORDER BY count DESC LIMIT 10`),
+      // Item x month matrix for the NCR heat map -- top 8 items by total NCRs
+      // raised in the last 6 months (not just currently-open ones, so the
+      // heat map reflects real occurrence history rather than a snapshot).
+      pool.query(`
+        WITH item_totals AS (
+          SELECT p.id, p.name, COUNT(*) as total
+          FROM ncr_items n JOIN ppe_items p ON p.id = n.ppe_item_id
+          WHERE n.status != 'canceled' AND n.created_at >= NOW() - INTERVAL '6 months'
+          GROUP BY p.id, p.name
+          ORDER BY total DESC
+          LIMIT 8
+        )
+        SELECT it.name as ppe_name, it.total,
+               TO_CHAR(DATE_TRUNC('month', n.created_at), 'Mon YYYY') as month,
+               DATE_TRUNC('month', n.created_at) as month_date,
+               COUNT(*) as count
+        FROM ncr_items n
+        JOIN item_totals it ON it.id = n.ppe_item_id
+        WHERE n.status != 'canceled' AND n.created_at >= NOW() - INTERVAL '6 months'
+        GROUP BY it.name, it.total, month_date, month
+        ORDER BY it.total DESC, month_date ASC
+      `),
       pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE overall_status='compliant') as compliant FROM audits WHERE audit_date >= date_trunc('month',NOW()) AND is_deleted IS NOT TRUE`),
       pool.query(`
         SELECT
@@ -609,10 +630,29 @@ app.get('/api/dashboard', auth, async (req, res) => {
       pool.query(`SELECT a.id,a.audit_date,a.overall_status,COALESCE(e.full_name,c.full_name) as employee_name,e.employee_number,COALESCE(e.national_id,c.national_id) as national_id,e.department,COALESCE(e.project,c.project) as project,u.full_name as audited_by_name,COUNT(ai.id) as total_items,COUNT(CASE WHEN ai.condition!='good' THEN 1 END) as issues_count FROM audits a LEFT JOIN employees e ON e.id=a.employee_id LEFT JOIN casuals c ON c.id=a.casual_id JOIN users u ON u.id=a.audited_by LEFT JOIN audit_items ai ON ai.audit_id=a.id GROUP BY a.id,e.full_name,c.full_name,e.employee_number,e.national_id,c.national_id,e.department,e.project,c.project,u.full_name ORDER BY a.created_at DESC LIMIT 5`)
     ]);
     const c = comp.rows[0];
+    // Pivot the item/month rows into a fixed 6-column grid -- generated
+    // independently of the query results so months with zero NCRs still
+    // show up as a (zero-filled) column instead of leaving a gap.
+    const heatmapMonths = [];
+    const now = new Date();
+    for (let i = 5; i >= 0; i--) {
+      heatmapMonths.push(new Date(now.getFullYear(), now.getMonth() - i, 1).toLocaleString('en-US', { month: 'short', year: 'numeric' }));
+    }
+    const heatmapItems = new Map();
+    for (const row of ncrCat.rows) {
+      if (!heatmapItems.has(row.ppe_name)) heatmapItems.set(row.ppe_name, { ppe_name: row.ppe_name, total: parseInt(row.total), byMonth: {} });
+      heatmapItems.get(row.ppe_name).byMonth[row.month] = parseInt(row.count);
+    }
+    const ncrHeatmap = {
+      months: heatmapMonths,
+      items: [...heatmapItems.values()]
+        .sort((a, b) => b.total - a.total)
+        .map(it => ({ ppe_name: it.ppe_name, total: it.total, counts: heatmapMonths.map(m => it.byMonth[m] || 0) })),
+    };
     res.json({
       employees: { active: parseInt(emp.rows[0].active), exits_this_year: parseInt(emp.rows[0].exits_this_year) },
       overdue: parseInt(overdue.rows[0].overdue),
-      ncr: { open: parseInt(ncr.rows[0].open), pending: parseInt(ncr.rows[0].pending), by_category: ncrCat.rows },
+      ncr: { open: parseInt(ncr.rows[0].open), pending: parseInt(ncr.rows[0].pending), heatmap: ncrHeatmap },
       compliance_rate: c.total > 0 ? Math.round((c.compliant / c.total) * 100) : null,
       delays: {
         ehs: parseInt(delays.rows[0].ehs_delay) || 0,

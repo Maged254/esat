@@ -1976,7 +1976,7 @@ app.put('/api/ppe/:id', auth, async (req, res) => {
 
 app.get('/api/ppe-requests', auth, async (req, res) => {
   try {
-    const { status, search, national_id, po_number, warehouse, location, ppe, period, page, pageSize, export: isExport } = req.query;
+    const { status, search, national_id, job_title, resource_type, department, po_number, warehouse, location, ppe, period, page, pageSize, export: isExport } = req.query;
     const projects = req.query.projects ? req.query.projects.split(',').filter(Boolean) : [];
     const clients = req.query.clients ? req.query.clients.split(',').filter(Boolean) : [];
 
@@ -2036,9 +2036,16 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
 
     if (search) { params.push(`%${search}%`); q += ` AND COALESCE(e.full_name, c.full_name) ILIKE $${params.length}`; }
     if (national_id) { params.push(`%${national_id}%`); q += ` AND COALESCE(e.national_id, c.national_id) ILIKE $${params.length}`; }
+    if (job_title) { params.push(`%${job_title}%`); q += ` AND COALESCE(e.job_title, c.job_title) ILIKE $${params.length}`; }
     if (po_number) { params.push(`%${po_number}%`); q += ` AND r.po_number ILIKE $${params.length}`; }
     if (location) { params.push(location); q += ` AND l.name=$${params.length}`; }
     if (ppe) { params.push(ppe); q += ` AND p.name=$${params.length}`; }
+    // Casuals have no resource_type of their own -- 'casual' just means the
+    // request is for a casual worker at all, same convention as Audit History.
+    if (resource_type === 'casual') { q += ` AND r.casual_id IS NOT NULL`; }
+    else if (resource_type) { params.push(resource_type); q += ` AND e.resource_type=$${params.length}`; }
+    // Only employees carry a department; casual-linked requests never match.
+    if (department) { params.push(department); q += ` AND e.department=$${params.length}`; }
     if (projects.length) { params.push(projects); q += ` AND COALESCE(e.project, c.project) = ANY($${params.length})`; }
     if (clients.length) { params.push(clients); q += ` AND COALESCE(e.client, c.client) = ANY($${params.length})`; }
     if (period === 'current') { q += ` AND date_trunc('month', r.date_flagged) = date_trunc('month', NOW())`; }
@@ -2141,21 +2148,23 @@ app.get('/api/ppe-requests/filter-options', auth, async (req, res) => {
     let q = `SELECT
         ARRAY_AGG(DISTINCT p.name) FILTER (WHERE p.name IS NOT NULL) as ppe_names,
         ARRAY_AGG(DISTINCT COALESCE(e.project, c.project)) FILTER (WHERE COALESCE(e.project, c.project) IS NOT NULL) as projects,
-        ARRAY_AGG(DISTINCT COALESCE(e.client, c.client)) FILTER (WHERE COALESCE(e.client, c.client) IS NOT NULL) as clients
+        ARRAY_AGG(DISTINCT COALESCE(e.client, c.client)) FILTER (WHERE COALESCE(e.client, c.client) IS NOT NULL) as clients,
+        ARRAY_AGG(DISTINCT e.department) FILTER (WHERE e.department IS NOT NULL) as departments
       FROM ppe_requests r
       JOIN ppe_items p ON p.id=r.ppe_item_id
       LEFT JOIN employees e ON e.id=r.employee_id
       LEFT JOIN casuals c ON c.id=r.casual_id
       WHERE 1=1`;
     const params = [];
+    const zero = { ppe_names: [], projects: [], clients: [], departments: [] };
     const ppeProjects = await getProjectFilter(req.user);
     if (ppeProjects !== null) {
-      if (ppeProjects.length === 0) return res.json({ ppe_names: [], projects: [], clients: [] });
+      if (ppeProjects.length === 0) return res.json(zero);
       params.push(ppeProjects); q += ` AND COALESCE(e.project, c.project) = ANY($${params.length})`;
     }
     const ppeClients = await getClientFilter(req.user);
     if (ppeClients !== null) {
-      if (ppeClients.length === 0) return res.json({ ppe_names: [], projects: [], clients: [] });
+      if (ppeClients.length === 0) return res.json(zero);
       params.push(ppeClients); q += ` AND COALESCE(e.client, c.client) = ANY($${params.length})`;
     }
     const { rows } = await pool.query(q, params);
@@ -2163,6 +2172,7 @@ app.get('/api/ppe-requests/filter-options', auth, async (req, res) => {
       ppe_names: (rows[0].ppe_names || []).sort(),
       projects: (rows[0].projects || []).sort(),
       clients: (rows[0].clients || []).sort(),
+      departments: (rows[0].departments || []).sort(),
     });
   } catch(e) { sendError(res, e); }
 });

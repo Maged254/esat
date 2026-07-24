@@ -297,6 +297,13 @@ async function setupDB() {
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS ordered_by UUID REFERENCES users(id)");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS available_by UUID REFERENCES users(id)");
     await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS distributed_by UUID REFERENCES users(id)");
+
+    // Warehouse pre-check flag: settable at EHS Purchase Requested / Approved
+    // (PM) stage without moving the request's actual status, so the tracker's
+    // Warehouse column can show "unavailable" ahead of SCM ordering it.
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS warehouse_unavailable_flagged_at TIMESTAMPTZ");
+    await client.query("ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS warehouse_unavailable_flagged_by UUID REFERENCES users(id)");
+
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ");
     // Existing rows default to how they were actually uploaded: public 'upload'
@@ -2191,14 +2198,29 @@ app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Can only approve items currently at EHS Purchase Requested' });
     }
+    // Warehouse Unavailable here is a pre-check flag, not a real pipeline
+    // transition -- it only applies before SCM has ordered the item, and
+    // deliberately leaves `status` (and the Status column) untouched.
+    if (status === 'warehouse_unavailable') {
+      if (!['ehs_purchase_requested', 'pda_approved'].includes(current.status)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Warehouse Unavailable can only be flagged on items at EHS Purchase Requested or Approved (PM)' });
+      }
+      const { rows: [flagged] } = await client.query(
+        'UPDATE ppe_requests SET warehouse_unavailable_flagged_at=NOW(), warehouse_unavailable_flagged_by=$1, updated_at=NOW() WHERE id=$2 RETURNING *',
+        [req.user.id, req.params.id]
+      );
+      await client.query('COMMIT');
+      return res.json(flagged);
+    }
     let extraFields = '';
     let extraParams = [status, req.params.id];
     if (status === 'ehs_purchase_requested') extraFields = ', date_purchase_requested=NOW(), purchase_requested_by=$3';
     if (status === 'pda_approved') extraFields = ', pda_approved_date=NOW(), pda_approved_by=$3';
     if (status === 'scm_ordered') { extraParams.push(req.user.id); extraFields = ', date_ordered=NOW(), ordered_by=$3, po_number=$4'; extraParams.push(req.body.po_number || null); }
-    // Reuse the same date_available/available_by pair for both outcomes --
-    // it marks *when the warehouse was checked*, not that stock was found.
-    if (status === 'warehouse_available' || status === 'warehouse_unavailable') extraFields = ', date_available=NOW(), available_by=$3, date_ordered=COALESCE(date_ordered,NOW()), ordered_by=COALESCE(ordered_by,$3)';
+    // warehouse_unavailable never reaches here (handled above), so this only
+    // ever fires for the genuine "found it" outcome.
+    if (status === 'warehouse_available') extraFields = ', date_available=NOW(), available_by=$3, date_ordered=COALESCE(date_ordered,NOW()), ordered_by=COALESCE(ordered_by,$3)';
     if (status === 'distributed') {
       extraParams.push(req.user.id); // $3
       extraFields = ', date_distributed=NOW(), distributed_by=$3, date_available=COALESCE(date_available,NOW()), available_by=COALESCE(available_by,$3), date_ordered=COALESCE(date_ordered,NOW()), ordered_by=COALESCE(ordered_by,$3)';

@@ -3272,6 +3272,7 @@ app.get('/api/graphs', auth, async (req, res) => {
         LEFT JOIN ppe_items p ON p.id = r.ppe_item_id
         WHERE COALESCE(e.employment_status, c.employment_status) = 'active'
           AND r.date_flagged >= NOW() - INTERVAL '12 months'
+          AND r.status != 'canceled'
         ${scopeWhere}
         GROUP BY COALESCE(e.id, c.id), COALESCE(e.full_name, c.full_name), p.id, p.name
         HAVING COUNT(r.id) > 1

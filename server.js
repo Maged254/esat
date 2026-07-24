@@ -2029,7 +2029,9 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
     // Mirrors the tracker's Warehouse column logic: real pipeline outcomes
     // (available/distributed) win; otherwise the pre-check flag or a legacy
     // warehouse_unavailable status counts as unavailable; everything else
-    // hasn't been checked yet.
+    // hasn't been checked yet. Canceled/exited requests are excluded outright
+    // -- they're dead requests, not pending warehouse work.
+    if (warehouse) { q += ` AND r.status NOT IN ('canceled', 'exit')`; }
     if (warehouse === 'available') { q += ` AND r.status IN ('warehouse_available', 'distributed')`; }
     else if (warehouse === 'unavailable') { q += ` AND r.status NOT IN ('warehouse_available', 'distributed') AND (r.status = 'warehouse_unavailable' OR r.warehouse_unavailable_flagged_at IS NOT NULL)`; }
     else if (warehouse === 'not_checked') { q += ` AND r.status NOT IN ('warehouse_available', 'distributed', 'warehouse_unavailable') AND r.warehouse_unavailable_flagged_at IS NULL`; }

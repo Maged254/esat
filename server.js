@@ -1976,7 +1976,7 @@ app.put('/api/ppe/:id', auth, async (req, res) => {
 
 app.get('/api/ppe-requests', auth, async (req, res) => {
   try {
-    const { status, search, national_id, po_number, location, ppe, period, page, pageSize, export: isExport } = req.query;
+    const { status, search, national_id, po_number, warehouse, location, ppe, period, page, pageSize, export: isExport } = req.query;
     const projects = req.query.projects ? req.query.projects.split(',').filter(Boolean) : [];
     const clients = req.query.clients ? req.query.clients.split(',').filter(Boolean) : [];
 
@@ -2025,6 +2025,14 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
     else if (status === 'pending_scm') { q += ` AND (r.status='pda_approved' OR (r.status='ehs_purchase_requested' AND NOT (p.needs_pda=true AND r.pda_approved_date IS NULL)))`; }
     else if (status === 'ehs_purchase_requested') { q += ` AND r.status='ehs_purchase_requested' AND NOT (p.needs_pda=true AND r.pda_approved_date IS NULL)`; }
     else if (status) { params.push(status); q += ` AND r.status=$${params.length}`; }
+
+    // Mirrors the tracker's Warehouse column logic: real pipeline outcomes
+    // (available/distributed) win; otherwise the pre-check flag or a legacy
+    // warehouse_unavailable status counts as unavailable; everything else
+    // hasn't been checked yet.
+    if (warehouse === 'available') { q += ` AND r.status IN ('warehouse_available', 'distributed')`; }
+    else if (warehouse === 'unavailable') { q += ` AND r.status NOT IN ('warehouse_available', 'distributed') AND (r.status = 'warehouse_unavailable' OR r.warehouse_unavailable_flagged_at IS NOT NULL)`; }
+    else if (warehouse === 'not_checked') { q += ` AND r.status NOT IN ('warehouse_available', 'distributed', 'warehouse_unavailable') AND r.warehouse_unavailable_flagged_at IS NULL`; }
 
     if (search) { params.push(`%${search}%`); q += ` AND COALESCE(e.full_name, c.full_name) ILIKE $${params.length}`; }
     if (national_id) { params.push(`%${national_id}%`); q += ` AND COALESCE(e.national_id, c.national_id) ILIKE $${params.length}`; }

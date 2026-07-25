@@ -830,13 +830,14 @@ app.get('/api/audit-coverage', auth, async (req, res) => {
       });
     }
 
-    const { project, client } = req.query;
+    const requestedProjects = String(req.query.project || '').split(',').map(s => s.trim()).filter(Boolean);
+    const requestedClients = String(req.query.client || '').split(',').map(s => s.trim()).filter(Boolean);
     const params = [];
     let whereExtra = '';
     if (projectFilter !== null) { params.push(projectFilter); whereExtra += ` AND e.project = ANY($${params.length})`; }
     if (clientFilter !== null) { params.push(clientFilter); whereExtra += ` AND e.client = ANY($${params.length})`; }
-    if (project) { params.push(project); whereExtra += ` AND e.project = $${params.length}`; }
-    if (client) { params.push(client); whereExtra += ` AND e.client = $${params.length}`; }
+    if (requestedProjects.length) { params.push(requestedProjects); whereExtra += ` AND e.project = ANY($${params.length})`; }
+    if (requestedClients.length) { params.push(requestedClients); whereExtra += ` AND e.client = ANY($${params.length})`; }
 
     const baseCTE = `
       WITH last_audit AS (

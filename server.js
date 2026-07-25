@@ -823,7 +823,8 @@ app.get('/api/audit-coverage', auth, async (req, res) => {
     const clientFilter = await getClientFilter(req.user);
     if ((projectFilter !== null && projectFilter.length === 0) || (clientFilter !== null && clientFilter.length === 0)) {
       return res.json({
-        total_active: 0, san_count: 0, non_san_count: 0,
+        total_active: 0, san_count: 0, san_inhouse: 0, san_outsource: 0,
+        non_san_count: 0, non_san_inhouse: 0, non_san_outsource: 0,
         bucket_0_30: 0, bucket_31_60: 0, bucket_61_90: 0, bucket_90_plus: 0, never_audited: 0,
         overdue_total: 0, audit_rate: null, avg_days_since_audit: null,
         this_month_audited: 0, last_month_audited: 0, by_project: []
@@ -871,7 +872,11 @@ app.get('/api/audit-coverage', auth, async (req, res) => {
     const totalQ = pool.query(`
       SELECT COUNT(*) FILTER (WHERE e.employment_status='active' ${whereExtra}) as total_active,
         COUNT(*) FILTER (WHERE e.employment_status='active' AND e.san=TRUE ${whereExtra}) as san_count,
-        COUNT(*) FILTER (WHERE e.employment_status='active' AND e.san=FALSE ${whereExtra}) as non_san_count
+        COUNT(*) FILTER (WHERE e.employment_status='active' AND e.san=TRUE AND e.resource_type='inhouse' ${whereExtra}) as san_inhouse,
+        COUNT(*) FILTER (WHERE e.employment_status='active' AND e.san=TRUE AND e.resource_type='outsource' ${whereExtra}) as san_outsource,
+        COUNT(*) FILTER (WHERE e.employment_status='active' AND e.san=FALSE ${whereExtra}) as non_san_count,
+        COUNT(*) FILTER (WHERE e.employment_status='active' AND e.san=FALSE AND e.resource_type='inhouse' ${whereExtra}) as non_san_inhouse,
+        COUNT(*) FILTER (WHERE e.employment_status='active' AND e.san=FALSE AND e.resource_type='outsource' ${whereExtra}) as non_san_outsource
       FROM employees e
     `, params);
 
@@ -886,11 +891,11 @@ app.get('/api/audit-coverage', auth, async (req, res) => {
 
     const byProjectQ = pool.query(`
       ${baseCTE}
-      SELECT project,
+      SELECT project, client,
         COUNT(*) as san_total,
         COUNT(*) FILTER (WHERE days_since IS NULL OR days_since > 30) as overdue
       FROM san_emp
-      GROUP BY project
+      GROUP BY project, client
       ORDER BY overdue DESC
     `, params);
 
@@ -904,7 +909,11 @@ app.get('/api/audit-coverage', auth, async (req, res) => {
     res.json({
       total_active: parseInt(t.total_active) || 0,
       san_count: parseInt(t.san_count) || 0,
+      san_inhouse: parseInt(t.san_inhouse) || 0,
+      san_outsource: parseInt(t.san_outsource) || 0,
       non_san_count: parseInt(t.non_san_count) || 0,
+      non_san_inhouse: parseInt(t.non_san_inhouse) || 0,
+      non_san_outsource: parseInt(t.non_san_outsource) || 0,
       bucket_0_30: auditedWithin30,
       bucket_31_60: parseInt(c.bucket_31_60) || 0,
       bucket_61_90: parseInt(c.bucket_61_90) || 0,
@@ -915,7 +924,7 @@ app.get('/api/audit-coverage', auth, async (req, res) => {
       avg_days_since_audit: c.avg_days_since_audit !== null ? parseInt(c.avg_days_since_audit) : null,
       this_month_audited: parseInt(m.this_month) || 0,
       last_month_audited: parseInt(m.last_month) || 0,
-      by_project: byProject.rows.map(r => ({ project: r.project, san_total: parseInt(r.san_total), overdue: parseInt(r.overdue) }))
+      by_project: byProject.rows.map(r => ({ project: r.project, client: r.client, san_total: parseInt(r.san_total), overdue: parseInt(r.overdue) }))
     });
   } catch(e) { sendError(res, e); }
 });

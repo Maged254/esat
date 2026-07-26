@@ -234,6 +234,17 @@ async function setupDB() {
       )
     `);
 
+    // Same backfill for NCR items: those canceled by an exit should read as
+    // Exit, matching the PPE tracker. Keys off the current exit population,
+    // so it stays correct as more people exit. Safe to re-run.
+    await client.query(`
+      UPDATE ncr_items SET status='exit', updated_at=NOW()
+      WHERE status='canceled' AND (
+        employee_id IN (SELECT id FROM employees WHERE employment_status='exit')
+        OR casual_id IN (SELECT id FROM casuals WHERE employment_status='exit')
+      )
+    `);
+
     // Ensure location_id column exists on audits
     await client.query('ALTER TABLE audits ADD COLUMN IF NOT EXISTS location_id INTEGER REFERENCES locations(id)');
 
@@ -1037,7 +1048,7 @@ app.post('/api/employees', auth, async (req, res) => {
         // synced exits also close out any open PPE requests.
         if (employment_status === 'exit') {
           await dbClient.query(`UPDATE ppe_requests SET status='exit', updated_at=NOW() WHERE employee_id=$1 AND status NOT IN ('distributed','canceled','exit')`, [empId]);
-          await dbClient.query(`UPDATE ncr_items SET status='canceled', updated_at=NOW() WHERE employee_id=$1 AND status NOT IN ('resolved','canceled')`, [empId]);
+          await dbClient.query(`UPDATE ncr_items SET status='exit', updated_at=NOW() WHERE employee_id=$1 AND status NOT IN ('resolved','distributed','canceled','exit')`, [empId]);
         }
         await dbClient.query('COMMIT');
         broadcastEmployeesChanged();
@@ -1071,7 +1082,7 @@ app.put('/api/employees/:id/status', auth, async (req, res) => {
     await client.query('UPDATE employees SET employment_status=$1, exit_date=$2, updated_at=NOW() WHERE id=$3', [employment_status, exit_date || null, req.params.id]);
     if (employment_status === 'exit') {
       await client.query(`UPDATE ppe_requests SET status='exit', updated_at=NOW() WHERE employee_id=$1 AND status NOT IN ('distributed','canceled','exit')`, [req.params.id]);
-      await client.query(`UPDATE ncr_items SET status='canceled', updated_at=NOW() WHERE employee_id=$1 AND status NOT IN ('resolved','canceled')`, [req.params.id]);
+      await client.query(`UPDATE ncr_items SET status='exit', updated_at=NOW() WHERE employee_id=$1 AND status NOT IN ('resolved','distributed','canceled','exit')`, [req.params.id]);
     }
     await client.query('COMMIT');
     const { rows } = await pool.query('SELECT * FROM employees WHERE id=$1', [req.params.id]);
@@ -1230,6 +1241,7 @@ app.put('/api/casuals/:id/status', auth, async (req, res) => {
     await client_db.query('UPDATE casuals SET employment_status=$1, exit_date=$2, updated_at=NOW(), last_edited_by=$3 WHERE id=$4', [employment_status, exit_date || null, req.user.id, req.params.id]);
     if (employment_status === 'exit') {
       await client_db.query(`UPDATE ppe_requests SET status='exit' WHERE casual_id=$1 AND status NOT IN ('distributed','resolved','canceled','exit')`, [req.params.id]);
+      await client_db.query(`UPDATE ncr_items SET status='exit', updated_at=NOW() WHERE casual_id=$1 AND status NOT IN ('resolved','distributed','canceled','exit')`, [req.params.id]);
     }
     await client_db.query('COMMIT');
     const { rows } = await pool.query('SELECT * FROM casuals WHERE id=$1', [req.params.id]);
@@ -1858,7 +1870,7 @@ app.get('/api/ncr/filter-options', auth, async (req, res) => {
 app.get('/api/ncr/stats', auth, async (req, res) => {
   try {
     let q = `SELECT
-        COUNT(*) FILTER (WHERE n.status NOT IN ('resolved','distributed','canceled')) as total_open,
+        COUNT(*) FILTER (WHERE n.status NOT IN ('resolved','distributed','canceled','exit')) as total_open,
         COUNT(*) FILTER (WHERE n.status='pending') as pending,
         COUNT(*) FILTER (WHERE n.status='ehs_purchase_requested' AND p.needs_pda=true) as pending_pm,
         COUNT(*) FILTER (WHERE n.status IN ('resolved','distributed') AND date_trunc('month', n.updated_at) = date_trunc('month', NOW())) as resolved_this_month

@@ -604,7 +604,7 @@ app.get('/api/dashboard', auth, async (req, res) => {
     const [emp, overdue, ncr, ncrCat, comp, delays, recent] = await Promise.all([
       pool.query(`SELECT COUNT(*) FILTER (WHERE employment_status='active') as active, COUNT(*) FILTER (WHERE employment_status='exit' AND exit_date >= date_trunc('year',NOW())) as exits_this_year FROM employees`),
       pool.query(`SELECT COUNT(*) as overdue FROM employees e LEFT JOIN (SELECT employee_id, MAX(audit_date) as last_audit FROM audits WHERE employee_present = TRUE AND is_deleted IS NOT TRUE GROUP BY employee_id) a ON e.id=a.employee_id WHERE e.employment_status='active' AND e.san=TRUE AND (a.last_audit IS NULL OR CURRENT_DATE - a.last_audit > 30)`),
-      pool.query(`SELECT COUNT(*) FILTER (WHERE status!='resolved') as open, COUNT(*) FILTER (WHERE status='pending') as pending FROM ncr_items`),
+      pool.query(`SELECT COUNT(*) FILTER (WHERE status NOT IN ('resolved','distributed','canceled','exit')) as open, COUNT(*) FILTER (WHERE status='pending') as pending FROM ncr_items`),
       // Item x month matrix for the NCR heat map -- top 20 items by total NCRs
       // raised in the last 6 months (not just currently-open ones, so the
       // heat map reflects real occurrence history rather than a snapshot).

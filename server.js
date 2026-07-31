@@ -1207,6 +1207,75 @@ app.post('/api/casuals/batch', auth, async (req, res) => {
   finally { client_db.release(); }
 });
 
+// Reactivate exited casuals in bulk (admin, supervisor only)
+app.post('/api/casuals/reactivate', auth, async (req, res) => {
+  if (!CASUAL_EDIT_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ error: 'At least one casual id is required' });
+  }
+  const client_db = await pool.connect();
+  try {
+    await client_db.query('BEGIN');
+    // Only exited casuals can be reactivated.
+    const { rows: candidates } = await client_db.query(
+      `SELECT * FROM casuals WHERE id = ANY($1::int[]) AND employment_status = 'exit'`,
+      [ids]
+    );
+    const reactivated = [];
+    const skipped = [];
+    for (const c of candidates) {
+      // Respect the supervisor's project/client scope, same as edit/exit.
+      if (!(await inScope(req.user, c.project, c.client))) {
+        skipped.push({ full_name: c.full_name, reason: 'Outside your project/client access' });
+        continue;
+      }
+      const { rows } = await client_db.query(
+        `UPDATE casuals SET employment_status='active', exit_date=NULL, updated_at=NOW(), last_edited_by=$1
+         WHERE id=$2 RETURNING *`,
+        [req.user.id, c.id]
+      );
+      reactivated.push(rows[0]);
+    }
+    await client_db.query('COMMIT');
+
+    const n = reactivated.length;
+    if (n > 0) {
+      const projects = [...new Set(reactivated.map(c => c.project).filter(Boolean))];
+      const clients = [...new Set(reactivated.map(c => c.client).filter(Boolean))];
+      const projectLabel = projects.length ? projects.join(', ') : '—';
+      const clientLabel = clients.length ? clients.join(', ') : '—';
+      resend.emails.send({
+        from: 'ESAT <esat@egypro.app>',
+        to: 'e.maged@outlook.com',
+        subject: `ESAT — ${n} Casual${n > 1 ? 's' : ''} Reactivated`,
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
+            <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
+              <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="110" height="50" style="height:50px; width:110px; display:block; margin:0 auto;" />
+            </td></tr></table>
+            <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
+              <p style="font-size: 15px; color: #374151;">
+                <strong style="color: #0f2a4a;">${n} casual${n > 1 ? 's were' : ' was'}</strong> reactivated by <strong style="color: #0f2a4a;">${escapeHtml(req.user.name || req.user.email)}</strong>.
+              </p>
+              <p style="font-size: 15px; color: #374151;">
+                Project: <strong style="color: #0f2a4a;">${escapeHtml(projectLabel)}</strong> &middot; Client: <strong style="color: #0f2a4a;">${escapeHtml(clientLabel)}</strong>
+              </p>
+              <a href="https://esat.egypro.app/casuals"
+                style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">
+                Open ESAT
+              </a>
+              <p style="font-size: 14px; color: #374151; margin-top: 24px;">Thanks,<br/>Maged Ezzat</p>
+            </div>
+          </div>
+        `
+      }).catch(e => console.error('Casuals reactivate email error:', e.message));
+    }
+    res.json({ reactivated, skipped });
+  } catch(e) { await client_db.query('ROLLBACK'); sendError(res, e); }
+  finally { client_db.release(); }
+});
+
 // Edit a casual (admin, supervisor only)
 app.put('/api/casuals/:id', auth, async (req, res) => {
   if (!CASUAL_EDIT_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });

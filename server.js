@@ -1117,7 +1117,7 @@ app.get('/api/casuals', auth, async (req, res) => {
     const params = [];
     if (casualProjects !== null) { params.push(casualProjects); q += ` AND c.project = ANY($${params.length})`; }
     if (casualClients !== null) { params.push(casualClients); q += ` AND c.client = ANY($${params.length})`; }
-    q += ' GROUP BY c.id, u.full_name, u2.full_name ORDER BY c.created_at DESC';
+    q += ' GROUP BY c.id, u.full_name, u2.full_name ORDER BY c.updated_at DESC NULLS LAST, c.created_at DESC';
     const { rows } = await pool.query(q, params);
     res.json(rows);
   } catch(e) { sendError(res, e); }

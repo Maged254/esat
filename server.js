@@ -1219,7 +1219,7 @@ app.post('/api/casuals/reactivate', auth, async (req, res) => {
     await client_db.query('BEGIN');
     // Only exited casuals can be reactivated.
     const { rows: candidates } = await client_db.query(
-      `SELECT * FROM casuals WHERE id = ANY($1::int[]) AND employment_status = 'exit'`,
+      `SELECT * FROM casuals WHERE id = ANY($1::uuid[]) AND employment_status = 'exit'`,
       [ids]
     );
     const reactivated = [];

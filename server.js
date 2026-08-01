@@ -427,6 +427,27 @@ async function setupDB() {
       ON CONFLICT (name) DO NOTHING
     `);
 
+    // Icon is stored per course (a stable slug, not the editable name) so
+    // renaming a training keeps its icon. Backfill known courses once; admins
+    // pick the icon for anything else via the Admin panel.
+    await client.query("ALTER TABLE training_courses ADD COLUMN IF NOT EXISTS icon VARCHAR(50)");
+    await client.query(`
+      UPDATE training_courses SET icon = CASE name
+        WHEN 'Defensive Driving' THEN 'defensive_driving'
+        WHEN 'Fall Arrest & Basic Rescue Technician' THEN 'fall_arrest'
+        WHEN 'Rope Rigging Technician' THEN 'rope_rigging'
+        WHEN 'General Safety and Pole Climbing' THEN 'pole_climbing'
+        WHEN 'Basic Competency and Safety in Power Systems' THEN 'power_systems'
+        WHEN 'Fire Fighting' THEN 'fire_fighting'
+        WHEN 'First Aid' THEN 'first_aid'
+        WHEN 'Hazard Identification & Risk Assessment' THEN 'hira'
+        WHEN 'Driving License' THEN 'driving_license'
+        WHEN 'Medical Certificate' THEN 'medical'
+        WHEN 'EHS Induction' THEN 'ehs_induction'
+        ELSE icon END
+      WHERE icon IS NULL
+    `);
+
     // Admin-managed list of Pending reasons, shown as a dropdown when HR marks a
     // training request Pending on the Update Training Records screen.
     await client.query(`
@@ -2565,7 +2586,7 @@ const TRAINING_UPDATE_ROLES = ['admin', 'hr'];
 app.get('/api/training-courses', auth, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      'SELECT id, name, validity_months, is_credential, needs_certificate, is_sensitive FROM training_courses WHERE is_active = TRUE ORDER BY sort_order ASC, name ASC'
+      'SELECT id, name, validity_months, is_credential, needs_certificate, is_sensitive, icon FROM training_courses WHERE is_active = TRUE ORDER BY sort_order ASC, name ASC'
     );
     res.json(rows);
   } catch(e) { sendError(res, e); }
@@ -2586,13 +2607,13 @@ app.get('/api/training-courses/all', auth, async (req, res) => {
 
 app.post('/api/training-courses', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  const { name, validity_months, needs_certificate, is_credential, is_sensitive, sort_order } = req.body;
+  const { name, validity_months, needs_certificate, is_credential, is_sensitive, sort_order, icon } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ error: 'Training name is required' });
   try {
     const { rows } = await pool.query(
-      `INSERT INTO training_courses (name, validity_months, needs_certificate, is_credential, is_sensitive, sort_order)
-       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [name.trim(), validity_months || null, needs_certificate !== false, is_credential || false, is_sensitive || false, sort_order || 99]
+      `INSERT INTO training_courses (name, validity_months, needs_certificate, is_credential, is_sensitive, sort_order, icon)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [name.trim(), validity_months || null, needs_certificate !== false, is_credential || false, is_sensitive || false, sort_order || 99, icon || null]
     );
     res.json(rows[0]);
   } catch(e) {
@@ -2606,17 +2627,17 @@ app.post('/api/training-courses', auth, async (req, res) => {
 // whole record. This is what lets validity_months be cleared back to NULL.
 app.put('/api/training-courses/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  const { name, validity_months, needs_certificate, is_credential, is_sensitive, is_active, sort_order } = req.body;
+  const { name, validity_months, needs_certificate, is_credential, is_sensitive, is_active, sort_order, icon } = req.body;
   if (!name || !String(name).trim()) return res.status(400).json({ error: 'Training name is required' });
   try {
     const { rows } = await pool.query(
       `UPDATE training_courses SET
          name=$1, validity_months=$2, needs_certificate=$3, is_credential=$4,
-         is_sensitive=$5, is_active=$6, sort_order=$7
-       WHERE id=$8 RETURNING *`,
+         is_sensitive=$5, is_active=$6, sort_order=$7, icon=$8
+       WHERE id=$9 RETURNING *`,
       [name.trim(), validity_months || null, needs_certificate !== false,
        is_credential || false, is_sensitive || false, is_active !== false,
-       sort_order || 99, req.params.id]
+       sort_order || 99, icon || null, req.params.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'Not found' });
     res.json(rows[0]);

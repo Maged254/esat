@@ -2660,6 +2660,111 @@ app.get('/api/training-records', auth, async (req, res) => {
   } catch(e) { sendError(res, e); }
 });
 
+// ── Trainings Tracker (read-only monitor) ───────────────────
+// Paginated, scoped list of every employee training record with a computed
+// expiry state. Employees only (casual training has no UI yet). Expiry is
+// derived at query time, never stored -- matches ESAT's overdue-metric rule.
+const EXPIRY_SOON_DAYS = 60;
+
+// Shared WHERE builder so /tracker and /stats always filter identically.
+const trainingTrackerWhere = async (req, params) => {
+  const { status, search, national_id, job_title, course_id, resource_type, department, expiry } = req.query;
+  const projectsCsv = req.query.projects ? req.query.projects.split(',').filter(Boolean) : [];
+  const clientsCsv = req.query.clients ? req.query.clients.split(',').filter(Boolean) : [];
+  let w = ` WHERE t.is_deleted IS NOT TRUE AND t.employee_id IS NOT NULL`;
+  if (status) { params.push(status.split(',')); w += ` AND t.status = ANY($${params.length})`; }
+  if (search) { params.push(`%${search}%`); w += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length})`; }
+  if (national_id) { params.push(`%${national_id}%`); w += ` AND e.national_id ILIKE $${params.length}`; }
+  if (job_title) { params.push(`%${job_title}%`); w += ` AND e.job_title ILIKE $${params.length}`; }
+  if (course_id) { params.push(course_id); w += ` AND t.course_id = $${params.length}`; }
+  if (department) { params.push(department); w += ` AND e.department = $${params.length}`; }
+  // Same intern/inhouse disjointness as the employees list.
+  if (resource_type === 'intern') { w += ` AND e.job_title ILIKE '%intern%'`; }
+  else if (resource_type === 'inhouse') { w += ` AND e.resource_type='inhouse' AND e.job_title NOT ILIKE '%intern%'`; }
+  else if (resource_type) { params.push(resource_type); w += ` AND e.resource_type = $${params.length}`; }
+  if (projectsCsv.length) { params.push(projectsCsv); w += ` AND e.project = ANY($${params.length})`; }
+  if (clientsCsv.length) { params.push(clientsCsv); w += ` AND e.client = ANY($${params.length})`; }
+  // Expiry buckets apply only to completed records that carry an expiry date.
+  if (expiry === 'expiring') { w += ` AND t.status='completed' AND t.expiry_date >= CURRENT_DATE AND t.expiry_date <= CURRENT_DATE + ${EXPIRY_SOON_DAYS}`; }
+  else if (expiry === 'expired') { w += ` AND t.status='completed' AND t.expiry_date < CURRENT_DATE`; }
+  else if (expiry === 'valid') { w += ` AND t.status='completed' AND t.expiry_date > CURRENT_DATE + ${EXPIRY_SOON_DAYS}`; }
+  // Project/client scope -- returns null (no restriction) or an allow-list.
+  const projects = await getProjectFilter(req.user);
+  if (projects !== null) {
+    if (projects.length === 0) return { blocked: true };
+    params.push(projects); w += ` AND e.project = ANY($${params.length})`;
+  }
+  const clients = await getClientFilter(req.user);
+  if (clients !== null) {
+    if (clients.length === 0) return { blocked: true };
+    params.push(clients); w += ` AND e.client = ANY($${params.length})`;
+  }
+  return { where: w };
+};
+
+app.get('/api/training-records/tracker', auth, async (req, res) => {
+  try {
+    const params = [];
+    const built = await trainingTrackerWhere(req, params);
+    if (built.blocked) return res.json({ rows: [], total: 0, page: 1, pageSize: 25 });
+    const limit = Math.min(Math.max(parseInt(req.query.pageSize) || 25, 1), 100);
+    const pageNum = Math.max(parseInt(req.query.page) || 1, 1);
+    const offset = (pageNum - 1) * limit;
+    const q = `
+      SELECT t.id, t.status, t.requested_at, t.scheduled_date, t.completed_at,
+             t.expiry_date, t.pending_reason, t.not_eligible_reason, t.cancel_reason,
+             c.name AS course_name, c.validity_months,
+             e.full_name AS employee_name, e.national_id, e.employee_number,
+             e.job_title, e.department, e.project, e.client,
+             u.full_name AS requested_by_name, ru.full_name AS recorded_by_name,
+             (t.expiry_date - CURRENT_DATE) AS days_to_expiry,
+             CASE WHEN t.status='completed' AND t.expiry_date IS NOT NULL THEN
+               CASE WHEN t.expiry_date < CURRENT_DATE THEN 'expired'
+                    WHEN t.expiry_date <= CURRENT_DATE + ${EXPIRY_SOON_DAYS} THEN 'expiring'
+                    ELSE 'valid' END
+             END AS expiry_state,
+             COUNT(*) OVER() AS full_count
+      FROM training_records t
+      JOIN training_courses c ON c.id = t.course_id
+      LEFT JOIN employees e ON e.id = t.employee_id
+      LEFT JOIN users u ON u.id = t.requested_by
+      LEFT JOIN users ru ON ru.id = t.recorded_by
+      ${built.where}
+      ORDER BY t.requested_at DESC
+      LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(limit, offset);
+    const { rows } = await pool.query(q, params);
+    const total = rows.length ? parseInt(rows[0].full_count) : 0;
+    res.json({ rows, total, page: pageNum, pageSize: limit });
+  } catch(e) { sendError(res, e); }
+});
+
+app.get('/api/training-records/stats', auth, async (req, res) => {
+  try {
+    // Stats ignore the status/expiry filters (they ARE the buckets) but keep the
+    // people-filters, so counts always match the list the user is looking at.
+    const statReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined } };
+    const params = [];
+    const built = await trainingTrackerWhere(statReq, params);
+    if (built.blocked) return res.json({ total:0, requested:0, scheduled:0, pending:0, completed:0, expiring:0, expired:0 });
+    const q = `
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE t.status='requested')::int AS requested,
+        COUNT(*) FILTER (WHERE t.status='scheduled')::int AS scheduled,
+        COUNT(*) FILTER (WHERE t.status='pending')::int AS pending,
+        COUNT(*) FILTER (WHERE t.status='completed')::int AS completed,
+        COUNT(*) FILTER (WHERE t.status='completed' AND t.expiry_date >= CURRENT_DATE AND t.expiry_date <= CURRENT_DATE + ${EXPIRY_SOON_DAYS})::int AS expiring,
+        COUNT(*) FILTER (WHERE t.status='completed' AND t.expiry_date < CURRENT_DATE)::int AS expired
+      FROM training_records t
+      JOIN training_courses c ON c.id = t.course_id
+      LEFT JOIN employees e ON e.id = t.employee_id
+      ${built.where}`;
+    const { rows } = await pool.query(q, params);
+    res.json(rows[0]);
+  } catch(e) { sendError(res, e); }
+});
+
 app.post('/api/training-requests', auth, async (req, res) => {
   if (!TRAINING_REQUEST_ROLES.includes(req.user.role)) {
     return res.status(403).json({ error: 'Not authorized to request training' });

@@ -427,6 +427,18 @@ async function setupDB() {
       ON CONFLICT (name) DO NOTHING
     `);
 
+    // Admin-managed list of Pending reasons, shown as a dropdown when HR marks a
+    // training request Pending on the Update Training Records screen.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS training_pending_reasons (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        label VARCHAR(150) NOT NULL UNIQUE,
+        is_active BOOLEAN DEFAULT TRUE,
+        sort_order INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
     console.log("Database setup complete");
   } catch(e) {
     console.error('DB setup error:', e.message);
@@ -517,7 +529,7 @@ const escapeHtml = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({
 }[c]));
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const VALID_ROLES = ['admin', 'ehs_manager', 'ehs_officer', 'supervisor', 'scm_officer', 'project_director'];
+const VALID_ROLES = ['admin', 'ehs_manager', 'ehs_officer', 'supervisor', 'scm_officer', 'project_director', 'hr'];
 // Data-URL profile pictures only, capped just under the 10mb JSON body limit
 // (no client-side resize happens before upload, so this must stay generous).
 const isValidProfilePicture = (s) => typeof s === 'string' && s.startsWith('data:image/') && s.length <= 9 * 1024 * 1024;
@@ -2547,6 +2559,8 @@ app.get('/api/sync-log/latest', auth, async (req, res) => {
 // Roles mirror ETMS: EHS managers raise training requests; HR record the
 // outcome later (that screen is not built yet).
 const TRAINING_REQUEST_ROLES = ['admin', 'ehs_manager'];
+// HR record the outcome of a request (complete / pending / schedule / not eligible).
+const TRAINING_UPDATE_ROLES = ['admin', 'hr'];
 
 app.get('/api/training-courses', auth, async (req, res) => {
   try {
@@ -2624,6 +2638,63 @@ app.delete('/api/training-courses/:id', auth, async (req, res) => {
       return res.status(400).json({ error: `Cannot delete: ${used.n} training record(s) use this type. Deactivate it instead.` });
     }
     const { rowCount } = await pool.query('DELETE FROM training_courses WHERE id = $1', [req.params.id]);
+    if (!rowCount) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true });
+  } catch(e) { sendError(res, e); }
+});
+
+// ── Pending reasons (admin-managed list for the Update screen) ──
+app.get('/api/training-pending-reasons', auth, async (req, res) => {
+  try {
+    // Active-only for the dropdown; admins get everything via ?all=1 for the panel.
+    const all = req.query.all === '1' && req.user.role === 'admin';
+    const { rows } = await pool.query(
+      `SELECT id, label, is_active, sort_order FROM training_pending_reasons
+       ${all ? '' : 'WHERE is_active = TRUE'} ORDER BY sort_order ASC, label ASC`
+    );
+    res.json(rows);
+  } catch(e) { sendError(res, e); }
+});
+
+app.post('/api/training-pending-reasons', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { label, sort_order } = req.body;
+  if (!label || !label.trim()) return res.status(400).json({ error: 'Reason is required' });
+  try {
+    const { rows } = await pool.query(
+      'INSERT INTO training_pending_reasons (label, sort_order) VALUES ($1,$2) RETURNING *',
+      [label.trim(), sort_order || 99]
+    );
+    res.json(rows[0]);
+  } catch(e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'That reason already exists' });
+    sendError(res, e);
+  }
+});
+
+app.put('/api/training-pending-reasons/:id', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { label, is_active, sort_order } = req.body;
+  if (!label || !String(label).trim()) return res.status(400).json({ error: 'Reason is required' });
+  try {
+    const { rows } = await pool.query(
+      'UPDATE training_pending_reasons SET label=$1, is_active=$2, sort_order=$3 WHERE id=$4 RETURNING *',
+      [label.trim(), is_active !== false, sort_order || 99, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(rows[0]);
+  } catch(e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'That reason already exists' });
+    sendError(res, e);
+  }
+});
+
+app.delete('/api/training-pending-reasons/:id', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    // pending_reason is stored as free text on the record, so deleting a reason
+    // never orphans history -- a hard delete is safe.
+    const { rowCount } = await pool.query('DELETE FROM training_pending_reasons WHERE id = $1', [req.params.id]);
     if (!rowCount) return res.status(404).json({ error: 'Not found' });
     res.json({ success: true });
   } catch(e) { sendError(res, e); }
@@ -2762,6 +2833,89 @@ app.get('/api/training-records/stats', auth, async (req, res) => {
       ${built.where}`;
     const { rows } = await pool.query(q, params);
     res.json(rows[0]);
+  } catch(e) { sendError(res, e); }
+});
+
+// ── Update Training Record (HR records the outcome) ─────────
+// Transition an OPEN request (requested/scheduled/pending) to its outcome.
+// PDF certificate upload is deliberately NOT here yet -- staged for next step.
+app.put('/api/training-records/:id/update', auth, async (req, res) => {
+  if (!TRAINING_UPDATE_ROLES.includes(req.user.role)) {
+    return res.status(403).json({ error: 'Not authorized to update training records' });
+  }
+  const { status } = req.body;
+  const ALLOWED = ['completed', 'pending', 'scheduled', 'not_eligible'];
+  if (!ALLOWED.includes(status)) return res.status(400).json({ error: 'Invalid outcome status' });
+  try {
+    // Load the record with its course validity and the employee snapshot fields.
+    const { rows: [rec] } = await pool.query(
+      `SELECT t.id, t.status AS current_status, t.employee_id,
+              c.validity_months, c.name AS course_name,
+              e.project, e.client, e.organization
+       FROM training_records t
+       JOIN training_courses c ON c.id = t.course_id
+       LEFT JOIN employees e ON e.id = t.employee_id
+       WHERE t.id = $1 AND t.is_deleted IS NOT TRUE`, [req.params.id]
+    );
+    if (!rec || !rec.employee_id) return res.status(404).json({ error: 'Not found' });
+    // Scope: out of scope reads as not-found (HR/admin are unrestricted anyway).
+    if (!(await inScope(req.user, rec.project, rec.client))) return res.status(404).json({ error: 'Not found' });
+    // Only open requests can be recorded; a terminal record must not be re-flipped here.
+    if (!['requested', 'scheduled', 'pending'].includes(rec.current_status)) {
+      return res.status(400).json({ error: `This record is already ${rec.current_status} and can't be updated here` });
+    }
+
+    if (status === 'completed') {
+      const { completed_at, training_cost, partnership } = req.body;
+      if (!completed_at) return res.status(400).json({ error: 'Completion date is required' });
+      if (rec.validity_months == null) {
+        return res.status(400).json({ error: `Set a validity period for "${rec.course_name}" in Admin → Training Courses before completing it, so the expiry can be computed.` });
+      }
+      const cost = (training_cost === '' || training_cost == null) ? null : Number(training_cost);
+      if (cost != null && (isNaN(cost) || cost < 0)) return res.status(400).json({ error: 'Training cost must be a non-negative number' });
+      const { rows } = await pool.query(
+        `UPDATE training_records SET
+           status='completed', completed_at=$1,
+           expiry_date=($1::date + ($2 * INTERVAL '1 month'))::date,
+           validity_months_applied=$2, training_cost=$3, partnership=$4,
+           project_at_completion=$5, client_at_completion=$6, organization_at_completion=$7,
+           recorded_by=$8, recorded_at=NOW(), updated_at=NOW()
+         WHERE id=$9 RETURNING *`,
+        [completed_at, rec.validity_months, cost, partnership || null,
+         rec.project || null, rec.client || null, rec.organization || null,
+         req.user.id, req.params.id]
+      );
+      return res.json(rows[0]);
+    }
+
+    if (status === 'pending') {
+      const { pending_reason } = req.body;
+      if (!pending_reason || !pending_reason.trim()) return res.status(400).json({ error: 'A pending reason is required' });
+      const { rows } = await pool.query(
+        `UPDATE training_records SET status='pending', pending_reason=$1, recorded_by=$2, recorded_at=NOW(), updated_at=NOW() WHERE id=$3 RETURNING *`,
+        [pending_reason.trim(), req.user.id, req.params.id]
+      );
+      return res.json(rows[0]);
+    }
+
+    if (status === 'scheduled') {
+      const { scheduled_date } = req.body;
+      if (!scheduled_date) return res.status(400).json({ error: 'A scheduled date is required' });
+      const { rows } = await pool.query(
+        `UPDATE training_records SET status='scheduled', scheduled_date=$1, updated_at=NOW() WHERE id=$2 RETURNING *`,
+        [scheduled_date, req.params.id]
+      );
+      return res.json(rows[0]);
+    }
+
+    // not_eligible
+    const { not_eligible_reason } = req.body;
+    if (!not_eligible_reason || !not_eligible_reason.trim()) return res.status(400).json({ error: 'A reason is required' });
+    const { rows } = await pool.query(
+      `UPDATE training_records SET status='not_eligible', not_eligible_reason=$1, recorded_by=$2, recorded_at=NOW(), updated_at=NOW() WHERE id=$3 RETURNING *`,
+      [not_eligible_reason.trim(), req.user.id, req.params.id]
+    );
+    return res.json(rows[0]);
   } catch(e) { sendError(res, e); }
 });
 

@@ -322,6 +322,113 @@ async function setupDB() {
     await client.query("ALTER TABLE audit_documents ADD COLUMN IF NOT EXISTS resource_type VARCHAR(20) DEFAULT 'image'");
     await client.query("ALTER TABLE audit_documents ADD COLUMN IF NOT EXISTS delivery_type VARCHAR(20) DEFAULT 'upload'");
     await client.query("ALTER TABLE audits ADD COLUMN IF NOT EXISTS delete_reason TEXT");
+
+    // ── Training module (ETMS migration, Phase 1) ──────────────
+    // Schema only -- historical ETMS data is NOT imported until the Phase 0
+    // certificate reconciliation passes. See the ETMS→ESAT migration report.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS training_courses (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(150) NOT NULL UNIQUE,
+        validity_months INTEGER,
+        is_credential BOOLEAN DEFAULT FALSE,
+        needs_certificate BOOLEAN DEFAULT TRUE,
+        is_sensitive BOOLEAN DEFAULT FALSE,
+        is_active BOOLEAN DEFAULT TRUE,
+        sort_order INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS training_records (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        employee_id UUID REFERENCES employees(id) ON DELETE CASCADE,
+        casual_id UUID REFERENCES casuals(id) ON DELETE CASCADE,
+        course_id UUID NOT NULL REFERENCES training_courses(id),
+        status VARCHAR(30) NOT NULL DEFAULT 'requested',
+        requested_by UUID REFERENCES users(id),
+        requested_at TIMESTAMPTZ DEFAULT NOW(),
+        scheduled_date DATE,
+        pending_reason TEXT,
+        not_eligible_reason TEXT,
+        cancelled_by UUID REFERENCES users(id),
+        cancelled_at TIMESTAMPTZ,
+        cancel_reason TEXT,
+        completed_at DATE,
+        recorded_by UUID REFERENCES users(id),
+        recorded_at TIMESTAMPTZ,
+        expiry_date DATE,
+        validity_months_applied INTEGER,
+        training_cost NUMERIC(12,2),
+        partnership VARCHAR(150),
+        project_at_completion VARCHAR(100),
+        client_at_completion VARCHAR(100),
+        organization_at_completion VARCHAR(100),
+        certificate_url TEXT,
+        cloudinary_public_id TEXT,
+        resource_type VARCHAR(20),
+        delivery_type VARCHAR(20),
+        original_filename TEXT,
+        source_sharepoint_url TEXT,
+        migrated_at TIMESTAMPTZ,
+        is_deleted BOOLEAN DEFAULT FALSE,
+        delete_reason TEXT,
+        deleted_by UUID REFERENCES users(id),
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS training_course_access UUID[] DEFAULT '{}'");
+
+    // Targeted constraints: ESAT has none elsewhere, but each of these prevents
+    // a specific corruption that would be expensive to unpick after migration.
+    // 1. A record belongs to exactly one person.
+    await client.query(`
+      DO $$ BEGIN
+        ALTER TABLE training_records ADD CONSTRAINT training_records_one_person
+          CHECK ((employee_id IS NULL) <> (casual_id IS NULL));
+      EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+    `);
+    // 2. A completed record must carry both its completion date and expiry.
+    await client.query(`
+      DO $$ BEGIN
+        ALTER TABLE training_records ADD CONSTRAINT training_records_completed_has_dates
+          CHECK (status <> 'completed' OR (completed_at IS NOT NULL AND expiry_date IS NOT NULL));
+      EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+    `);
+    // 3. At most one OPEN request per person+course -- encodes the ETMS rule that
+    //    the update screen only lists people with an outstanding request, without
+    //    blocking renewals (a plain UNIQUE(employee,course) would break them).
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS one_open_training_request_employee
+        ON training_records (employee_id, course_id)
+        WHERE status IN ('requested','scheduled','pending') AND is_deleted IS NOT TRUE AND employee_id IS NOT NULL
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS one_open_training_request_casual
+        ON training_records (casual_id, course_id)
+        WHERE status IN ('requested','scheduled','pending') AND is_deleted IS NOT TRUE AND casual_id IS NOT NULL
+    `);
+    await client.query('CREATE INDEX IF NOT EXISTS idx_training_records_employee ON training_records(employee_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_training_records_status ON training_records(status)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_training_records_expiry ON training_records(expiry_date)');
+
+    // Seed the 10 course types carried over from ETMS. validity_months is left
+    // NULL deliberately -- only Defensive Driving (24) is confirmed; the rest are
+    // pending and must be set before any completion can compute an expiry.
+    await client.query(`
+      INSERT INTO training_courses (name, validity_months, is_credential, is_sensitive, sort_order) VALUES
+        ('Defensive Driving', 24, FALSE, FALSE, 1),
+        ('Fall Arrest & Basic Rescue Technician', NULL, FALSE, FALSE, 2),
+        ('Rope Rigging Technician', NULL, FALSE, FALSE, 3),
+        ('General Safety and Pole Climbing', NULL, FALSE, FALSE, 4),
+        ('Basic Competency and Safety in Power Systems', NULL, FALSE, FALSE, 5),
+        ('Fire Fighting', NULL, FALSE, FALSE, 6),
+        ('First Aid', NULL, FALSE, FALSE, 7),
+        ('Driving License', NULL, TRUE, FALSE, 8),
+        ('Medical Certificate', NULL, TRUE, TRUE, 9),
+        ('Hazard Identification & Risk Assessment', NULL, FALSE, FALSE, 10)
+      ON CONFLICT (name) DO NOTHING
+    `);
+
     console.log("Database setup complete");
   } catch(e) {
     console.error('DB setup error:', e.message);
@@ -2436,6 +2543,86 @@ app.post('/api/sync-log', auth, async (req, res) => {
 app.get('/api/sync-log/latest', auth, async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM sync_log ORDER BY synced_at DESC LIMIT 1');
   res.json(rows[0] || null);
+});
+
+// ── Training (ETMS migration, Phase 1) ─────────────────────
+// Roles mirror ETMS: EHS managers raise training requests; HR record the
+// outcome later (that screen is not built yet).
+const TRAINING_REQUEST_ROLES = ['admin', 'ehs_manager'];
+
+app.get('/api/training-courses', auth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, name, validity_months, is_credential, needs_certificate, is_sensitive FROM training_courses WHERE is_active = TRUE ORDER BY sort_order ASC, name ASC'
+    );
+    res.json(rows);
+  } catch(e) { sendError(res, e); }
+});
+
+// Open requests for a person -- used by the request form to show what's already
+// outstanding, so the user sees why a duplicate is refused.
+app.get('/api/training-records', auth, async (req, res) => {
+  try {
+    const { employee_id, status } = req.query;
+    const params = [];
+    let q = `SELECT t.*, c.name as course_name, e.full_name as employee_name,
+               e.national_id, e.employee_number, u.full_name as requested_by_name
+             FROM training_records t
+             JOIN training_courses c ON c.id = t.course_id
+             LEFT JOIN employees e ON e.id = t.employee_id
+             LEFT JOIN users u ON u.id = t.requested_by
+             WHERE t.is_deleted IS NOT TRUE`;
+    if (employee_id) { params.push(employee_id); q += ` AND t.employee_id = $${params.length}`; }
+    if (status) { params.push(status.split(',')); q += ` AND t.status = ANY($${params.length})`; }
+    const projects = await getProjectFilter(req.user);
+    if (projects !== null) {
+      if (projects.length === 0) return res.json([]);
+      params.push(projects); q += ` AND e.project = ANY($${params.length})`;
+    }
+    const clients = await getClientFilter(req.user);
+    if (clients !== null) {
+      if (clients.length === 0) return res.json([]);
+      params.push(clients); q += ` AND e.client = ANY($${params.length})`;
+    }
+    q += ' ORDER BY t.requested_at DESC';
+    const { rows } = await pool.query(q, params);
+    res.json(rows);
+  } catch(e) { sendError(res, e); }
+});
+
+app.post('/api/training-requests', auth, async (req, res) => {
+  if (!TRAINING_REQUEST_ROLES.includes(req.user.role)) {
+    return res.status(403).json({ error: 'Not authorized to request training' });
+  }
+  const { employee_id, course_id } = req.body;
+  if (!employee_id || !course_id) return res.status(400).json({ error: 'Employee and training type are required' });
+  try {
+    // Same scope rule as every other person-linked resource: out of scope reads
+    // as "not found" rather than leaking that the employee exists.
+    const scope = await getPersonScope(employee_id);
+    if (!scope || !(await inScope(req.user, scope.project, scope.client))) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    const { rows: [emp] } = await pool.query(
+      "SELECT employment_status FROM employees WHERE id=$1", [employee_id]
+    );
+    if (!emp) return res.status(404).json({ error: 'Not found' });
+    if (emp.employment_status !== 'active') {
+      return res.status(400).json({ error: 'Cannot request training for a non-active employee' });
+    }
+    const { rows: [rec] } = await pool.query(
+      `INSERT INTO training_records (employee_id, course_id, status, requested_by, requested_at)
+       VALUES ($1,$2,'requested',$3,NOW()) RETURNING *`,
+      [employee_id, course_id, req.user.id]
+    );
+    res.json(rec);
+  } catch(e) {
+    // 23505 = the partial unique index: an open request already exists.
+    if (e.code === '23505') {
+      return res.status(400).json({ error: 'This employee already has an open request for this training' });
+    }
+    sendError(res, e);
+  }
 });
 
 // Start

@@ -423,9 +423,7 @@ async function setupDB() {
         ('Basic Competency and Safety in Power Systems', NULL, FALSE, FALSE, 5),
         ('Fire Fighting', NULL, FALSE, FALSE, 6),
         ('First Aid', NULL, FALSE, FALSE, 7),
-        ('Driving License', NULL, TRUE, FALSE, 8),
-        ('Medical Certificate', NULL, TRUE, TRUE, 9),
-        ('Hazard Identification & Risk Assessment', NULL, FALSE, FALSE, 10)
+        ('Hazard Identification & Risk Assessment', NULL, FALSE, FALSE, 8)
       ON CONFLICT (name) DO NOTHING
     `);
 
@@ -2556,6 +2554,78 @@ app.get('/api/training-courses', auth, async (req, res) => {
       'SELECT id, name, validity_months, is_credential, needs_certificate, is_sensitive FROM training_courses WHERE is_active = TRUE ORDER BY sort_order ASC, name ASC'
     );
     res.json(rows);
+  } catch(e) { sendError(res, e); }
+});
+
+// ── Admin: manage training course types ─────────────────────
+// Full list incl. inactive, and create/edit/delete — for the Admin panel.
+app.get('/api/training-courses/all', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    const { rows } = await pool.query(
+      `SELECT c.*, (SELECT COUNT(*)::int FROM training_records r WHERE r.course_id = c.id AND r.is_deleted IS NOT TRUE) AS record_count
+       FROM training_courses c ORDER BY c.sort_order ASC, c.name ASC`
+    );
+    res.json(rows);
+  } catch(e) { sendError(res, e); }
+});
+
+app.post('/api/training-courses', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { name, validity_months, needs_certificate, is_credential, is_sensitive, sort_order } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Training name is required' });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO training_courses (name, validity_months, needs_certificate, is_credential, is_sensitive, sort_order)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [name.trim(), validity_months || null, needs_certificate !== false, is_credential || false, is_sensitive || false, sort_order || 99]
+    );
+    res.json(rows[0]);
+  } catch(e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'A training with this name already exists' });
+    sendError(res, e);
+  }
+});
+
+// Expects the full course object (like PUT /api/ppe/:id) -- every field is
+// written, so the Admin form and the activate/deactivate toggle both send the
+// whole record. This is what lets validity_months be cleared back to NULL.
+app.put('/api/training-courses/:id', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { name, validity_months, needs_certificate, is_credential, is_sensitive, is_active, sort_order } = req.body;
+  if (!name || !String(name).trim()) return res.status(400).json({ error: 'Training name is required' });
+  try {
+    const { rows } = await pool.query(
+      `UPDATE training_courses SET
+         name=$1, validity_months=$2, needs_certificate=$3, is_credential=$4,
+         is_sensitive=$5, is_active=$6, sort_order=$7
+       WHERE id=$8 RETURNING *`,
+      [name.trim(), validity_months || null, needs_certificate !== false,
+       is_credential || false, is_sensitive || false, is_active !== false,
+       sort_order || 99, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(rows[0]);
+  } catch(e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'A training with this name already exists' });
+    sendError(res, e);
+  }
+});
+
+app.delete('/api/training-courses/:id', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    // Refuse to delete a course that has training records -- deactivate instead,
+    // so historical records keep a valid course reference.
+    const { rows: [used] } = await pool.query(
+      'SELECT COUNT(*)::int AS n FROM training_records WHERE course_id = $1', [req.params.id]
+    );
+    if (used.n > 0) {
+      return res.status(400).json({ error: `Cannot delete: ${used.n} training record(s) use this type. Deactivate it instead.` });
+    }
+    const { rowCount } = await pool.query('DELETE FROM training_courses WHERE id = $1', [req.params.id]);
+    if (!rowCount) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true });
   } catch(e) { sendError(res, e); }
 });
 

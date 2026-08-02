@@ -4014,6 +4014,16 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
+// Training certificates live in their own Cloudinary account (so PDF delivery can
+// be enabled there without touching the audit-document account). Passed per call
+// as a config override; falls back to the main account until the TRAINING_* env
+// vars are set, so nothing breaks in the meantime.
+const TRAIN_CLOUD = {
+  cloud_name: process.env.TRAINING_CLOUDINARY_CLOUD_NAME || process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.TRAINING_CLOUDINARY_API_KEY || process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.TRAINING_CLOUDINARY_API_SECRET || process.env.CLOUDINARY_API_SECRET,
+};
+
 // ── Upload Audit Document ────────────────────────────────────
 app.post('/api/audit-documents/upload', auth, (req, res) => {
   upload.single('file')(req, res, async (err) => {
@@ -4187,7 +4197,7 @@ app.post('/api/training-records/:id/certificate', auth, (req, res) => {
       const publicId = `${folder}/${sanitizeForPublicId(rec.course_name)}_${rec.id}`;
       const result = await new Promise((resolve, reject) => {
         const stream = cloudinary.uploader.upload_stream(
-          { public_id: publicId, overwrite: true, resource_type: 'auto', type: 'authenticated' },
+          { public_id: publicId, overwrite: true, resource_type: 'auto', type: 'authenticated', ...TRAIN_CLOUD },
           (error, r) => { if (error) reject(error); else resolve(r); }
         );
         stream.end(req.file.buffer);
@@ -4195,7 +4205,7 @@ app.post('/api/training-records/:id/certificate', auth, (req, res) => {
       // A replacement can land under a different resource_type (image vs raw); if
       // so, the old asset now has an orphan public_id -- clean it up.
       if (rec.cloudinary_public_id && (rec.cloudinary_public_id !== result.public_id || (rec.resource_type && rec.resource_type !== result.resource_type))) {
-        cloudinary.uploader.destroy(rec.cloudinary_public_id, { resource_type: rec.resource_type || 'image', type: rec.delivery_type || 'authenticated' }).catch(() => {});
+        cloudinary.uploader.destroy(rec.cloudinary_public_id, { resource_type: rec.resource_type || 'image', type: rec.delivery_type || 'authenticated', ...TRAIN_CLOUD }).catch(() => {});
       }
       await pool.query(
         `UPDATE training_records SET certificate_url=$1, cloudinary_public_id=$2, resource_type=$3, delivery_type='authenticated', original_filename=$4, updated_at=NOW() WHERE id=$5`,
@@ -4227,7 +4237,7 @@ app.get('/api/training-records/:id/certificate/download', async (req, res) => {
       ? { width: 1200, crop: 'limit', quality: 'auto', fetch_format: 'auto' } : {};
     const signedUrl = cloudinary.url(rec.cloudinary_public_id, {
       type: rec.delivery_type || 'authenticated', resource_type: resourceType,
-      sign_url: true, expires_at: Math.floor(Date.now() / 1000) + 300, ...previewTransform,
+      sign_url: true, expires_at: Math.floor(Date.now() / 1000) + 300, ...previewTransform, ...TRAIN_CLOUD,
     });
     res.redirect(signedUrl);
   } catch (e) { res.status(500).json({ error: 'Download failed' }); }
@@ -4241,7 +4251,7 @@ app.delete('/api/training-records/:id/certificate', auth, async (req, res) => {
     if (!(await inScope(req.user, rec.project, rec.client))) return res.status(404).json({ error: 'Not found' });
     if (!(await canManageCourse(req.user, rec.course_id))) return res.status(403).json({ error: `You are not assigned to manage "${rec.course_name}".` });
     if (rec.cloudinary_public_id) {
-      await cloudinary.uploader.destroy(rec.cloudinary_public_id, { resource_type: rec.resource_type || 'image', type: rec.delivery_type || 'authenticated' }).catch(() => {});
+      await cloudinary.uploader.destroy(rec.cloudinary_public_id, { resource_type: rec.resource_type || 'image', type: rec.delivery_type || 'authenticated', ...TRAIN_CLOUD }).catch(() => {});
     }
     await pool.query(`UPDATE training_records SET certificate_url=NULL, cloudinary_public_id=NULL, resource_type=NULL, delivery_type=NULL, original_filename=NULL, updated_at=NOW() WHERE id=$1`, [rec.id]);
     res.json({ ok: true });

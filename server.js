@@ -2782,6 +2782,14 @@ const SUPERSEDED_SQL = `EXISTS (
 // The current (latest) completed certificate for a person+course.
 const CURRENT_CERT_SQL = `t.status='completed' AND NOT ${SUPERSEDED_SQL}`;
 
+// The "Expired" view is really the actionable renewal: the auto-opened request
+// (Status Requested/…) carrying `prior_expiry_date` (the "Expired on <date>"
+// note). The raw expired certificate itself is a reference line, shown only in
+// the full "All records" dump.
+const RENEWAL_DUE_SQL = `t.prior_expiry_date IS NOT NULL AND t.status IN ('requested','scheduled','pending')`;
+// A current expired certificate (the reference line hidden outside All records).
+const EXPIRED_CERT_SQL = `${CURRENT_CERT_SQL} AND t.expiry_date < CURRENT_DATE`;
+
 // When a certificate expires, a renewal has to happen -- so we auto-open a
 // `requested` record for it, which then flows through the normal Update process
 // (scheduled / pending / completed) like any other request. The expired
@@ -2822,7 +2830,7 @@ const ensureRenewalRequests = async (courseId) => {
 
 // Shared WHERE builder so /tracker and /stats always filter identically.
 const trainingTrackerWhere = async (req, params) => {
-  const { status, search, national_id, job_title, course_id, resource_type, department, expiry, employment_status } = req.query;
+  const { status, search, national_id, job_title, course_id, resource_type, department, expiry, employment_status, hide_expired_cert, new_only } = req.query;
   const projectsCsv = req.query.projects ? req.query.projects.split(',').filter(Boolean) : [];
   const clientsCsv = req.query.clients ? req.query.clients.split(',').filter(Boolean) : [];
   let w = ` WHERE t.is_deleted IS NOT TRUE AND t.employee_id IS NOT NULL`;
@@ -2841,10 +2849,20 @@ const trainingTrackerWhere = async (req, params) => {
   if (clientsCsv.length) { params.push(clientsCsv); w += ` AND e.client = ANY($${params.length})`; }
   // Expiry buckets apply only to completed records that carry an expiry date.
   // A renewed (superseded) certificate is history, so it lands in none of them.
+  // 'expired' = the expired CERTIFICATE (the Tracker's compliance view).
+  // 'renewal_due' = the actionable RENEWAL REQUEST that expiry auto-opens (the
+  // Update page's "Expired" view); the cert itself is hidden there.
   if (expiry === 'expiring') { w += ` AND ${CURRENT_CERT_SQL} AND t.expiry_date >= CURRENT_DATE AND t.expiry_date <= CURRENT_DATE + ${EXPIRY_SOON_DAYS}`; }
-  else if (expiry === 'expired') { w += ` AND ${CURRENT_CERT_SQL} AND t.expiry_date < CURRENT_DATE`; }
+  else if (expiry === 'expired') { w += ` AND ${EXPIRED_CERT_SQL}`; }
+  else if (expiry === 'renewal_due') { w += ` AND ${RENEWAL_DUE_SQL}`; }
   else if (expiry === 'valid') { w += ` AND ${CURRENT_CERT_SQL} AND t.expiry_date > CURRENT_DATE + ${EXPIRY_SOON_DAYS}`; }
   else if (expiry === 'superseded') { w += ` AND t.status='completed' AND ${SUPERSEDED_SQL}`; }
+  // Everywhere except the full "All records" view, the raw expired certificate
+  // is hidden -- its renewal request stands in for it in the working views.
+  if (hide_expired_cert) { w += ` AND NOT (${EXPIRED_CERT_SQL})`; }
+  // The default open-requests worklist shows only genuine new requests; renewals
+  // (which carry prior_expiry_date) live under the Expired view instead.
+  if (new_only) { w += ` AND t.prior_expiry_date IS NULL`; }
   // Project/client scope -- returns null (no restriction) or an allow-list.
   const projects = await getProjectFilter(req.user);
   if (projects !== null) {
@@ -2903,10 +2921,10 @@ app.get('/api/training-records/stats', auth, async (req, res) => {
     await ensureRenewalRequests(req.query.course_id); // keep counts in step with the list
     // Stats ignore the status/expiry filters (they ARE the buckets) but keep the
     // people-filters, so counts always match the list the user is looking at.
-    const statReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined } };
+    const statReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined, hide_expired_cert: undefined, new_only: undefined } };
     const params = [];
     const built = await trainingTrackerWhere(statReq, params);
-    if (built.blocked) return res.json({ total:0, requested:0, scheduled:0, pending:0, completed:0, expiring:0, expired:0, superseded:0 });
+    if (built.blocked) return res.json({ total:0, requested:0, scheduled:0, pending:0, completed:0, open:0, expiring:0, expired:0, renewal_due:0, superseded:0 });
     const q = `
       SELECT
         COUNT(*)::int AS total,
@@ -2914,8 +2932,10 @@ app.get('/api/training-records/stats', auth, async (req, res) => {
         COUNT(*) FILTER (WHERE t.status='scheduled')::int AS scheduled,
         COUNT(*) FILTER (WHERE t.status='pending')::int AS pending,
         COUNT(*) FILTER (WHERE t.status='completed')::int AS completed,
+        COUNT(*) FILTER (WHERE t.status IN ('requested','scheduled','pending') AND t.prior_expiry_date IS NULL)::int AS open,
         COUNT(*) FILTER (WHERE ${CURRENT_CERT_SQL} AND t.expiry_date >= CURRENT_DATE AND t.expiry_date <= CURRENT_DATE + ${EXPIRY_SOON_DAYS})::int AS expiring,
-        COUNT(*) FILTER (WHERE ${CURRENT_CERT_SQL} AND t.expiry_date < CURRENT_DATE)::int AS expired,
+        COUNT(*) FILTER (WHERE ${EXPIRED_CERT_SQL})::int AS expired,
+        COUNT(*) FILTER (WHERE ${RENEWAL_DUE_SQL})::int AS renewal_due,
         COUNT(*) FILTER (WHERE t.status='completed' AND ${SUPERSEDED_SQL})::int AS superseded
       FROM training_records t
       JOIN training_courses c ON c.id = t.course_id
@@ -2932,15 +2952,17 @@ app.get('/api/training-records/stats', auth, async (req, res) => {
 app.get('/api/training-records/expiry-summary', auth, async (req, res) => {
   try {
     await ensureRenewalRequests(); // Update page mount → sweep every course
-    const sumReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined, course_id: undefined } };
+    const sumReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined, course_id: undefined, hide_expired_cert: undefined } };
     const params = [];
     const built = await trainingTrackerWhere(sumReq, params);
     if (built.blocked) return res.json([]);
+    // 'expired' counts renewal requests (matching the Expired view); 'open' counts
+    // only genuine new requests, so the two badges stay disjoint.
     const q = `
       SELECT t.course_id,
-             COUNT(*) FILTER (WHERE ${CURRENT_CERT_SQL} AND t.expiry_date < CURRENT_DATE)::int AS expired,
+             COUNT(*) FILTER (WHERE ${RENEWAL_DUE_SQL})::int AS expired,
              COUNT(*) FILTER (WHERE ${CURRENT_CERT_SQL} AND t.expiry_date >= CURRENT_DATE AND t.expiry_date <= CURRENT_DATE + ${EXPIRY_SOON_DAYS})::int AS expiring,
-             COUNT(*) FILTER (WHERE t.status IN ('requested','scheduled','pending'))::int AS open
+             COUNT(*) FILTER (WHERE t.status IN ('requested','scheduled','pending') AND t.prior_expiry_date IS NULL)::int AS open
       FROM training_records t
       JOIN training_courses c ON c.id = t.course_id
       LEFT JOIN employees e ON e.id = t.employee_id

@@ -2592,10 +2592,58 @@ const TRAINING_UPDATE_ROLES = ['admin', 'hr'];
 
 app.get('/api/training-courses', auth, async (req, res) => {
   try {
+    const cols = 'id, name, validity_months, is_credential, needs_certificate, is_sensitive, icon';
+    // ?manage=1 → only the courses this user may manage on the Update page.
+    // Admin manages all; a non-admin sees only the courses granted to them
+    // (an empty grant = none, so they must be assigned in Admin first).
+    if (req.query.manage && req.user.role !== 'admin') {
+      const { rows } = await pool.query(
+        `SELECT ${cols} FROM training_courses
+          WHERE is_active = TRUE
+            AND id = ANY( (SELECT COALESCE(training_course_access,'{}') FROM users WHERE id = $1) )
+          ORDER BY sort_order ASC, name ASC`, [req.user.id]);
+      return res.json(rows);
+    }
     const { rows } = await pool.query(
-      'SELECT id, name, validity_months, is_credential, needs_certificate, is_sensitive, icon FROM training_courses WHERE is_active = TRUE ORDER BY sort_order ASC, name ASC'
+      `SELECT ${cols} FROM training_courses WHERE is_active = TRUE ORDER BY sort_order ASC, name ASC`
     );
     res.json(rows);
+  } catch(e) { sendError(res, e); }
+});
+
+// Whether a user may record/update outcomes for a course. Admin → always.
+// Others → the course must be in their (live, DB-read) training_course_access,
+// so an admin's change takes effect without the HR re-logging in.
+const canManageCourse = async (user, courseId) => {
+  if (user.role === 'admin') return true;
+  const { rows } = await pool.query(
+    `SELECT 1 FROM users WHERE id = $1 AND $2::uuid = ANY(COALESCE(training_course_access,'{}'))`,
+    [user.id, courseId]);
+  return rows.length > 0;
+};
+
+// Admin: set exactly which HR users manage a given course (many-to-many, stored
+// per user in training_course_access).
+app.put('/api/training-courses/:id/managers', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const courseId = req.params.id;
+  const userIds = Array.isArray(req.body.user_ids) ? req.body.user_ids : [];
+  try {
+    const c = await pool.query('SELECT id FROM training_courses WHERE id = $1', [courseId]);
+    if (!c.rows.length) return res.status(404).json({ error: 'Training not found' });
+    // Drop the course from any HR who is no longer selected.
+    await pool.query(
+      `UPDATE users SET training_course_access = array_remove(training_course_access, $1::uuid), updated_at = NOW()
+        WHERE role = 'hr' AND $1::uuid = ANY(training_course_access) AND NOT (id = ANY($2::uuid[]))`,
+      [courseId, userIds]);
+    // Grant it to the selected HR who don't have it yet.
+    if (userIds.length) {
+      await pool.query(
+        `UPDATE users SET training_course_access = array_append(COALESCE(training_course_access,'{}'), $1::uuid), updated_at = NOW()
+          WHERE role = 'hr' AND id = ANY($2::uuid[]) AND NOT ($1::uuid = ANY(COALESCE(training_course_access,'{}')))`,
+        [courseId, userIds]);
+    }
+    res.json({ ok: true });
   } catch(e) { sendError(res, e); }
 });
 
@@ -3014,6 +3062,7 @@ app.post('/api/training-records/:id/renew', auth, async (req, res) => {
     );
     if (!rec || !rec.employee_id) return res.status(404).json({ error: 'Not found' });
     if (!(await inScope(req.user, rec.project, rec.client))) return res.status(404).json({ error: 'Not found' });
+    if (!(await canManageCourse(req.user, rec.course_id))) return res.status(403).json({ error: `You are not assigned to manage "${rec.course_name}".` });
     if (rec.status !== 'completed') {
       return res.status(400).json({ error: 'Only a completed training can be renewed — record this one first.' });
     }
@@ -3068,7 +3117,7 @@ app.put('/api/training-records/:id/update', auth, async (req, res) => {
   try {
     // Load the record with its course validity and the employee snapshot fields.
     const { rows: [rec] } = await pool.query(
-      `SELECT t.id, t.status AS current_status, t.employee_id,
+      `SELECT t.id, t.status AS current_status, t.employee_id, t.course_id,
               t.completed_at AS current_completed_at, t.expiry_date AS current_expiry_date,
               c.validity_months, c.name AS course_name,
               e.project, e.client, e.organization
@@ -3080,6 +3129,8 @@ app.put('/api/training-records/:id/update', auth, async (req, res) => {
     if (!rec || !rec.employee_id) return res.status(404).json({ error: 'Not found' });
     // Scope: out of scope reads as not-found (HR/admin are unrestricted anyway).
     if (!(await inScope(req.user, rec.project, rec.client))) return res.status(404).json({ error: 'Not found' });
+    // Per-course management access (admin bypasses).
+    if (!(await canManageCourse(req.user, rec.course_id))) return res.status(403).json({ error: `You are not assigned to manage "${rec.course_name}".` });
     // Open requests AND already-recorded ones (e.g. a valid certificate that needs
     // correcting) can be updated here. Moving a completed record back to an open
     // status can trip the one-open-request index if a renewal already exists --
@@ -4456,7 +4507,7 @@ app.get('/api/graphs', auth, async (req, res) => {
 
 app.get('/api/users', auth, async (req, res) => {
   if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
-  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access, must_reset_password, failed_login_attempts, locked_until, last_login, created_at FROM users ORDER BY created_at DESC');
+  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access, training_course_access, must_reset_password, failed_login_attempts, locked_until, last_login, created_at FROM users ORDER BY created_at DESC');
   res.json(rows);
 });
 

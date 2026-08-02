@@ -411,21 +411,25 @@ async function setupDB() {
     await client.query('CREATE INDEX IF NOT EXISTS idx_training_records_status ON training_records(status)');
     await client.query('CREATE INDEX IF NOT EXISTS idx_training_records_expiry ON training_records(expiry_date)');
 
-    // Seed the 10 course types carried over from ETMS. validity_months is left
-    // NULL deliberately -- only Defensive Driving (24) is confirmed; the rest are
-    // pending and must be set before any completion can compute an expiry.
-    await client.query(`
-      INSERT INTO training_courses (name, validity_months, is_credential, is_sensitive, sort_order) VALUES
-        ('Defensive Driving', 24, FALSE, FALSE, 1),
-        ('Fall Arrest & Basic Rescue Technician', NULL, FALSE, FALSE, 2),
-        ('Rope Rigging Technician', NULL, FALSE, FALSE, 3),
-        ('General Safety and Pole Climbing', NULL, FALSE, FALSE, 4),
-        ('Basic Competency and Safety in Power Systems', NULL, FALSE, FALSE, 5),
-        ('Fire Fighting', NULL, FALSE, FALSE, 6),
-        ('First Aid', NULL, FALSE, FALSE, 7),
-        ('Hazard Identification & Risk Assessment', NULL, FALSE, FALSE, 8)
-      ON CONFLICT (name) DO NOTHING
-    `);
+    // Seed the initial course types carried over from ETMS -- but ONLY on a
+    // brand-new (empty) table. Re-seeding on every boot would resurrect courses
+    // the admin has since deleted/renamed, so it must not run once the table
+    // has any rows. validity_months is left NULL except Defensive Driving.
+    const { rows: [{ count: existingCourses }] } = await client.query('SELECT COUNT(*)::int AS count FROM training_courses');
+    if (existingCourses === 0) {
+      await client.query(`
+        INSERT INTO training_courses (name, validity_months, is_credential, is_sensitive, sort_order) VALUES
+          ('Defensive Driving', 24, FALSE, FALSE, 1),
+          ('Fall Arrest & Basic Rescue Technician', NULL, FALSE, FALSE, 2),
+          ('Rope Rigging Technician', NULL, FALSE, FALSE, 3),
+          ('General Safety and Pole Climbing', NULL, FALSE, FALSE, 4),
+          ('Basic Competency and Safety in Power Systems', NULL, FALSE, FALSE, 5),
+          ('Fire Fighting', NULL, FALSE, FALSE, 6),
+          ('First Aid', NULL, FALSE, FALSE, 7),
+          ('Hazard Identification & Risk Assessment', NULL, FALSE, FALSE, 8)
+        ON CONFLICT (name) DO NOTHING
+      `);
+    }
 
     // Icon is stored per course (a stable slug, not the editable name) so
     // renaming a training keeps its icon. Backfill known courses once; admins

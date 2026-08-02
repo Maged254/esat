@@ -3994,6 +3994,16 @@ const upload = multer({
     else cb(new Error('Only PDF and image files (JPEG, PNG, HEIC) are allowed'));
   }
 });
+// Training certificates are small scans/PDFs -- cap at 1MB (separate from the
+// 10MB audit-document uploader).
+const certUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 1 * 1024 * 1024 }, // 1MB
+  fileFilter: (req, file, cb) => {
+    if (ALLOWED_UPLOAD_MIMETYPES.includes(file.mimetype)) cb(null, true);
+    else cb(new Error('Only PDF and image files (JPEG, PNG, HEIC) are allowed'));
+  }
+});
 // Strips anything but alphanumerics/hyphen/underscore so user-controlled values
 // can't inject extra path segments into the Cloudinary public_id/folder.
 const sanitizeForPublicId = (s) => String(s || '').replace(/[^a-zA-Z0-9_-]/g, '-');
@@ -4163,8 +4173,8 @@ const loadTrainingRecordForCert = (id) => pool.query(
     WHERE t.id = $1 AND t.is_deleted IS NOT TRUE`, [id]);
 
 app.post('/api/training-records/:id/certificate', auth, (req, res) => {
-  upload.single('file')(req, res, async (err) => {
-    if (err) return res.status(400).json({ error: err.message || 'Upload rejected' });
+  certUpload.single('file')(req, res, async (err) => {
+    if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'Certificate must be 1MB or smaller.' : (err.message || 'Upload rejected') });
     if (!TRAINING_UPDATE_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized to update training records' });
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     try {

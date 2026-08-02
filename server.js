@@ -2890,7 +2890,7 @@ const ensureRenewalRequests = async (courseId) => {
 
 // Shared WHERE builder so /tracker and /stats always filter identically.
 const trainingTrackerWhere = async (req, params) => {
-  const { status, search, national_id, job_title, course_id, resource_type, department, expiry, employment_status, hide_expired_cert, new_only, group } = req.query;
+  const { status, search, national_id, job_title, course_id, resource_type, department, expiry, employment_status, hide_expired_cert, new_only, group, pending_reason } = req.query;
   const projectsCsv = req.query.projects ? req.query.projects.split(',').filter(Boolean) : [];
   const clientsCsv = req.query.clients ? req.query.clients.split(',').filter(Boolean) : [];
   let w = ` WHERE t.is_deleted IS NOT TRUE AND t.employee_id IS NOT NULL`;
@@ -2907,6 +2907,8 @@ const trainingTrackerWhere = async (req, params) => {
   else if (resource_type) { params.push(resource_type); w += ` AND e.resource_type = $${params.length}`; }
   if (projectsCsv.length) { params.push(projectsCsv); w += ` AND e.project = ANY($${params.length})`; }
   if (clientsCsv.length) { params.push(clientsCsv); w += ` AND e.client = ANY($${params.length})`; }
+  // Only pending records carry a reason, so this also narrows to Pending.
+  if (pending_reason) { params.push(pending_reason); w += ` AND t.pending_reason = $${params.length}`; }
   // Expiry buckets apply only to completed records that carry an expiry date.
   // A renewed (superseded) certificate is history, so it lands in none of them.
   // 'expired' = the expired CERTIFICATE (the Tracker's compliance view).

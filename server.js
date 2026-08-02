@@ -2760,11 +2760,12 @@ const EXPIRY_SOON_DAYS = 60;
 
 // Shared WHERE builder so /tracker and /stats always filter identically.
 const trainingTrackerWhere = async (req, params) => {
-  const { status, search, national_id, job_title, course_id, resource_type, department, expiry } = req.query;
+  const { status, search, national_id, job_title, course_id, resource_type, department, expiry, employment_status } = req.query;
   const projectsCsv = req.query.projects ? req.query.projects.split(',').filter(Boolean) : [];
   const clientsCsv = req.query.clients ? req.query.clients.split(',').filter(Boolean) : [];
   let w = ` WHERE t.is_deleted IS NOT TRUE AND t.employee_id IS NOT NULL`;
   if (status) { params.push(status.split(',')); w += ` AND t.status = ANY($${params.length})`; }
+  if (employment_status) { params.push(employment_status); w += ` AND e.employment_status = $${params.length}`; }
   if (search) { params.push(`%${search}%`); w += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length})`; }
   if (national_id) { params.push(`%${national_id}%`); w += ` AND e.national_id ILIKE $${params.length}`; }
   if (job_title) { params.push(`%${job_title}%`); w += ` AND e.job_title ILIKE $${params.length}`; }

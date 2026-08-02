@@ -2813,7 +2813,7 @@ app.get('/api/training-records/tracker', auth, async (req, res) => {
              c.name AS course_name, c.validity_months,
              e.full_name AS employee_name, e.national_id, e.employee_number,
              e.job_title, e.department, e.project, e.client,
-             u.full_name AS requested_by_name, ru.full_name AS recorded_by_name,
+             u.full_name AS requested_by_name, ru.full_name AS recorded_by_name, t.recorded_at,
              (t.expiry_date - CURRENT_DATE) AS days_to_expiry,
              CASE WHEN t.status='completed' AND t.expiry_date IS NOT NULL THEN
                CASE WHEN t.expiry_date < CURRENT_DATE THEN 'expired'
@@ -2928,8 +2928,8 @@ app.put('/api/training-records/:id/update', auth, async (req, res) => {
       const { scheduled_date } = req.body;
       if (!scheduled_date) return res.status(400).json({ error: 'A scheduled date is required' });
       const { rows } = await pool.query(
-        `UPDATE training_records SET status='scheduled', scheduled_date=$1, updated_at=NOW() WHERE id=$2 RETURNING *`,
-        [scheduled_date, req.params.id]
+        `UPDATE training_records SET status='scheduled', scheduled_date=$1, recorded_by=$2, recorded_at=NOW(), updated_at=NOW() WHERE id=$3 RETURNING *`,
+        [scheduled_date, req.user.id, req.params.id]
       );
       return res.json(rows[0]);
     }

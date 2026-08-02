@@ -2731,12 +2731,14 @@ app.get('/api/training-records', auth, async (req, res) => {
   try {
     const { employee_id, status } = req.query;
     const params = [];
-    let q = `SELECT t.*, c.name as course_name, e.full_name as employee_name,
-               e.national_id, e.employee_number, u.full_name as requested_by_name
+    let q = `SELECT t.*, c.name as course_name, c.icon as course_icon, e.full_name as employee_name,
+               e.national_id, e.employee_number, u.full_name as requested_by_name,
+               cu.full_name as cancelled_by_name
              FROM training_records t
              JOIN training_courses c ON c.id = t.course_id
              LEFT JOIN employees e ON e.id = t.employee_id
              LEFT JOIN users u ON u.id = t.requested_by
+             LEFT JOIN users cu ON cu.id = t.cancelled_by
              WHERE t.is_deleted IS NOT TRUE`;
     if (employee_id) { params.push(employee_id); q += ` AND t.employee_id = $${params.length}`; }
     if (status) { params.push(status.split(',')); q += ` AND t.status = ANY($${params.length})`; }
@@ -2981,6 +2983,34 @@ app.post('/api/training-requests', auth, async (req, res) => {
     }
     sendError(res, e);
   }
+});
+
+// Remove (cancel) an open training request -- EHS side, same roles as raising it.
+// A reason is mandatory. Only open requests can be cancelled.
+app.put('/api/training-records/:id/cancel', auth, async (req, res) => {
+  if (!TRAINING_REQUEST_ROLES.includes(req.user.role)) {
+    return res.status(403).json({ error: 'Not authorized to remove training requests' });
+  }
+  const { cancel_reason } = req.body;
+  if (!cancel_reason || !cancel_reason.trim()) return res.status(400).json({ error: 'A reason is required to remove a request' });
+  try {
+    const { rows: [rec] } = await pool.query(
+      `SELECT t.status AS current_status, e.project, e.client
+       FROM training_records t LEFT JOIN employees e ON e.id = t.employee_id
+       WHERE t.id = $1 AND t.is_deleted IS NOT TRUE AND t.employee_id IS NOT NULL`, [req.params.id]
+    );
+    if (!rec) return res.status(404).json({ error: 'Not found' });
+    if (!(await inScope(req.user, rec.project, rec.client))) return res.status(404).json({ error: 'Not found' });
+    if (!['requested', 'scheduled', 'pending'].includes(rec.current_status)) {
+      return res.status(400).json({ error: `This request is already ${rec.current_status} and can't be removed` });
+    }
+    const { rows: [updated] } = await pool.query(
+      `UPDATE training_records SET status='cancelled', cancel_reason=$1, cancelled_by=$2, cancelled_at=NOW(), updated_at=NOW()
+       WHERE id=$3 RETURNING *`,
+      [cancel_reason.trim(), req.user.id, req.params.id]
+    );
+    res.json(updated);
+  } catch(e) { sendError(res, e); }
 });
 
 // Start

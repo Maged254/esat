@@ -2882,10 +2882,10 @@ app.put('/api/training-records/:id/update', auth, async (req, res) => {
     if (!rec || !rec.employee_id) return res.status(404).json({ error: 'Not found' });
     // Scope: out of scope reads as not-found (HR/admin are unrestricted anyway).
     if (!(await inScope(req.user, rec.project, rec.client))) return res.status(404).json({ error: 'Not found' });
-    // Only open requests can be recorded; a terminal record must not be re-flipped here.
-    if (!['requested', 'scheduled', 'pending'].includes(rec.current_status)) {
-      return res.status(400).json({ error: `This record is already ${rec.current_status} and can't be updated here` });
-    }
+    // Open requests AND already-recorded ones (e.g. a valid certificate that needs
+    // correcting) can be updated here. Moving a completed record back to an open
+    // status can trip the one-open-request index if a renewal already exists --
+    // that's surfaced as a friendly 23505 below.
 
     if (status === 'completed') {
       const { completed_at, training_cost, partnership } = req.body;
@@ -2938,7 +2938,10 @@ app.put('/api/training-records/:id/update', auth, async (req, res) => {
       [not_eligible_reason.trim(), req.user.id, req.params.id]
     );
     return res.json(rows[0]);
-  } catch(e) { sendError(res, e); }
+  } catch(e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'This employee already has an open request for this training — resolve that one first.' });
+    sendError(res, e);
+  }
 });
 
 app.post('/api/training-requests', auth, async (req, res) => {

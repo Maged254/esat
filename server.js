@@ -2764,6 +2764,21 @@ app.get('/api/training-records', auth, async (req, res) => {
 // derived at query time, never stored -- matches ESAT's overdue-metric rule.
 const EXPIRY_SOON_DAYS = 60;
 
+// A completed record is SUPERSEDED once a later completion exists for the same
+// person+course -- i.e. the certificate was renewed. Superseded rows are kept as
+// history but must never count as expired, or every renewal would permanently
+// inflate the expired figures. Derived at query time, never stored (same rule as
+// the expiry state itself). Correlates on `t`, so it drops into any query below.
+const SUPERSEDED_SQL = `EXISTS (
+      SELECT 1 FROM training_records tx
+       WHERE tx.course_id = t.course_id AND tx.id <> t.id
+         AND tx.is_deleted IS NOT TRUE AND tx.status = 'completed'
+         AND (tx.employee_id = t.employee_id OR tx.casual_id = t.casual_id)
+         AND (tx.completed_at > t.completed_at
+              OR (tx.completed_at = t.completed_at AND tx.id > t.id)))`;
+// The current (latest) completed certificate for a person+course.
+const CURRENT_CERT_SQL = `t.status='completed' AND NOT ${SUPERSEDED_SQL}`;
+
 // Shared WHERE builder so /tracker and /stats always filter identically.
 const trainingTrackerWhere = async (req, params) => {
   const { status, search, national_id, job_title, course_id, resource_type, department, expiry, employment_status } = req.query;
@@ -2784,9 +2799,11 @@ const trainingTrackerWhere = async (req, params) => {
   if (projectsCsv.length) { params.push(projectsCsv); w += ` AND e.project = ANY($${params.length})`; }
   if (clientsCsv.length) { params.push(clientsCsv); w += ` AND e.client = ANY($${params.length})`; }
   // Expiry buckets apply only to completed records that carry an expiry date.
-  if (expiry === 'expiring') { w += ` AND t.status='completed' AND t.expiry_date >= CURRENT_DATE AND t.expiry_date <= CURRENT_DATE + ${EXPIRY_SOON_DAYS}`; }
-  else if (expiry === 'expired') { w += ` AND t.status='completed' AND t.expiry_date < CURRENT_DATE`; }
-  else if (expiry === 'valid') { w += ` AND t.status='completed' AND t.expiry_date > CURRENT_DATE + ${EXPIRY_SOON_DAYS}`; }
+  // A renewed (superseded) certificate is history, so it lands in none of them.
+  if (expiry === 'expiring') { w += ` AND ${CURRENT_CERT_SQL} AND t.expiry_date >= CURRENT_DATE AND t.expiry_date <= CURRENT_DATE + ${EXPIRY_SOON_DAYS}`; }
+  else if (expiry === 'expired') { w += ` AND ${CURRENT_CERT_SQL} AND t.expiry_date < CURRENT_DATE`; }
+  else if (expiry === 'valid') { w += ` AND ${CURRENT_CERT_SQL} AND t.expiry_date > CURRENT_DATE + ${EXPIRY_SOON_DAYS}`; }
+  else if (expiry === 'superseded') { w += ` AND t.status='completed' AND ${SUPERSEDED_SQL}`; }
   // Project/client scope -- returns null (no restriction) or an allow-list.
   const projects = await getProjectFilter(req.user);
   if (projects !== null) {
@@ -2817,7 +2834,8 @@ app.get('/api/training-records/tracker', auth, async (req, res) => {
              e.job_title, e.department, e.project, e.client,
              u.full_name AS requested_by_name, ru.full_name AS recorded_by_name, t.recorded_at,
              (t.expiry_date - CURRENT_DATE) AS days_to_expiry,
-             CASE WHEN t.status='completed' AND t.expiry_date IS NOT NULL THEN
+             CASE WHEN t.status='completed' AND ${SUPERSEDED_SQL} THEN 'superseded'
+                  WHEN t.status='completed' AND t.expiry_date IS NOT NULL THEN
                CASE WHEN t.expiry_date < CURRENT_DATE THEN 'expired'
                     WHEN t.expiry_date <= CURRENT_DATE + ${EXPIRY_SOON_DAYS} THEN 'expiring'
                     ELSE 'valid' END
@@ -2845,7 +2863,7 @@ app.get('/api/training-records/stats', auth, async (req, res) => {
     const statReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined } };
     const params = [];
     const built = await trainingTrackerWhere(statReq, params);
-    if (built.blocked) return res.json({ total:0, requested:0, scheduled:0, pending:0, completed:0, expiring:0, expired:0 });
+    if (built.blocked) return res.json({ total:0, requested:0, scheduled:0, pending:0, completed:0, expiring:0, expired:0, superseded:0 });
     const q = `
       SELECT
         COUNT(*)::int AS total,
@@ -2853,14 +2871,102 @@ app.get('/api/training-records/stats', auth, async (req, res) => {
         COUNT(*) FILTER (WHERE t.status='scheduled')::int AS scheduled,
         COUNT(*) FILTER (WHERE t.status='pending')::int AS pending,
         COUNT(*) FILTER (WHERE t.status='completed')::int AS completed,
-        COUNT(*) FILTER (WHERE t.status='completed' AND t.expiry_date >= CURRENT_DATE AND t.expiry_date <= CURRENT_DATE + ${EXPIRY_SOON_DAYS})::int AS expiring,
-        COUNT(*) FILTER (WHERE t.status='completed' AND t.expiry_date < CURRENT_DATE)::int AS expired
+        COUNT(*) FILTER (WHERE ${CURRENT_CERT_SQL} AND t.expiry_date >= CURRENT_DATE AND t.expiry_date <= CURRENT_DATE + ${EXPIRY_SOON_DAYS})::int AS expiring,
+        COUNT(*) FILTER (WHERE ${CURRENT_CERT_SQL} AND t.expiry_date < CURRENT_DATE)::int AS expired,
+        COUNT(*) FILTER (WHERE t.status='completed' AND ${SUPERSEDED_SQL})::int AS superseded
       FROM training_records t
       JOIN training_courses c ON c.id = t.course_id
       LEFT JOIN employees e ON e.id = t.employee_id
       ${built.where}`;
     const { rows } = await pool.query(q, params);
     res.json(rows[0]);
+  } catch(e) { sendError(res, e); }
+});
+
+// Per-course expired/expiring counts, so the Update page can show HR what needs
+// renewing before a course is even picked. Ignores any course_id/status/expiry
+// filter (it reports on every course) but keeps the people-filters and scope.
+app.get('/api/training-records/expiry-summary', auth, async (req, res) => {
+  try {
+    const sumReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined, course_id: undefined } };
+    const params = [];
+    const built = await trainingTrackerWhere(sumReq, params);
+    if (built.blocked) return res.json([]);
+    const q = `
+      SELECT t.course_id,
+             COUNT(*) FILTER (WHERE ${CURRENT_CERT_SQL} AND t.expiry_date < CURRENT_DATE)::int AS expired,
+             COUNT(*) FILTER (WHERE ${CURRENT_CERT_SQL} AND t.expiry_date >= CURRENT_DATE AND t.expiry_date <= CURRENT_DATE + ${EXPIRY_SOON_DAYS})::int AS expiring,
+             COUNT(*) FILTER (WHERE t.status IN ('requested','scheduled','pending'))::int AS open
+      FROM training_records t
+      JOIN training_courses c ON c.id = t.course_id
+      LEFT JOIN employees e ON e.id = t.employee_id
+      ${built.where}
+      GROUP BY t.course_id`;
+    const { rows } = await pool.query(q, params);
+    res.json(rows);
+  } catch(e) { sendError(res, e); }
+});
+
+// ── Renew a training (new certificate, previous one kept) ───
+// A renewal is a NEW record, never an overwrite: the expired certificate stays
+// as history (with its own date, cost and -- later -- its PDF) and is marked
+// superseded by the derived rule above. Correcting a mistake on the current
+// certificate is the other endpoint (`/update`), which edits in place.
+app.post('/api/training-records/:id/renew', auth, async (req, res) => {
+  if (!TRAINING_UPDATE_ROLES.includes(req.user.role)) {
+    return res.status(403).json({ error: 'Not authorized to update training records' });
+  }
+  const { completed_at, training_cost, partnership } = req.body;
+  try {
+    const { rows: [rec] } = await pool.query(
+      `SELECT t.id, t.status, t.employee_id, t.casual_id, t.course_id, t.completed_at, t.expiry_date,
+              c.validity_months, c.name AS course_name,
+              e.project, e.client, e.organization, e.employment_status
+       FROM training_records t
+       JOIN training_courses c ON c.id = t.course_id
+       LEFT JOIN employees e ON e.id = t.employee_id
+       WHERE t.id = $1 AND t.is_deleted IS NOT TRUE`, [req.params.id]
+    );
+    if (!rec || !rec.employee_id) return res.status(404).json({ error: 'Not found' });
+    if (!(await inScope(req.user, rec.project, rec.client))) return res.status(404).json({ error: 'Not found' });
+    if (rec.status !== 'completed') {
+      return res.status(400).json({ error: 'Only a completed training can be renewed — record this one first.' });
+    }
+    if (!completed_at) return res.status(400).json({ error: 'Completion date is required' });
+    if (rec.validity_months == null) {
+      return res.status(400).json({ error: `Set a validity period for "${rec.course_name}" in Admin → Training Courses before renewing it, so the expiry can be computed.` });
+    }
+    if (rec.completed_at && new Date(completed_at) <= new Date(rec.completed_at)) {
+      return res.status(400).json({ error: 'The renewal date must be after the previous completion date.' });
+    }
+    // If EHS already raised a fresh request for this training, that record is the
+    // one to record against -- renewing separately would strand it open.
+    const { rows: [open] } = await pool.query(
+      `SELECT id FROM training_records
+        WHERE employee_id=$1 AND course_id=$2 AND is_deleted IS NOT TRUE
+          AND status IN ('requested','scheduled','pending') LIMIT 1`,
+      [rec.employee_id, rec.course_id]
+    );
+    if (open) {
+      return res.status(400).json({ error: 'This employee already has an open request for this training — record that one as completed instead of renewing.' });
+    }
+    const cost = (training_cost === '' || training_cost == null) ? null : Number(training_cost);
+    if (cost != null && (isNaN(cost) || cost < 0)) return res.status(400).json({ error: 'Training cost must be a non-negative number' });
+    const { rows } = await pool.query(
+      `INSERT INTO training_records
+         (employee_id, course_id, status, requested_by, requested_at,
+          completed_at, expiry_date, validity_months_applied, training_cost, partnership,
+          project_at_completion, client_at_completion, organization_at_completion,
+          recorded_by, recorded_at)
+       VALUES ($1, $2, 'completed', $3, NOW(),
+               $4, ($4::date + ($5 * INTERVAL '1 month'))::date, $5, $6, $7,
+               $8, $9, $10, $3, NOW())
+       RETURNING *`,
+      [rec.employee_id, rec.course_id, req.user.id,
+       completed_at, rec.validity_months, cost, partnership || null,
+       rec.project || null, rec.client || null, rec.organization || null]
+    );
+    res.status(201).json(rows[0]);
   } catch(e) { sendError(res, e); }
 });
 
@@ -2878,6 +2984,7 @@ app.put('/api/training-records/:id/update', auth, async (req, res) => {
     // Load the record with its course validity and the employee snapshot fields.
     const { rows: [rec] } = await pool.query(
       `SELECT t.id, t.status AS current_status, t.employee_id,
+              t.completed_at AS current_completed_at, t.expiry_date AS current_expiry_date,
               c.validity_months, c.name AS course_name,
               e.project, e.client, e.organization
        FROM training_records t
@@ -2898,6 +3005,13 @@ app.put('/api/training-records/:id/update', auth, async (req, res) => {
       if (!completed_at) return res.status(400).json({ error: 'Completion date is required' });
       if (rec.validity_months == null) {
         return res.status(400).json({ error: `Set a validity period for "${rec.course_name}" in Admin → Training Courses before completing it, so the expiry can be computed.` });
+      }
+      // Editing a completed record is a CORRECTION to that certificate. A date at
+      // or beyond its expiry is a new training cycle, and saving it here would
+      // silently erase the previous certificate -- that has to go through Renew.
+      if (rec.current_status === 'completed' && rec.current_expiry_date &&
+          new Date(completed_at) >= new Date(rec.current_expiry_date)) {
+        return res.status(400).json({ error: 'That date starts a new training cycle. Use Renew so the previous certificate is kept as history.' });
       }
       const cost = (training_cost === '' || training_cost == null) ? null : Number(training_cost);
       if (cost != null && (isNaN(cost) || cost < 0)) return res.status(400).json({ error: 'Training cost must be a non-negative number' });

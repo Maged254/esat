@@ -377,6 +377,9 @@ async function setupDB() {
       );
     `);
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS training_course_access UUID[] DEFAULT '{}'");
+    // When a certificate expires we auto-open a renewal request; this stamps that
+    // request with the date the previous certificate expired (shown as a note).
+    await client.query('ALTER TABLE training_records ADD COLUMN IF NOT EXISTS prior_expiry_date DATE');
 
     // Targeted constraints: ESAT has none elsewhere, but each of these prevents
     // a specific corruption that would be expensive to unpick after migration.
@@ -2779,6 +2782,44 @@ const SUPERSEDED_SQL = `EXISTS (
 // The current (latest) completed certificate for a person+course.
 const CURRENT_CERT_SQL = `t.status='completed' AND NOT ${SUPERSEDED_SQL}`;
 
+// When a certificate expires, a renewal has to happen -- so we auto-open a
+// `requested` record for it, which then flows through the normal Update process
+// (scheduled / pending / completed) like any other request. The expired
+// certificate itself is left untouched (still reads "Expired"); the new request
+// carries `prior_expiry_date` so the UI can show "Expired on <date>".
+//
+// This is idempotent and lazy: it inserts a request only for a CURRENT expired
+// certificate (not superseded history) belonging to an ACTIVE employee that does
+// not already have an open request. The partial unique index is the final guard
+// against duplicates, so concurrent calls are safe (23505 is swallowed).
+const ensureRenewalRequests = async (courseId) => {
+  const params = [];
+  let courseClause = '';
+  if (courseId) { params.push(courseId); courseClause = ` AND t.course_id = $${params.length}`; }
+  try {
+    await pool.query(`
+      INSERT INTO training_records (employee_id, course_id, status, requested_at, prior_expiry_date, created_at, updated_at)
+      SELECT t.employee_id, t.course_id, 'requested', NOW(), t.expiry_date, NOW(), NOW()
+      FROM training_records t
+      JOIN employees e ON e.id = t.employee_id
+      WHERE t.status = 'completed'
+        AND t.expiry_date < CURRENT_DATE
+        AND t.is_deleted IS NOT TRUE
+        AND t.employee_id IS NOT NULL
+        AND e.employment_status = 'active'
+        ${courseClause}
+        AND NOT ${SUPERSEDED_SQL}
+        AND NOT EXISTS (
+          SELECT 1 FROM training_records o
+           WHERE o.employee_id = t.employee_id AND o.course_id = t.course_id
+             AND o.is_deleted IS NOT TRUE
+             AND o.status IN ('requested','scheduled','pending'))
+    `, params);
+  } catch (e) {
+    if (e.code !== '23505') throw e; // unique index caught a race -- already exists
+  }
+};
+
 // Shared WHERE builder so /tracker and /stats always filter identically.
 const trainingTrackerWhere = async (req, params) => {
   const { status, search, national_id, job_title, course_id, resource_type, department, expiry, employment_status } = req.query;
@@ -2820,6 +2861,7 @@ const trainingTrackerWhere = async (req, params) => {
 
 app.get('/api/training-records/tracker', auth, async (req, res) => {
   try {
+    await ensureRenewalRequests(req.query.course_id); // materialise renewals for newly-expired certs
     const params = [];
     const built = await trainingTrackerWhere(req, params);
     if (built.blocked) return res.json({ rows: [], total: 0, page: 1, pageSize: 25 });
@@ -2828,7 +2870,7 @@ app.get('/api/training-records/tracker', auth, async (req, res) => {
     const offset = (pageNum - 1) * limit;
     const q = `
       SELECT t.id, t.status, t.requested_at, t.scheduled_date, t.completed_at,
-             t.expiry_date, t.pending_reason, t.not_eligible_reason, t.cancel_reason,
+             t.expiry_date, t.prior_expiry_date, t.pending_reason, t.not_eligible_reason, t.cancel_reason,
              c.name AS course_name, c.validity_months,
              e.full_name AS employee_name, e.national_id, e.employee_number,
              e.job_title, e.department, e.project, e.client,
@@ -2858,6 +2900,7 @@ app.get('/api/training-records/tracker', auth, async (req, res) => {
 
 app.get('/api/training-records/stats', auth, async (req, res) => {
   try {
+    await ensureRenewalRequests(req.query.course_id); // keep counts in step with the list
     // Stats ignore the status/expiry filters (they ARE the buckets) but keep the
     // people-filters, so counts always match the list the user is looking at.
     const statReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined } };
@@ -2888,6 +2931,7 @@ app.get('/api/training-records/stats', auth, async (req, res) => {
 // filter (it reports on every course) but keeps the people-filters and scope.
 app.get('/api/training-records/expiry-summary', auth, async (req, res) => {
   try {
+    await ensureRenewalRequests(); // Update page mount → sweep every course
     const sumReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined, course_id: undefined } };
     const params = [];
     const built = await trainingTrackerWhere(sumReq, params);
@@ -4019,7 +4063,13 @@ app.post('/api/admin/test-overdue-digest', auth, async (req, res) => {
   } catch(e) { sendError(res, e); }
 });
 
-app.listen(PORT, () => { console.log(`ESAT running on port ${PORT}`); scheduleDailyDigest(); });
+app.listen(PORT, () => {
+  console.log(`ESAT running on port ${PORT}`);
+  scheduleDailyDigest();
+  // Open renewal requests for anything already expired at boot, then daily.
+  ensureRenewalRequests().catch(e => console.error('ensureRenewalRequests (boot):', e.message));
+  setInterval(() => ensureRenewalRequests().catch(e => console.error('ensureRenewalRequests (daily):', e.message)), 24 * 60 * 60 * 1000);
+});
 });
 
 // ── User Management Routes ───────────────────────────────────

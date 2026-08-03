@@ -4000,8 +4000,8 @@ const certUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 1 * 1024 * 1024 }, // 1MB
   fileFilter: (req, file, cb) => {
-    if (ALLOWED_UPLOAD_MIMETYPES.includes(file.mimetype)) cb(null, true);
-    else cb(new Error('Only PDF and image files (JPEG, PNG, HEIC) are allowed'));
+    if (file.mimetype === 'application/pdf') cb(null, true);
+    else cb(new Error('Certificate must be a PDF.'));
   }
 });
 // Strips anything but alphanumerics/hyphen/underscore so user-controlled values

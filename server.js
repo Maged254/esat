@@ -836,7 +836,7 @@ app.get('/api/employees', auth, async (req, res) => {
     return res.status(403).json({ error: 'Not authorized' });
   }
   try {
-    const { status, search, national_id, project, client, san, job_title, department, resource_type, audit_age, page, pageSize } = req.query;
+    const { status, search, national_id, employee_number, project, client, san, job_title, department, resource_type, audit_age, page, pageSize } = req.query;
     // Other pages (pickers/dropdowns) call this endpoint without `page` and need
     // the old bare-array shape with every matching row -- only paginate, and only
     // switch to the {rows,total,...} shape, when a page param is actually sent.
@@ -849,6 +849,7 @@ app.get('/api/employees', auth, async (req, res) => {
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
     if (search) { params.push(`%${search}%`); q += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length})`; }
     if (national_id) { params.push(`%${national_id}%`); q += ` AND e.national_id ILIKE $${params.length}`; }
+    if (employee_number) { params.push(`%${employee_number}%`); q += ` AND e.employee_number ILIKE $${params.length}`; }
     if (project) { params.push(project); q += ` AND e.project=$${params.length}`; }
     if (client) { params.push(client); q += ` AND e.client=$${params.length}`; }
     if (san === 'yes') { q += ` AND (e.san IS NULL OR e.san = TRUE)`; }
@@ -895,7 +896,7 @@ app.get('/api/employees/stats', auth, async (req, res) => {
     return res.status(403).json({ error: 'Not authorized' });
   }
   try {
-    const { status, search, national_id, project, client, san, job_title, department, resource_type, audit_age } = req.query;
+    const { status, search, national_id, employee_number, project, client, san, job_title, department, resource_type, audit_age } = req.query;
     const zero = { total_active: 0, inhouse: 0, outsource: 0, interns: 0, exits: 0 };
     let q = `WITH scoped AS (
         SELECT e.employment_status, e.resource_type, e.job_title,
@@ -907,6 +908,7 @@ app.get('/api/employees/stats', auth, async (req, res) => {
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
     if (search) { params.push(`%${search}%`); q += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length})`; }
     if (national_id) { params.push(`%${national_id}%`); q += ` AND e.national_id ILIKE $${params.length}`; }
+    if (employee_number) { params.push(`%${employee_number}%`); q += ` AND e.employee_number ILIKE $${params.length}`; }
     if (project) { params.push(project); q += ` AND e.project=$${params.length}`; }
     if (client) { params.push(client); q += ` AND e.client=$${params.length}`; }
     if (san === 'yes') { q += ` AND (e.san IS NULL OR e.san = TRUE)`; }

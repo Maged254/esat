@@ -4027,6 +4027,16 @@ const r2 = R2_CONFIGURED ? new S3Client({
   endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   credentials: { accessKeyId: process.env.R2_ACCESS_KEY_ID, secretAccessKey: process.env.R2_SECRET_ACCESS_KEY },
 }) : null;
+// Keep certificate keys/filenames human-readable, mirroring the SharePoint
+// TrainingCertificatesLibrary layout: "<NationalID> - <Name>/<Course>/<Name> (<date>).<ext>".
+// Only collapse path-breaking/whitespace chars; spaces and () are fine in S3 keys.
+const cleanKeyPart = (s) => String(s || '').replace(/[\\/\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim() || '_';
+const MIME_EXT = { 'application/pdf': 'pdf', 'image/jpeg': 'jpg', 'image/png': 'png', 'image/heic': 'heic', 'image/heif': 'heif' };
+const certDateStr = (d) => (d ? new Date(d) : new Date()).toISOString().slice(0, 10);
+const certExtFor = (filename, mime) => {
+  const e = (String(filename || '').split('.').pop() || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  return e || MIME_EXT[mime] || 'pdf';
+};
 
 // ── Upload Audit Document ────────────────────────────────────
 app.post('/api/audit-documents/upload', auth, (req, res) => {
@@ -4179,7 +4189,7 @@ app.delete('/api/audit-documents/:id', auth, async (req, res) => {
 // Loads a training record with everything the three handlers need.
 const loadTrainingRecordForCert = (id) => pool.query(
   `SELECT t.id, t.employee_id, t.course_id, t.cloudinary_public_id, t.certificate_url,
-          t.resource_type, t.delivery_type, t.original_filename,
+          t.resource_type, t.delivery_type, t.original_filename, t.completed_at,
           c.name AS course_name, e.full_name AS employee_name, e.national_id, e.project, e.client
      FROM training_records t
      JOIN training_courses c ON c.id = t.course_id
@@ -4198,9 +4208,17 @@ app.post('/api/training-records/:id/certificate', auth, (req, res) => {
       if (!(await inScope(req.user, rec.project, rec.client))) return res.status(404).json({ error: 'Not found' });
       if (!(await canManageCourse(req.user, rec.course_id))) return res.status(403).json({ error: `You are not assigned to manage "${rec.course_name}".` });
 
-      const folder = `esat-training-certs/${sanitizeForPublicId(rec.national_id)}_${sanitizeForPublicId(rec.employee_name)}`;
-      const ext = (req.file.originalname.split('.').pop() || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-      const key = `${folder}/${sanitizeForPublicId(rec.course_name)}_${rec.id}${ext ? '.' + ext : ''}`;
+      // Mirror the SharePoint layout: <NationalID> - <Name>/<Course>/<Name> (<date>).<ext>
+      const ext = certExtFor(req.file.originalname, req.file.mimetype);
+      const person = `${cleanKeyPart(rec.national_id)} - ${cleanKeyPart(rec.employee_name)}`;
+      const base = `${person}/${cleanKeyPart(rec.course_name)}/${cleanKeyPart(rec.employee_name)} (${certDateStr(rec.completed_at)})`;
+      let key = `${base}.${ext}`;
+      // Same person+course+date on two different records is rare but possible;
+      // append a short id so one never silently overwrites the other.
+      const clash = await pool.query(
+        `SELECT 1 FROM training_records WHERE cloudinary_public_id = $1 AND id <> $2 AND is_deleted IS NOT TRUE LIMIT 1`,
+        [key, rec.id]);
+      if (clash.rows.length) key = `${base} [${rec.id.slice(0, 8)}].${ext}`;
       await r2.send(new PutObjectCommand({
         Bucket: R2_BUCKET, Key: key, Body: req.file.buffer, ContentType: req.file.mimetype,
       }));
@@ -4237,9 +4255,14 @@ app.get('/api/training-records/:id/certificate/download', async (req, res) => {
     const { rows: [rec] } = await loadTrainingRecordForCert(req.params.id);
     if (!rec || !rec.cloudinary_public_id) return res.status(404).json({ error: 'Not found' });
     if (!(await inScope(req.user, rec.project, rec.client))) return res.status(404).json({ error: 'Not found' });
-    // Preview → inline (renders in <img>/<iframe>); otherwise a named download.
-    const safeName = (rec.original_filename || 'certificate').replace(/[^\w.\- ]/g, '_');
-    const disposition = req.query.preview ? 'inline' : `attachment; filename="${safeName}"`;
+    // Preview → inline (renders in <img>/<iframe>); otherwise a named download
+    // matching the SharePoint convention: "<Name> (<completion date>).<ext>".
+    const ext = certExtFor(rec.cloudinary_public_id, rec.resource_type);
+    const dlName = `${cleanKeyPart(rec.employee_name)} (${certDateStr(rec.completed_at)}).${ext}`;
+    const asciiName = dlName.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '');
+    const disposition = req.query.preview
+      ? 'inline'
+      : `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(dlName)}`;
     const url = await getSignedUrl(r2, new GetObjectCommand({
       Bucket: R2_BUCKET, Key: rec.cloudinary_public_id,
       ResponseContentType: rec.resource_type || undefined,

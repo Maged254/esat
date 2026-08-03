@@ -4241,8 +4241,11 @@ app.post('/api/training-records/:id/certificate', auth, (req, res) => {
   });
 });
 
-// Redirect to a short-lived signed URL. Token via header OR ?token= (so a plain
-// <a>/<img> works). Anyone in the record's project/client scope may view.
+// Stream the certificate THROUGH the backend (not a redirect), so the R2
+// presigned URL -- which exposes the account id, access-key id, and the
+// employee's name/national-id in the object path -- is never seen by the
+// browser. The browser only ever sees this endpoint (a record UUID + token).
+// Token via header OR ?token= so a plain <img>/new-tab navigation works.
 app.get('/api/training-records/:id/certificate/download', async (req, res) => {
   const token = req.headers.authorization?.split(' ')[1] || req.query.token;
   if (!token) return res.status(401).json({ error: 'No token' });
@@ -4255,7 +4258,7 @@ app.get('/api/training-records/:id/certificate/download', async (req, res) => {
     const { rows: [rec] } = await loadTrainingRecordForCert(req.params.id);
     if (!rec || !rec.cloudinary_public_id) return res.status(404).json({ error: 'Not found' });
     if (!(await inScope(req.user, rec.project, rec.client))) return res.status(404).json({ error: 'Not found' });
-    // Preview → inline (renders in <img>/<iframe>); otherwise a named download
+    // Preview → inline (renders in <img>/PDF viewer); otherwise a named download
     // matching the SharePoint convention: "<Name> (<completion date>).<ext>".
     const ext = certExtFor(rec.cloudinary_public_id, rec.resource_type);
     const dlName = `${cleanKeyPart(rec.employee_name)} (${certDateStr(rec.completed_at)}).${ext}`;
@@ -4263,13 +4266,18 @@ app.get('/api/training-records/:id/certificate/download', async (req, res) => {
     const disposition = req.query.preview
       ? 'inline'
       : `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(dlName)}`;
-    const url = await getSignedUrl(r2, new GetObjectCommand({
-      Bucket: R2_BUCKET, Key: rec.cloudinary_public_id,
-      ResponseContentType: rec.resource_type || undefined,
-      ResponseContentDisposition: disposition,
-    }), { expiresIn: 300 });
-    res.redirect(url);
-  } catch (e) { res.status(500).json({ error: 'Download failed' }); }
+    const obj = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: rec.cloudinary_public_id }));
+    res.setHeader('Content-Type', rec.resource_type || obj.ContentType || 'application/octet-stream');
+    res.setHeader('Content-Disposition', disposition);
+    res.setHeader('Cache-Control', 'private, no-store');
+    if (obj.ContentLength != null) res.setHeader('Content-Length', obj.ContentLength);
+    obj.Body.on('error', () => { res.destroy(); });
+    res.on('close', () => { try { obj.Body.destroy(); } catch { /* already closed */ } });
+    obj.Body.pipe(res);
+  } catch (e) {
+    if (e.name === 'NoSuchKey') return res.status(404).json({ error: 'Not found' });
+    if (!res.headersSent) res.status(500).json({ error: 'Download failed' });
+  }
 });
 
 app.delete('/api/training-records/:id/certificate', auth, async (req, res) => {

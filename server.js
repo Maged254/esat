@@ -293,6 +293,26 @@ async function setupDB() {
     await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS last_edited_by UUID REFERENCES users(id)");
     await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS last_edited_at TIMESTAMPTZ");
     await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS last_edit_reason TEXT");
+    // Immutable, append-only history of employee-detail changes (edits + exits).
+    // Snapshots employee + editor identity so a row stays readable even if the
+    // employee is later renamed or the user removed. `changes` is a JSON array of
+    // { field, before, after }. Feeds the Change History page + the daily digest.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS employee_change_log (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        employee_id UUID REFERENCES employees(id) ON DELETE SET NULL,
+        employee_name VARCHAR(150),
+        national_id VARCHAR(30),
+        employee_number VARCHAR(20),
+        action VARCHAR(20) NOT NULL DEFAULT 'update',
+        reason TEXT,
+        changes JSONB NOT NULL DEFAULT '[]'::jsonb,
+        changed_by UUID REFERENCES users(id),
+        changed_by_name VARCHAR(150),
+        changed_at TIMESTAMPTZ DEFAULT NOW()
+      )`);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_employee_change_log_changed_at ON employee_change_log(changed_at)");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_employee_change_log_employee ON employee_change_log(employee_id)");
     await client.query("ALTER TABLE ncr_items ALTER COLUMN status TYPE VARCHAR(50)");
     await client.query("ALTER TABLE ppe_requests ALTER COLUMN status TYPE VARCHAR(50)");
     await client.query("UPDATE employees SET san = TRUE WHERE san IS NULL");
@@ -1235,13 +1255,25 @@ app.put('/api/employees/:id/status', auth, async (req, res) => {
     return res.status(400).json({ error: 'Invalid employment_status' });
   }
   if (exit_date && isNaN(Date.parse(exit_date))) return res.status(400).json({ error: 'Invalid exit_date' });
+  const { reason } = req.body;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const cur = (await client.query('SELECT * FROM employees WHERE id=$1 FOR UPDATE', [req.params.id])).rows[0];
+    if (!cur) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
     await client.query('UPDATE employees SET employment_status=$1, exit_date=$2, updated_at=NOW() WHERE id=$3', [employment_status, exit_date || null, req.params.id]);
     if (employment_status === 'exit') {
       await client.query(`UPDATE ppe_requests SET status='exit', updated_at=NOW() WHERE employee_id=$1 AND status NOT IN ('distributed','canceled','exit')`, [req.params.id]);
       await client.query(`UPDATE ncr_items SET status='exit', updated_at=NOW() WHERE employee_id=$1 AND status NOT IN ('resolved','distributed','canceled','exit')`, [req.params.id]);
+    }
+    // Log a status change (exit / reactivate) to the employee history.
+    if (employment_status && employment_status !== cur.employment_status) {
+      const changes = [{ field: 'Status', before: cur.employment_status, after: employment_status }];
+      await client.query(
+        `INSERT INTO employee_change_log (employee_id, employee_name, national_id, employee_number, action, reason, changes, changed_by, changed_by_name)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9)`,
+        [cur.id, cur.full_name, cur.national_id, cur.employee_number, employment_status === 'exit' ? 'exit' : 'reactivate', reason?.trim() || null, JSON.stringify(changes), req.user.id, req.user.name || null]
+      );
     }
     await client.query('COMMIT');
     const { rows } = await pool.query('SELECT * FROM employees WHERE id=$1', [req.params.id]);
@@ -1263,21 +1295,81 @@ app.put('/api/employees/:id/san', auth, async (req, res) => {
 // Edit an employee's core details (admin, hr) — records who/when + a mandatory
 // reason (mirrors the ETMS "Update Resource's Details" screen). employee_number,
 // organization, resource_type and employment_status are NOT editable here.
+// Every save writes an immutable field-level diff to employee_change_log.
+const EMPLOYEE_EDITABLE = [
+  { key: 'full_name', label: 'Employee Name' },
+  { key: 'job_title', label: 'Job Title' },
+  { key: 'department', label: 'Department' },
+  { key: 'project', label: 'Project' },
+  { key: 'client', label: 'Client' },
+];
 app.put('/api/employees/:id', auth, async (req, res) => {
   if (!['admin', 'hr'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
   const { full_name, national_id, job_title, department, project, client, reason } = req.body;
   if (!full_name || !full_name.trim()) return res.status(400).json({ error: 'Employee name is required' });
   if (!reason || !reason.trim()) return res.status(400).json({ error: 'A reason for the update is required' });
+  const next = {
+    full_name: full_name.trim(),
+    job_title: job_title?.trim() || null,
+    department: department || null,
+    project: project || null,
+    client: client || null,
+  };
+  const client_db = await pool.connect();
   try {
-    const { rows } = await pool.query(
+    await client_db.query('BEGIN');
+    const cur = (await client_db.query('SELECT * FROM employees WHERE id=$1 FOR UPDATE', [req.params.id])).rows[0];
+    if (!cur) { await client_db.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+    // Field-level diff over the editable fields only (national_id is read-only).
+    const norm = (v) => (v === undefined || v === null || v === '') ? null : v;
+    const changes = EMPLOYEE_EDITABLE
+      .filter(f => norm(cur[f.key]) !== norm(next[f.key]))
+      .map(f => ({ field: f.label, before: cur[f.key] || null, after: next[f.key] || null }));
+    const { rows } = await client_db.query(
       `UPDATE employees SET full_name=$1, national_id=$2, job_title=$3, department=$4, project=$5, client=$6,
          last_edit_reason=$7, last_edited_by=$8, last_edited_at=NOW(), updated_at=NOW()
        WHERE id=$9 RETURNING *`,
-      [full_name.trim(), national_id || null, job_title || null, department || null, project || null, client || null, reason.trim(), req.user.id, req.params.id]
+      [next.full_name, national_id || null, next.job_title, next.department, next.project, next.client, reason.trim(), req.user.id, req.params.id]
     );
-    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    // Only record history when something actually changed.
+    if (changes.length) {
+      await client_db.query(
+        `INSERT INTO employee_change_log (employee_id, employee_name, national_id, employee_number, action, reason, changes, changed_by, changed_by_name)
+         VALUES ($1,$2,$3,$4,'update',$5,$6::jsonb,$7,$8)`,
+        [cur.id, cur.full_name, cur.national_id, cur.employee_number, reason.trim(), JSON.stringify(changes), req.user.id, req.user.name || null]
+      );
+    }
+    await client_db.query('COMMIT');
     broadcastEmployeesChanged();
-    res.json(rows[0]);
+    res.json({ ...rows[0], changed_fields: changes.length });
+  } catch (e) { await client_db.query('ROLLBACK'); sendError(res, e); }
+  finally { client_db.release(); }
+});
+
+// Employee change history (admin, hr) — the written record of who changed what,
+// when, for which employee. Filterable by date range / action / employee, so the
+// "what changed yesterday" digest and an on-demand review both read from here.
+app.get('/api/employee-change-log', auth, async (req, res) => {
+  if (!['admin', 'hr'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  try {
+    const { from, to, action, search, page, pageSize } = req.query;
+    const limit = Math.min(Math.max(parseInt(pageSize) || 50, 1), 200);
+    const pageNum = Math.max(parseInt(page) || 1, 1);
+    const offset = (pageNum - 1) * limit;
+    let q = `SELECT id, employee_id, employee_name, national_id, employee_number, action, reason, changes,
+                    changed_by_name, changed_at, COUNT(*) OVER() as full_count
+             FROM employee_change_log WHERE 1=1`;
+    const params = [];
+    if (from) { params.push(from); q += ` AND changed_at >= $${params.length}::date`; }
+    if (to) { params.push(to); q += ` AND changed_at < ($${params.length}::date + INTERVAL '1 day')`; }
+    if (action) { params.push(action); q += ` AND action = $${params.length}`; }
+    if (search) { params.push(`%${search}%`); q += ` AND (employee_name ILIKE $${params.length} OR national_id ILIKE $${params.length} OR employee_number ILIKE $${params.length})`; }
+    q += ` ORDER BY changed_at DESC`;
+    params.push(limit); q += ` LIMIT $${params.length}`;
+    params.push(offset); q += ` OFFSET $${params.length}`;
+    const { rows } = await pool.query(q, params);
+    const total = rows.length ? parseInt(rows[0].full_count) : 0;
+    res.json({ rows: rows.map(({ full_count, ...r }) => r), total, page: pageNum, pageSize: limit });
   } catch (e) { sendError(res, e); }
 });
 
@@ -3812,6 +3904,74 @@ async function sendDailyEHSDigest() {
 }
 
 // Schedule daily digests
+// "What changed yesterday" — emailed each morning. Reads the append-only
+// employee_change_log for the previous calendar day (Africa/Nairobi) so early-
+// morning edits from yesterday aren't missed by a naive last-24h window.
+async function sendDailyEmployeeChangesDigest() {
+  try {
+    const { rows } = await pool.query(`
+      SELECT employee_name, national_id, employee_number, action, reason, changes, changed_by_name, changed_at
+      FROM employee_change_log
+      WHERE changed_at >= (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi')) - INTERVAL '1 day') AT TIME ZONE 'Africa/Nairobi'
+        AND changed_at <  (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi'))) AT TIME ZONE 'Africa/Nairobi'
+      ORDER BY changed_at
+    `);
+    if (rows.length === 0) return; // nothing changed yesterday — no email
+
+    const actionTag = (a) => a === 'exit'
+      ? '<span style="background:#fde8e8;color:#c0392b;font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px;">EXIT</span>'
+      : a === 'reactivate'
+      ? '<span style="background:#e6f4ea;color:#1d9e75;font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px;">REACTIVATE</span>'
+      : '<span style="background:#eef2ff;color:#3730a3;font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px;">UPDATE</span>';
+
+    let tableRows = '';
+    rows.forEach(r => {
+      const when = new Date(r.changed_at).toLocaleString('en-GB', { timeZone: 'Africa/Nairobi', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false });
+      const diffs = (r.changes || []).map(c =>
+        `<div style="margin:1px 0;"><b>${escapeHtml(c.field)}:</b> <span style="color:#9ca3af;text-decoration:line-through;">${escapeHtml(String(c.before ?? '—'))}</span> &rarr; <span style="color:#0f2a4a;font-weight:600;">${escapeHtml(String(c.after ?? '—'))}</span></div>`
+      ).join('');
+      tableRows += `
+        <tr style="border-bottom:1px solid #e5e7eb;">
+          <td style="padding:8px 12px;font-size:12px;vertical-align:top;">
+            <div style="font-weight:600;color:#111;">${escapeHtml(r.employee_name || '—')}</div>
+            <div style="color:#9ca3af;font-size:11px;">${escapeHtml(r.national_id || r.employee_number || '')}</div>
+          </td>
+          <td style="padding:8px 12px;font-size:12px;vertical-align:top;">${actionTag(r.action)}<div style="margin-top:4px;">${diffs}</div>${r.reason ? `<div style="color:#6b7280;font-style:italic;margin-top:4px;">"${escapeHtml(r.reason)}"</div>` : ''}</td>
+          <td style="padding:8px 12px;font-size:12px;vertical-align:top;white-space:nowrap;">${escapeHtml(r.changed_by_name || '—')}<div style="color:#9ca3af;font-size:11px;">${when}</div></td>
+        </tr>`;
+    });
+
+    await resend.emails.send({
+      from: 'ESAT <esat@egypro.app>',
+      to: 'e.maged@outlook.com',
+      subject: `ESAT Daily — ${rows.length} employee record change${rows.length > 1 ? 's' : ''} yesterday`,
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto; padding: 24px;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
+            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="110" height="50" style="height:50px; width:110px; display:block; margin:0 auto;" />
+          </td></tr></table>
+          <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
+            <p style="margin:0 0 16px;font-size:15px;color:#111;">Hello Maged,</p>
+            <p style="margin:0 0 20px;font-size:14px;color:#374151;">Employee records changed yesterday: <strong>${rows.length} change${rows.length > 1 ? 's' : ''}</strong>.</p>
+            <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;background:white;">
+              <tr style="background:#f3f4f6;">
+                <th align="left" style="padding:8px 12px;font-size:11px;color:#6b7280;text-transform:uppercase;">Employee</th>
+                <th align="left" style="padding:8px 12px;font-size:11px;color:#6b7280;text-transform:uppercase;">What changed</th>
+                <th align="left" style="padding:8px 12px;font-size:11px;color:#6b7280;text-transform:uppercase;">By / When</th>
+              </tr>
+              ${tableRows}
+            </table>
+            <p style="margin:20px 0 0;font-size:12px;color:#9ca3af;">Full history is on the Change History page in ESAT.</p>
+          </div>
+        </div>
+      `
+    });
+    console.log('Employee changes digest sent — ' + rows.length + ' changes');
+  } catch(e) {
+    console.error('Employee changes digest error:', e.message);
+  }
+}
+
 function scheduleAt(utcHour, utcMin, label, fn) {
   const now = new Date();
   const next = new Date();
@@ -3926,6 +4086,7 @@ function scheduleDailyDigest() {
   scheduleAt(5, 45, 'EHS digest', sendDailyEHSDigest);      // 8:45am EAT
   scheduleAt(6,  0, 'SCM digest', sendDailySCMDigest);      // 9:00am EAT
   scheduleAt(13, 0, 'Overdue digest', sendDailyOverdueDigest); // 4:00pm EAT
+  scheduleAt(5, 15, 'Employee changes digest', sendDailyEmployeeChangesDigest); // 8:15am EAT
   scheduleAt(2,  0, 'Log prune', pruneOldRequestLogs);      // 5:00am EAT
 }
 

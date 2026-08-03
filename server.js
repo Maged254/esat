@@ -287,6 +287,12 @@ async function setupDB() {
 
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_picture TEXT");
     await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS san BOOLEAN DEFAULT TRUE");
+    // HR/admin edits to an employee's core details are tracked (who/when + a reason),
+    // surfaced as the "Last Update (HR)" column on the Employees page. Kept separate
+    // from ppe_last_edited_* (PPE assignment) and from updated_at (touched by san/status).
+    await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS last_edited_by UUID REFERENCES users(id)");
+    await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS last_edited_at TIMESTAMPTZ");
+    await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS last_edit_reason TEXT");
     await client.query("ALTER TABLE ncr_items ALTER COLUMN status TYPE VARCHAR(50)");
     await client.query("ALTER TABLE ppe_requests ALTER COLUMN status TYPE VARCHAR(50)");
     await client.query("UPDATE employees SET san = TRUE WHERE san IS NULL");
@@ -844,7 +850,7 @@ app.get('/api/employees', auth, async (req, res) => {
     const limit = paginate ? Math.min(Math.max(parseInt(pageSize) || 25, 1), 100) : null;
     const pageNum = paginate ? Math.max(parseInt(page) || 1, 1) : 1;
     const offset = paginate ? (pageNum - 1) * limit : 0;
-    let q = `SELECT e.*, MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as days_since_audit, COUNT(epa.id) > 0 as ppe_assigned, u.full_name as ppe_last_edited_by_name, COUNT(*) OVER() as full_count FROM employees e LEFT JOIN audits a ON a.employee_id=e.id LEFT JOIN employee_ppe_assignments epa ON epa.employee_id=e.id LEFT JOIN users u ON u.id=e.ppe_last_edited_by WHERE 1=1`;
+    let q = `SELECT e.*, MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as days_since_audit, COUNT(epa.id) > 0 as ppe_assigned, u.full_name as ppe_last_edited_by_name, ued.full_name as last_edited_by_name, COUNT(*) OVER() as full_count FROM employees e LEFT JOIN audits a ON a.employee_id=e.id LEFT JOIN employee_ppe_assignments epa ON epa.employee_id=e.id LEFT JOIN users u ON u.id=e.ppe_last_edited_by LEFT JOIN users ued ON ued.id=e.last_edited_by WHERE 1=1`;
     const params = [];
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
     if (search) { params.push(`%${search}%`); q += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length})`; }
@@ -872,7 +878,7 @@ app.get('/api/employees', auth, async (req, res) => {
       if (empClients.length === 0) { return res.json(paginate ? { rows: [], total: 0, page: pageNum, pageSize: limit } : []); }
       params.push(empClients); q += ` AND e.client = ANY($${params.length})`;
     }
-    q += ` GROUP BY e.id, u.full_name`;
+    q += ` GROUP BY e.id, u.full_name, ued.full_name`;
     // audit_age filters on an aggregate (days since the last audit), so it has
     // to be a HAVING clause -- can't reference the SELECT alias here.
     const auditAgeExpr = `CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE)`;
@@ -1223,7 +1229,7 @@ app.post('/api/employees', auth, async (req, res) => {
 
 // Update employee status (admin only)
 app.put('/api/employees/:id/status', auth, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  if (!['admin', 'hr'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
   const { employment_status, exit_date } = req.body;
   if (employment_status && !['active', 'exit'].includes(employment_status)) {
     return res.status(400).json({ error: 'Invalid employment_status' });
@@ -1252,6 +1258,27 @@ app.put('/api/employees/:id/san', auth, async (req, res) => {
   const { rows } = await pool.query('UPDATE employees SET san=$1, updated_at=NOW() WHERE id=$2 RETURNING *', [san, req.params.id]);
   broadcastEmployeesChanged();
   res.json(rows[0]);
+});
+
+// Edit an employee's core details (admin, hr) — records who/when + a mandatory
+// reason (mirrors the ETMS "Update Resource's Details" screen). employee_number,
+// organization, resource_type and employment_status are NOT editable here.
+app.put('/api/employees/:id', auth, async (req, res) => {
+  if (!['admin', 'hr'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  const { full_name, national_id, job_title, department, project, client, reason } = req.body;
+  if (!full_name || !full_name.trim()) return res.status(400).json({ error: 'Employee name is required' });
+  if (!reason || !reason.trim()) return res.status(400).json({ error: 'A reason for the update is required' });
+  try {
+    const { rows } = await pool.query(
+      `UPDATE employees SET full_name=$1, national_id=$2, job_title=$3, department=$4, project=$5, client=$6,
+         last_edit_reason=$7, last_edited_by=$8, last_edited_at=NOW(), updated_at=NOW()
+       WHERE id=$9 RETURNING *`,
+      [full_name.trim(), national_id || null, job_title || null, department || null, project || null, client || null, reason.trim(), req.user.id, req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    broadcastEmployeesChanged();
+    res.json(rows[0]);
+  } catch (e) { sendError(res, e); }
 });
 
 // ── Casuals ──────────────────────────────────────────────────

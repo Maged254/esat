@@ -380,6 +380,12 @@ async function setupDB() {
     // When a certificate expires we auto-open a renewal request; this stamps that
     // request with the date the previous certificate expired (shown as a note).
     await client.query('ALTER TABLE training_records ADD COLUMN IF NOT EXISTS prior_expiry_date DATE');
+    // Simple key/value app settings (admin-toggleable). Starts with the cert
+    // requirement OFF so the migration can complete records without certs.
+    await client.query(`CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMPTZ DEFAULT NOW()
+      )`);
+    await client.query(`INSERT INTO app_settings (key, value) VALUES ('require_training_certificate','false') ON CONFLICT (key) DO NOTHING`);
 
     // Targeted constraints: ESAT has none elsewhere, but each of these prevents
     // a specific corruption that would be expensive to unpick after migration.
@@ -2644,6 +2650,35 @@ app.put('/api/training-courses/:id/managers', auth, async (req, res) => {
         [courseId, userIds]);
     }
     res.json({ ok: true });
+  } catch(e) { sendError(res, e); }
+});
+
+// ── App settings (simple key/value, admin-toggleable) ───────
+const ALLOWED_SETTINGS = ['require_training_certificate'];
+const getBoolSetting = async (key) => {
+  const { rows } = await pool.query('SELECT value FROM app_settings WHERE key = $1', [key]);
+  return rows[0]?.value === 'true';
+};
+const readAllSettings = async () => {
+  const { rows } = await pool.query('SELECT key, value FROM app_settings');
+  const out = {};
+  rows.forEach(r => { out[r.key] = r.value === 'true'; });
+  return out;
+};
+app.get('/api/app-settings', auth, async (req, res) => {
+  try { res.json(await readAllSettings()); } catch(e) { sendError(res, e); }
+});
+app.put('/api/app-settings', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    for (const [k, v] of Object.entries(req.body || {})) {
+      if (!ALLOWED_SETTINGS.includes(k)) continue;
+      await pool.query(
+        `INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2, NOW())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        [k, (v === true || v === 'true') ? 'true' : 'false']);
+    }
+    res.json(await readAllSettings());
   } catch(e) { sendError(res, e); }
 });
 

@@ -1417,6 +1417,17 @@ app.get('/api/employee-change-log', auth, async (req, res) => {
   } catch (e) { sendError(res, e); }
 });
 
+// Hard-delete a single change-history record (admin only) — for correcting an
+// erroneous entry. The log is otherwise append-only.
+app.delete('/api/employee-change-log/:id', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    const { rowCount } = await pool.query('DELETE FROM employee_change_log WHERE id=$1', [req.params.id]);
+    if (!rowCount) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true });
+  } catch (e) { sendError(res, e); }
+});
+
 // ── Casuals ──────────────────────────────────────────────────
 const CASUAL_EDIT_ROLES = ['admin', 'supervisor'];
 const CASUAL_VIEW_ROLES = ['admin', 'supervisor', 'ehs_officer', 'ehs_manager'];

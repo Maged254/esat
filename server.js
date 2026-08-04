@@ -409,6 +409,9 @@ async function setupDB() {
       );
     `);
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS training_course_access UUID[] DEFAULT '{}'");
+    // Per-HR-user access to named HR tasks (e.g. 'add_employee', 'edit_employee'),
+    // managed in Admin → HR Tasks Managers. Admins always have every task.
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS hr_task_access TEXT[] DEFAULT '{}'");
     // When a certificate expires we auto-open a renewal request; this stamps that
     // request with the date the previous certificate expired (shown as a note).
     await client.query('ALTER TABLE training_records ADD COLUMN IF NOT EXISTS prior_expiry_date DATE');
@@ -809,8 +812,8 @@ app.post('/api/auth/login', async (req, res) => {
     await pool.query('UPDATE users SET last_login=NOW() WHERE id=$1', [user.id]);
     const isSync = user.email === 'sync@egypro.com';
     const tokenOptions = isSync ? {} : { expiresIn: '8h' };
-    const token = jwt.sign({ id: user.id, email: user.email, role: user.role, name: user.full_name, project_access: user.project_access || [], client_access: user.client_access || [], page_access: user.page_access || [], sync: isSync }, JWT_SECRET, tokenOptions);
-    res.json({ token, user: { id: user.id, name: user.full_name, email: user.email, role: user.role, project_access: user.project_access || [], client_access: user.client_access || [], page_access: user.page_access || [], must_reset_password: user.must_reset_password || false } });
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role, name: user.full_name, project_access: user.project_access || [], client_access: user.client_access || [], page_access: user.page_access || [], hr_task_access: user.hr_task_access || [], sync: isSync }, JWT_SECRET, tokenOptions);
+    res.json({ token, user: { id: user.id, name: user.full_name, email: user.email, role: user.role, project_access: user.project_access || [], client_access: user.client_access || [], page_access: user.page_access || [], hr_task_access: user.hr_task_access || [], must_reset_password: user.must_reset_password || false } });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -1315,7 +1318,7 @@ app.post('/api/employees', auth, async (req, res) => {
 
 // Update employee status (admin only)
 app.put('/api/employees/:id/status', auth, async (req, res) => {
-  if (!['admin', 'hr'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  if (!(await hasHrTask(req.user, 'edit_employee'))) return res.status(403).json({ error: 'Not authorized' });
   const { employment_status, exit_date } = req.body;
   if (employment_status && !['active', 'exit'].includes(employment_status)) {
     return res.status(400).json({ error: 'Invalid employment_status' });
@@ -1370,7 +1373,7 @@ const EMPLOYEE_EDITABLE = [
   { key: 'client', label: 'Client' },
 ];
 app.put('/api/employees/:id', auth, async (req, res) => {
-  if (!['admin', 'hr'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  if (!(await hasHrTask(req.user, 'edit_employee'))) return res.status(403).json({ error: 'Not authorized' });
   const { full_name, national_id, job_title, department, project, client, reason } = req.body;
   if (!full_name || !full_name.trim()) return res.status(400).json({ error: 'Employee name is required' });
   if (!reason || !reason.trim()) return res.status(400).json({ error: 'A reason for the update is required' });
@@ -2859,6 +2862,35 @@ app.put('/api/training-courses/:id/managers', auth, async (req, res) => {
         `UPDATE users SET training_course_access = array_append(COALESCE(training_course_access,'{}'), $1::uuid), updated_at = NOW()
           WHERE role = 'hr' AND id = ANY($2::uuid[]) AND NOT ($1::uuid = ANY(COALESCE(training_course_access,'{}')))`,
         [courseId, userIds]);
+    }
+    res.json({ ok: true });
+  } catch(e) { sendError(res, e); }
+});
+
+// ── HR task access (Add Employee / Edit Employee) — Admin → HR Tasks Managers ──
+const HR_TASKS = ['add_employee', 'edit_employee'];
+// Admins always have every task; HR needs it in their (live) hr_task_access.
+const hasHrTask = async (user, task) => {
+  if (user.role === 'admin') return true;
+  if (user.role !== 'hr') return false;
+  const { rows } = await pool.query(`SELECT 1 FROM users WHERE id=$1 AND $2 = ANY(COALESCE(hr_task_access,'{}'))`, [user.id, task]);
+  return rows.length > 0;
+};
+app.put('/api/hr-tasks/:task/managers', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const task = req.params.task;
+  if (!HR_TASKS.includes(task)) return res.status(400).json({ error: 'Unknown task' });
+  const userIds = Array.isArray(req.body.user_ids) ? req.body.user_ids : [];
+  try {
+    await pool.query(
+      `UPDATE users SET hr_task_access = array_remove(hr_task_access, $1), updated_at = NOW()
+        WHERE role='hr' AND $1 = ANY(hr_task_access) AND NOT (id = ANY($2::uuid[]))`,
+      [task, userIds]);
+    if (userIds.length) {
+      await pool.query(
+        `UPDATE users SET hr_task_access = array_append(COALESCE(hr_task_access,'{}'), $1), updated_at = NOW()
+          WHERE role='hr' AND id = ANY($2::uuid[]) AND NOT ($1 = ANY(COALESCE(hr_task_access,'{}')))`,
+        [task, userIds]);
     }
     res.json({ ok: true });
   } catch(e) { sendError(res, e); }
@@ -4670,7 +4702,7 @@ app.delete('/api/training-records/:id/certificate', auth, async (req, res) => {
 app.post('/api/employees/manual', auth, (req, res) => {
   certUpload.single('national_id_doc')(req, res, async (err) => {
     if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'National ID file must be 1MB or smaller.' : (err.message || 'Upload rejected') });
-    if (!['admin', 'hr'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+    if (!(await hasHrTask(req.user, 'add_employee'))) return res.status(403).json({ error: 'Not authorized' });
     if (!R2_CONFIGURED) return res.status(503).json({ error: 'Document storage is not configured yet.' });
     if (!req.file) return res.status(400).json({ error: 'National ID document (PDF) is required' });
     let { full_name, national_id, employee_number, job_title, department, project, client, organization, resource_type } = req.body;
@@ -5105,7 +5137,7 @@ app.get('/api/graphs', auth, async (req, res) => {
 
 app.get('/api/users', auth, async (req, res) => {
   if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
-  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access, training_course_access, must_reset_password, failed_login_attempts, locked_until, last_login, created_at FROM users ORDER BY created_at DESC');
+  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access, training_course_access, hr_task_access, must_reset_password, failed_login_attempts, locked_until, last_login, created_at FROM users ORDER BY created_at DESC');
   res.json(rows);
 });
 

@@ -1272,6 +1272,9 @@ app.post('/api/employees', auth, async (req, res) => {
   let { employee_number, full_name, national_id, job_title, department, project, client, organization, resource_type, employment_status } = req.body;
   resource_type = resource_type?.toLowerCase();
   employment_status = employment_status?.toLowerCase();
+  // Employment ID is IN-HOUSE only. Never import/assign one from ETMS for
+  // interns or outsource (word-boundary \bintern\b so "International" is safe).
+  const noEmpId = ['outsource', 'intern'].includes(resource_type) || /\bintern\b/i.test(job_title || '');
 
   const dbClient = await pool.connect();
   try {
@@ -1281,7 +1284,7 @@ app.post('/api/employees', auth, async (req, res) => {
       if (existing.rows.length > 0) {
         await dbClient.query('BEGIN');
         const { rows } = await dbClient.query(
-          `UPDATE employees SET full_name=$1, job_title=$2, department=$3, project=$4, client=$5, organization=$6, resource_type=$7, employment_status=$8 WHERE national_id=$9 RETURNING *`,
+          `UPDATE employees SET full_name=$1, job_title=$2, department=$3, project=$4, client=$5, organization=$6, resource_type=$7, employment_status=$8${noEmpId ? ', employee_number=NULL' : ''} WHERE national_id=$9 RETURNING *`,
           [full_name, job_title, department, project, client, organization, resource_type, employment_status || 'active', national_id]
         );
         const empId = rows[0].id;
@@ -1297,7 +1300,7 @@ app.post('/api/employees', auth, async (req, res) => {
         return res.json(rows[0]);
       }
     }
-    const empNumber = employee_number || national_id || ('EMP-' + Date.now());
+    const empNumber = noEmpId ? null : (employee_number || national_id || ('EMP-' + Date.now()));
     const { rows } = await dbClient.query(`INSERT INTO employees (employee_number,full_name,national_id,job_title,department,project,client,organization,resource_type,employment_status,created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`, [empNumber, full_name, national_id, job_title, department, project, client, organization, resource_type, employment_status || 'active', req.user.id]);
     broadcastEmployeesChanged();
     res.status(201).json(rows[0]);

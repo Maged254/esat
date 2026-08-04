@@ -923,7 +923,7 @@ app.get('/api/employees', auth, async (req, res) => {
     const limit = paginate ? Math.min(Math.max(parseInt(pageSize) || 25, 1), 100) : null;
     const pageNum = paginate ? Math.max(parseInt(page) || 1, 1) : 1;
     const offset = paginate ? (pageNum - 1) * limit : 0;
-    let q = `SELECT e.*, MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as days_since_audit, COUNT(epa.id) > 0 as ppe_assigned, u.full_name as ppe_last_edited_by_name, ued.full_name as last_edited_by_name, COUNT(*) OVER() as full_count FROM employees e LEFT JOIN audits a ON a.employee_id=e.id LEFT JOIN employee_ppe_assignments epa ON epa.employee_id=e.id LEFT JOIN users u ON u.id=e.ppe_last_edited_by LEFT JOIN users ued ON ued.id=e.last_edited_by WHERE 1=1`;
+    let q = `SELECT e.*, MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as days_since_audit, COUNT(epa.id) > 0 as ppe_assigned, u.full_name as ppe_last_edited_by_name, ued.full_name as last_edited_by_name, uc.full_name as created_by_name, ex.changed_by_name as exited_by_name, ex.changed_at as exited_at, COUNT(*) OVER() as full_count FROM employees e LEFT JOIN audits a ON a.employee_id=e.id LEFT JOIN employee_ppe_assignments epa ON epa.employee_id=e.id LEFT JOIN users u ON u.id=e.ppe_last_edited_by LEFT JOIN users ued ON ued.id=e.last_edited_by LEFT JOIN users uc ON uc.id=e.created_by LEFT JOIN LATERAL (SELECT changed_by_name, changed_at FROM employee_change_log WHERE employee_id=e.id AND action='exit' ORDER BY changed_at DESC LIMIT 1) ex ON true WHERE 1=1`;
     const params = [];
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
     if (search) { params.push(`%${search}%`); q += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length})`; }
@@ -951,7 +951,7 @@ app.get('/api/employees', auth, async (req, res) => {
       if (empClients.length === 0) { return res.json(paginate ? { rows: [], total: 0, page: pageNum, pageSize: limit } : []); }
       params.push(empClients); q += ` AND e.client = ANY($${params.length})`;
     }
-    q += ` GROUP BY e.id, u.full_name, ued.full_name`;
+    q += ` GROUP BY e.id, u.full_name, ued.full_name, uc.full_name, ex.changed_by_name, ex.changed_at`;
     // audit_age filters on an aggregate (days since the last audit), so it has
     // to be a HAVING clause -- can't reference the SELECT alias here.
     const auditAgeExpr = `CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE)`;

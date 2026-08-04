@@ -1651,10 +1651,7 @@ app.delete('/api/employees/all/purge', auth, async (req, res) => {
 app.delete('/api/employees/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   try {
-    const { rows: [emp] } = await pool.query('SELECT national_id_doc_key FROM employees WHERE id=$1', [req.params.id]);
     await pool.query('DELETE FROM employees WHERE id=$1', [req.params.id]);
-    // Best-effort: remove the National ID document from R2 so it isn't orphaned.
-    if (emp?.national_id_doc_key && r2) r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: emp.national_id_doc_key })).catch(() => {});
     broadcastEmployeesChanged();
     res.json({ message: 'Deleted' });
   } catch (e) {

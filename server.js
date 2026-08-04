@@ -295,6 +295,10 @@ async function setupDB() {
     await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS last_edit_reason TEXT");
     await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS created_by UUID REFERENCES users(id)");
     await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS national_id_doc_key TEXT");
+    // Employment ID (employee_number) is only for in-house employees; interns and
+    // outsource have none. Relax NOT NULL — the UNIQUE constraint still enforces
+    // uniqueness among the ones that have a value (Postgres allows multiple NULLs).
+    await client.query("ALTER TABLE employees ALTER COLUMN employee_number DROP NOT NULL");
     // Immutable, append-only history of employee-detail changes (edits + exits).
     // Snapshots employee + editor identity so a row stays readable even if the
     // employee is later renamed or the user removed. `changes` is a JSON array of
@@ -4653,16 +4657,21 @@ app.post('/api/employees/manual', auth, (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'National ID document (PDF) is required' });
     let { full_name, national_id, employee_number, job_title, department, project, client, organization, resource_type } = req.body;
     resource_type = (resource_type || '').toLowerCase();
-    const required = { full_name: 'Resource Name', national_id: 'National ID Number', employee_number: 'Employment ID', department: 'Department', project: 'Project Name', client: 'Client', job_title: 'Job Title', organization: 'Organization' };
-    for (const k in required) { if (!String(req.body[k] || '').trim()) return res.status(400).json({ error: `${required[k]} is required` }); }
     if (!['inhouse', 'intern'].includes(resource_type)) return res.status(400).json({ error: 'Invalid resource type' });
+    const required = { full_name: 'Resource Name', national_id: 'National ID Number', department: 'Department', project: 'Project Name', client: 'Client', job_title: 'Job Title', organization: 'Organization' };
+    for (const k in required) { if (!String(req.body[k] || '').trim()) return res.status(400).json({ error: `${required[k]} is required` }); }
+    // Only in-house employees carry an Employment ID; interns/outsource have none.
+    const empNo = resource_type === 'inhouse' ? String(employee_number || '').trim() : null;
+    if (resource_type === 'inhouse' && !empNo) return res.status(400).json({ error: 'Employment ID is required' });
     try {
       // A manual add must be a genuinely new person — no silent upsert here.
       // National ID must be unique across ALL resources (employees + casuals).
       const conflict = await nationalIdConflict(national_id.trim());
       if (conflict) return res.status(409).json({ error: `This National ID already belongs to ${conflict}.` });
-      const dupNo = await pool.query('SELECT id FROM employees WHERE employee_number=$1', [employee_number.trim()]);
-      if (dupNo.rows.length) return res.status(409).json({ error: 'This Employment ID is already in use.' });
+      if (empNo) {
+        const dupNo = await pool.query('SELECT id FROM employees WHERE employee_number=$1', [empNo]);
+        if (dupNo.rows.length) return res.status(409).json({ error: 'This Employment ID is already in use.' });
+      }
 
       const person = `${cleanKeyPart(national_id)} - ${cleanKeyPart(full_name)}`;
       const key = `${person}/National ID/${cleanKeyPart(full_name)} - National ID.pdf`;
@@ -4671,7 +4680,7 @@ app.post('/api/employees/manual', auth, (req, res) => {
         const { rows } = await pool.query(
           `INSERT INTO employees (employee_number, full_name, national_id, job_title, department, project, client, organization, resource_type, employment_status, created_by, national_id_doc_key)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$11) RETURNING *`,
-          [employee_number.trim(), full_name.trim(), national_id.trim(), job_title.trim(), department.trim(), project.trim(), client.trim(), organization.trim(), resource_type, req.user.id, key]
+          [empNo, full_name.trim(), national_id.trim(), job_title.trim(), department.trim(), project.trim(), client.trim(), organization.trim(), resource_type, req.user.id, key]
         );
         broadcastEmployeesChanged();
         res.status(201).json(rows[0]);

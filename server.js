@@ -1658,6 +1658,24 @@ app.delete('/api/employees/:id', auth, async (req, res) => {
   }
 });
 
+// TEMPORARY one-off maintenance: purge Employees-module test data (the TEST
+// employee + the change-history rows created while building the edit/history
+// feature). Admin-only AND gated by a fixed confirmation token so it can't be
+// triggered casually. REMOVE THIS ENDPOINT after the one-time cleanup.
+app.post('/api/admin/purge-employee-test-data', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  if (req.body?.confirm !== 'PURGE-TEST-2026-08-04') return res.status(400).json({ error: 'Missing/invalid confirm token' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const delLog = await client.query('DELETE FROM employee_change_log');
+    const delEmp = await client.query("DELETE FROM employees WHERE employee_number='TEST-EMP-001'");
+    await client.query('COMMIT');
+    res.json({ deleted_change_log_rows: delLog.rowCount, deleted_test_employees: delEmp.rowCount });
+  } catch (e) { await client.query('ROLLBACK').catch(()=>{}); sendError(res, e); }
+  finally { client.release(); }
+});
+
 // Delete a casual (admin only)
 app.delete('/api/casuals/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });

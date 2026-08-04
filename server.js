@@ -501,6 +501,35 @@ async function setupDB() {
       )
     `);
 
+    // Admin-managed option lists for the employee Add/Edit dropdowns
+    // (Department / Project / Client). As ESAT goes independent of ETMS these
+    // become the source of truth instead of DISTINCT values scraped from rows.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS org_lists (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        list_type VARCHAR(20) NOT NULL,
+        name VARCHAR(120) NOT NULL,
+        is_active BOOLEAN DEFAULT TRUE,
+        sort_order INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (list_type, name)
+      )
+    `);
+    // Seed ONCE (only while the table is empty) from the existing employee data
+    // so the lists start populated with every department/project/client in use.
+    // Guarded by NOT EXISTS so an admin deleting a value doesn't get it re-added
+    // on the next boot just because employee rows still reference it.
+    await client.query(`
+      INSERT INTO org_lists (list_type, name)
+      SELECT t.list_type, t.name FROM (
+        SELECT 'department' AS list_type, department AS name FROM employees WHERE department IS NOT NULL AND department <> ''
+        UNION SELECT 'project', project FROM employees WHERE project IS NOT NULL AND project <> ''
+        UNION SELECT 'client', client FROM employees WHERE client IS NOT NULL AND client <> ''
+      ) t
+      WHERE NOT EXISTS (SELECT 1 FROM org_lists)
+      ON CONFLICT (list_type, name) DO NOTHING
+    `);
+
     console.log("Database setup complete");
   } catch(e) {
     console.error('DB setup error:', e.message);
@@ -979,6 +1008,19 @@ app.get('/api/employees/stats', auth, async (req, res) => {
 
 // Distinct department/project/client values for the Employees filter
 // dropdowns -- needed now that the main list is paginated.
+// A National ID must be globally unique across EVERY resource — employees of any
+// resource_type (inhouse/intern/outsource) AND casuals. Returns a human label of
+// the current owner, or null if free. Used by the manual add + casual add paths.
+async function nationalIdConflict(nationalId, { excludeEmployeeId = null, excludeCasualId = null } = {}) {
+  const nid = String(nationalId || '').trim();
+  if (!nid) return null;
+  const emp = await pool.query('SELECT full_name FROM employees WHERE national_id=$1 AND ($2::uuid IS NULL OR id<>$2) LIMIT 1', [nid, excludeEmployeeId]);
+  if (emp.rows.length) return `an employee (${emp.rows[0].full_name})`;
+  const cas = await pool.query('SELECT full_name FROM casuals WHERE national_id=$1 AND ($2::uuid IS NULL OR id<>$2) LIMIT 1', [nid, excludeCasualId]);
+  if (cas.rows.length) return `a casual (${cas.rows[0].full_name})`;
+  return null;
+}
+
 app.get('/api/employees/filter-options', auth, async (req, res) => {
   if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) {
     return res.status(403).json({ error: 'Not authorized' });
@@ -1421,6 +1463,12 @@ app.post('/api/casuals/batch', auth, async (req, res) => {
     for (const c of casuals) {
       if (!c.full_name || !c.national_id) {
         skipped.push({ full_name: c.full_name || '(no name)', reason: 'Full name and National ID are required' });
+        continue;
+      }
+      // Global uniqueness: a National ID already held by an employee can't be a casual.
+      const empOwner = await client_db.query('SELECT full_name FROM employees WHERE national_id=$1 LIMIT 1', [c.national_id]);
+      if (empOwner.rows.length) {
+        skipped.push({ full_name: c.full_name, reason: `National ID ${c.national_id} already belongs to an employee (${empOwner.rows[0].full_name})` });
         continue;
       }
       const match = existingByNationalId.get(c.national_id);
@@ -2929,6 +2977,58 @@ app.delete('/api/training-pending-reasons/:id', auth, async (req, res) => {
     // pending_reason is stored as free text on the record, so deleting a reason
     // never orphans history -- a hard delete is safe.
     const { rowCount } = await pool.query('DELETE FROM training_pending_reasons WHERE id = $1', [req.params.id]);
+    if (!rowCount) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true });
+  } catch(e) { sendError(res, e); }
+});
+
+// ── Admin-managed option lists: Department / Project / Client ────────────────
+const ORG_LIST_TYPES = ['department', 'project', 'client'];
+// Any authenticated user reads them (to fill the Add/Edit dropdowns). No `type`
+// → all active items across every list; admins pass ?all=1 for the panel.
+app.get('/api/org-lists', auth, async (req, res) => {
+  try {
+    const { type } = req.query;
+    const all = req.query.all === '1' && req.user.role === 'admin';
+    const params = [];
+    let where = all ? '1=1' : 'is_active = TRUE';
+    if (type) { params.push(type); where += ` AND list_type = $${params.length}`; }
+    const { rows } = await pool.query(`SELECT id, list_type, name, is_active, sort_order FROM org_lists WHERE ${where} ORDER BY list_type ASC, sort_order ASC, name ASC`, params);
+    res.json(rows);
+  } catch(e) { sendError(res, e); }
+});
+app.post('/api/org-lists', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { list_type, name, sort_order } = req.body;
+  if (!ORG_LIST_TYPES.includes(list_type)) return res.status(400).json({ error: 'Invalid list type' });
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Name is required' });
+  try {
+    const { rows } = await pool.query('INSERT INTO org_lists (list_type, name, sort_order) VALUES ($1,$2,$3) RETURNING *', [list_type, name.trim(), sort_order || 0]);
+    res.json(rows[0]);
+  } catch(e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'That value already exists in this list' });
+    sendError(res, e);
+  }
+});
+app.put('/api/org-lists/:id', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { name, is_active, sort_order } = req.body;
+  if (!name || !String(name).trim()) return res.status(400).json({ error: 'Name is required' });
+  try {
+    const { rows } = await pool.query('UPDATE org_lists SET name=$1, is_active=$2, sort_order=$3 WHERE id=$4 RETURNING *', [name.trim(), is_active !== false, sort_order || 0, req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(rows[0]);
+  } catch(e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'That value already exists in this list' });
+    sendError(res, e);
+  }
+});
+app.delete('/api/org-lists/:id', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    // Values live as free text on employee rows, so deleting an option never
+    // orphans existing records — a hard delete is safe (it just stops offering it).
+    const { rowCount } = await pool.query('DELETE FROM org_lists WHERE id=$1', [req.params.id]);
     if (!rowCount) return res.status(404).json({ error: 'Not found' });
     res.json({ success: true });
   } catch(e) { sendError(res, e); }
@@ -4540,8 +4640,9 @@ app.post('/api/employees/manual', auth, (req, res) => {
     if (!['inhouse', 'intern'].includes(resource_type)) return res.status(400).json({ error: 'Invalid resource type' });
     try {
       // A manual add must be a genuinely new person — no silent upsert here.
-      const dupNid = await pool.query('SELECT id FROM employees WHERE national_id=$1', [national_id.trim()]);
-      if (dupNid.rows.length) return res.status(409).json({ error: 'An employee with this National ID already exists.' });
+      // National ID must be unique across ALL resources (employees + casuals).
+      const conflict = await nationalIdConflict(national_id.trim());
+      if (conflict) return res.status(409).json({ error: `This National ID already belongs to ${conflict}.` });
       const dupNo = await pool.query('SELECT id FROM employees WHERE employee_number=$1', [employee_number.trim()]);
       if (dupNo.rows.length) return res.status(409).json({ error: 'This Employment ID is already in use.' });
 

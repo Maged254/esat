@@ -293,6 +293,8 @@ async function setupDB() {
     await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS last_edited_by UUID REFERENCES users(id)");
     await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS last_edited_at TIMESTAMPTZ");
     await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS last_edit_reason TEXT");
+    await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS created_by UUID REFERENCES users(id)");
+    await client.query("ALTER TABLE employees ADD COLUMN IF NOT EXISTS national_id_doc_key TEXT");
     // Immutable, append-only history of employee-detail changes (edits + exits).
     // Snapshots employee + editor identity so a row stays readable even if the
     // employee is later renamed or the user removed. `changes` is a JSON array of
@@ -1235,7 +1237,7 @@ app.post('/api/employees', auth, async (req, res) => {
       }
     }
     const empNumber = employee_number || national_id || ('EMP-' + Date.now());
-    const { rows } = await dbClient.query(`INSERT INTO employees (employee_number,full_name,national_id,job_title,department,project,client,organization,resource_type,employment_status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`, [empNumber, full_name, national_id, job_title, department, project, client, organization, resource_type, employment_status || 'active']);
+    const { rows } = await dbClient.query(`INSERT INTO employees (employee_number,full_name,national_id,job_title,department,project,client,organization,resource_type,employment_status,created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`, [empNumber, full_name, national_id, job_title, department, project, client, organization, resource_type, employment_status || 'active', req.user.id]);
     broadcastEmployeesChanged();
     res.status(201).json(rows[0]);
   } catch(e) {
@@ -1649,7 +1651,10 @@ app.delete('/api/employees/all/purge', auth, async (req, res) => {
 app.delete('/api/employees/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   try {
+    const { rows: [emp] } = await pool.query('SELECT national_id_doc_key FROM employees WHERE id=$1', [req.params.id]);
     await pool.query('DELETE FROM employees WHERE id=$1', [req.params.id]);
+    // Best-effort: remove the National ID document from R2 so it isn't orphaned.
+    if (emp?.national_id_doc_key && r2) r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: emp.national_id_doc_key })).catch(() => {});
     broadcastEmployeesChanged();
     res.json({ message: 'Deleted' });
   } catch (e) {
@@ -4518,6 +4523,83 @@ app.delete('/api/training-records/:id/certificate', auth, async (req, res) => {
     await pool.query(`UPDATE training_records SET certificate_url=NULL, cloudinary_public_id=NULL, resource_type=NULL, delivery_type=NULL, original_filename=NULL, updated_at=NOW() WHERE id=$1`, [rec.id]);
     res.json({ ok: true });
   } catch (e) { sendError(res, e); }
+});
+
+// Add an employee manually (admin, hr) WITH a mandatory National ID PDF, stored
+// in R2 in the same employee folder as the training certs, "National ID" subfolder:
+//   "<NationalID> - <Name>/National ID/<Name> - National ID.pdf"
+// Separate from POST /employees (which stays JSON for CSV import) because this one
+// is multipart and must live after the R2 client is defined.
+app.post('/api/employees/manual', auth, (req, res) => {
+  certUpload.single('national_id_doc')(req, res, async (err) => {
+    if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'National ID file must be 1MB or smaller.' : (err.message || 'Upload rejected') });
+    if (!['admin', 'hr'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+    if (!R2_CONFIGURED) return res.status(503).json({ error: 'Document storage is not configured yet.' });
+    if (!req.file) return res.status(400).json({ error: 'National ID document (PDF) is required' });
+    let { full_name, national_id, employee_number, job_title, department, project, client, organization, resource_type } = req.body;
+    resource_type = (resource_type || '').toLowerCase();
+    const required = { full_name: 'Resource Name', national_id: 'National ID Number', employee_number: 'Employment ID', department: 'Department', project: 'Project Name', client: 'Client', job_title: 'Job Title', organization: 'Organization' };
+    for (const k in required) { if (!String(req.body[k] || '').trim()) return res.status(400).json({ error: `${required[k]} is required` }); }
+    if (!['inhouse', 'intern'].includes(resource_type)) return res.status(400).json({ error: 'Invalid resource type' });
+    try {
+      // A manual add must be a genuinely new person — no silent upsert here.
+      const dupNid = await pool.query('SELECT id FROM employees WHERE national_id=$1', [national_id.trim()]);
+      if (dupNid.rows.length) return res.status(409).json({ error: 'An employee with this National ID already exists.' });
+      const dupNo = await pool.query('SELECT id FROM employees WHERE employee_number=$1', [employee_number.trim()]);
+      if (dupNo.rows.length) return res.status(409).json({ error: 'This Employment ID is already in use.' });
+
+      const person = `${cleanKeyPart(national_id)} - ${cleanKeyPart(full_name)}`;
+      const key = `${person}/National ID/${cleanKeyPart(full_name)} - National ID.pdf`;
+      await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: key, Body: req.file.buffer, ContentType: 'application/pdf' }));
+      try {
+        const { rows } = await pool.query(
+          `INSERT INTO employees (employee_number, full_name, national_id, job_title, department, project, client, organization, resource_type, employment_status, created_by, national_id_doc_key)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$11) RETURNING *`,
+          [employee_number.trim(), full_name.trim(), national_id.trim(), job_title.trim(), department.trim(), project.trim(), client.trim(), organization.trim(), resource_type, req.user.id, key]
+        );
+        broadcastEmployeesChanged();
+        res.status(201).json(rows[0]);
+      } catch (e) {
+        r2.send(new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: key })).catch(() => {}); // don't orphan the upload
+        if (e.code === '23505') return res.status(409).json({ error: 'Employment ID or National ID already exists.' });
+        throw e;
+      }
+    } catch (e) {
+      console.error('Manual employee add error:', e.message);
+      res.status(500).json({ error: GENERIC_ERROR_MESSAGE });
+    }
+  });
+});
+
+// Stream an employee's National ID document through the backend (the R2 URL is
+// never exposed). Token via header OR ?token=. admin/hr only.
+app.get('/api/employees/:id/national-id/download', async (req, res) => {
+  const token = req.headers.authorization?.split(' ')[1] || req.query.token;
+  if (!token) return res.status(401).json({ error: 'No token' });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    if (!req.user.sync && req.user.iat < SERVER_BOOT_TIME) return res.status(401).json({ error: 'Session expired, please log in again' });
+  } catch { return res.status(401).json({ error: 'Invalid token' }); }
+  if (!['admin', 'hr'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  try {
+    if (!R2_CONFIGURED) return res.status(503).json({ error: 'Document storage is not configured yet.' });
+    const { rows: [emp] } = await pool.query('SELECT full_name, national_id_doc_key FROM employees WHERE id=$1', [req.params.id]);
+    if (!emp || !emp.national_id_doc_key) return res.status(404).json({ error: 'Not found' });
+    const dlName = `${cleanKeyPart(emp.full_name)} - National ID.pdf`;
+    const asciiName = dlName.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '');
+    const disposition = req.query.preview ? 'inline' : `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(dlName)}`;
+    const obj = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: emp.national_id_doc_key }));
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', disposition);
+    res.setHeader('Cache-Control', 'private, no-store');
+    if (obj.ContentLength != null) res.setHeader('Content-Length', obj.ContentLength);
+    obj.Body.on('error', () => { res.destroy(); });
+    res.on('close', () => { try { obj.Body.destroy(); } catch { /* closed */ } });
+    obj.Body.pipe(res);
+  } catch (e) {
+    if (e.name === 'NoSuchKey') return res.status(404).json({ error: 'Not found' });
+    if (!res.headersSent) res.status(500).json({ error: 'Download failed' });
+  }
 });
 
 app.post('/api/admin/test-overdue-digest', auth, async (req, res) => {

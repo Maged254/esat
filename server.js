@@ -419,6 +419,21 @@ async function setupDB() {
       )`);
     await client.query(`INSERT INTO app_settings (key, value) VALUES ('require_training_certificate','false') ON CONFLICT (key) DO NOTHING`);
 
+    // One-time: Employment ID is in-house only now, so clear it for existing
+    // interns and outsource. Word-boundary '\yintern\y' avoids matching e.g.
+    // "International". Guarded by a marker so it runs exactly once.
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM app_settings WHERE key='intern_outsource_empid_cleared') THEN
+          UPDATE employees SET employee_number=NULL
+            WHERE employee_number IS NOT NULL
+              AND (resource_type IN ('outsource','intern') OR job_title ~* '\\yintern\\y');
+          INSERT INTO app_settings (key, value) VALUES ('intern_outsource_empid_cleared','done') ON CONFLICT (key) DO NOTHING;
+        END IF;
+      END $$;
+    `);
+
     // Targeted constraints: ESAT has none elsewhere, but each of these prevents
     // a specific corruption that would be expensive to unpick after migration.
     // 1. A record belongs to exactly one person.

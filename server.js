@@ -1698,14 +1698,21 @@ app.delete('/api/employees/all/purge', auth, async (req, res) => {
 
 app.delete('/api/employees/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const client = await pool.connect();
   try {
-    await pool.query('DELETE FROM employees WHERE id=$1', [req.params.id]);
+    await client.query('BEGIN');
+    // Hard delete removes the person entirely — including their change history
+    // (otherwise the log rows would linger with a null employee_id).
+    await client.query('DELETE FROM employee_change_log WHERE employee_id=$1', [req.params.id]);
+    await client.query('DELETE FROM employees WHERE id=$1', [req.params.id]);
+    await client.query('COMMIT');
     broadcastEmployeesChanged();
     res.json({ message: 'Deleted' });
   } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
     if (e.code === '23503') return res.status(400).json({ error: 'Cannot delete: employee has existing audits or records. Deactivate them instead.' });
     sendError(res, e);
-  }
+  } finally { client.release(); }
 });
 
 // Delete a casual (admin only)

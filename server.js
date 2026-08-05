@@ -420,6 +420,10 @@ async function setupDB() {
     // Per-HR-user access to named HR tasks (e.g. 'add_employee', 'edit_employee'),
     // managed in Admin → HR Tasks Managers. Admins always have every task.
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS hr_task_access TEXT[] DEFAULT '{}'");
+    // Per-user access to manage outsource resources by subtype ('services' and/or
+    // 'vehicle_supplier'), managed in Admin → Outsource Managers. Each grant covers
+    // add + edit + exit for that subtype. Admins always have both.
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS outsource_access TEXT[] DEFAULT '{}'");
     // When a certificate expires we auto-open a renewal request; this stamps that
     // request with the date the previous certificate expired (shown as a note).
     await client.query('ALTER TABLE training_records ADD COLUMN IF NOT EXISTS prior_expiry_date DATE');
@@ -686,7 +690,7 @@ const escapeHtml = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({
 }[c]));
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const VALID_ROLES = ['admin', 'ehs_manager', 'ehs_officer', 'supervisor', 'scm_officer', 'project_director', 'hr'];
+const VALID_ROLES = ['admin', 'ehs_manager', 'ehs_officer', 'supervisor', 'scm_officer', 'project_director', 'hr', 'fleet'];
 // Data-URL profile pictures only, capped just under the 10mb JSON body limit
 // (no client-side resize happens before upload, so this must stay generous).
 const isValidProfilePicture = (s) => typeof s === 'string' && s.startsWith('data:image/') && s.length <= 9 * 1024 * 1024;
@@ -856,8 +860,8 @@ app.post('/api/auth/login', async (req, res) => {
     await pool.query('UPDATE users SET last_login=NOW() WHERE id=$1', [user.id]);
     const isSync = user.email === 'sync@egypro.com';
     const tokenOptions = isSync ? {} : { expiresIn: '8h' };
-    const token = jwt.sign({ id: user.id, email: user.email, role: user.role, name: user.full_name, project_access: user.project_access || [], client_access: user.client_access || [], page_access: user.page_access || [], hr_task_access: user.hr_task_access || [], sync: isSync }, JWT_SECRET, tokenOptions);
-    res.json({ token, user: { id: user.id, name: user.full_name, email: user.email, role: user.role, project_access: user.project_access || [], client_access: user.client_access || [], page_access: user.page_access || [], hr_task_access: user.hr_task_access || [], must_reset_password: user.must_reset_password || false } });
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role, name: user.full_name, project_access: user.project_access || [], client_access: user.client_access || [], page_access: user.page_access || [], hr_task_access: user.hr_task_access || [], outsource_access: user.outsource_access || [], sync: isSync }, JWT_SECRET, tokenOptions);
+    res.json({ token, user: { id: user.id, name: user.full_name, email: user.email, role: user.role, project_access: user.project_access || [], client_access: user.client_access || [], page_access: user.page_access || [], hr_task_access: user.hr_task_access || [], outsource_access: user.outsource_access || [], must_reset_password: user.must_reset_password || false } });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -953,9 +957,25 @@ app.get('/api/dashboard', auth, async (req, res) => {
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
+// Restricts a query to outsource resources of the caller's permitted subtype(s),
+// for the Outsource page (?outsource_scope=1) and always for the fleet role.
+// Returns a SQL fragment appended to the WHERE (may push a param). Relies on the
+// `oe` (outsource_entities) join that both the list and stats queries already have.
+function outsourceScopeClause(req, params) {
+  const wants = req.query.outsource_scope === '1' || req.user.role === 'fleet';
+  if (!wants) return '';
+  let c = ` AND e.resource_type='outsource'`;
+  if (req.user.role !== 'admin') {
+    const subs = Array.isArray(req.user.outsource_access) ? req.user.outsource_access : [];
+    if (!subs.length) return ` AND 1=0`; // no subtype granted → sees nothing
+    params.push(subs); c += ` AND oe.type = ANY($${params.length})`;
+  }
+  return c;
+}
+
 // Employees
 app.get('/api/employees', auth, async (req, res) => {
-  if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) {
+  if (!['admin','ehs_manager','ehs_officer','supervisor','fleet'].includes(req.user.role)) {
     return res.status(403).json({ error: 'Not authorized' });
   }
   try {
@@ -992,6 +1012,7 @@ app.get('/api/employees', auth, async (req, res) => {
     else if (classification === 'outsource_services') { q += ` AND oe.type='services'`; }
     else if (classification === 'outsource_vehicle_supplier') { q += ` AND oe.type='vehicle_supplier'`; }
     else if (classification === 'outsource') { q += ` AND LOWER(TRIM(e.organization))<>'egypro' AND oe.type IS NULL`; }
+    q += outsourceScopeClause(req, params);
     const empProjects = await getProjectFilter(req.user);
     if (empProjects !== null) {
       if (empProjects.length === 0) { return res.json(paginate ? { rows: [], total: 0, page: pageNum, pageSize: limit } : []); }
@@ -1022,14 +1043,14 @@ app.get('/api/employees', auth, async (req, res) => {
 // History's pattern since these cards already reflected active filters
 // before pagination (unlike PPE Tracker's global counts).
 app.get('/api/employees/stats', auth, async (req, res) => {
-  if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) {
+  if (!['admin','ehs_manager','ehs_officer','supervisor','fleet'].includes(req.user.role)) {
     return res.status(403).json({ error: 'Not authorized' });
   }
   try {
     const { status, search, national_id, employee_number, project, client, san, job_title, department, resource_type, classification, audit_age } = req.query;
     const zero = { total_active: 0, inhouse: 0, outsource: 0, interns: 0, exits: 0 };
     let q = `WITH scoped AS (
-        SELECT e.employment_status, e.resource_type, e.job_title,
+        SELECT e.employment_status, e.resource_type, e.job_title, oe.type as otype,
           CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as days_since_audit
         FROM employees e
         LEFT JOIN audits a ON a.employee_id=e.id
@@ -1059,6 +1080,7 @@ app.get('/api/employees/stats', auth, async (req, res) => {
     else if (classification === 'outsource_services') { q += ` AND oe.type='services'`; }
     else if (classification === 'outsource_vehicle_supplier') { q += ` AND oe.type='vehicle_supplier'`; }
     else if (classification === 'outsource') { q += ` AND LOWER(TRIM(e.organization))<>'egypro' AND oe.type IS NULL`; }
+    q += outsourceScopeClause(req, params);
     const empProjects = await getProjectFilter(req.user);
     if (empProjects !== null) {
       if (empProjects.length === 0) return res.json(zero);
@@ -1069,13 +1091,15 @@ app.get('/api/employees/stats', auth, async (req, res) => {
       if (empClients.length === 0) return res.json(zero);
       params.push(empClients); q += ` AND e.client = ANY($${params.length})`;
     }
-    q += ` GROUP BY e.id
+    q += ` GROUP BY e.id, oe.type
       )
       SELECT
         COUNT(*) FILTER (WHERE employment_status='active') as total_active,
         COUNT(*) FILTER (WHERE resource_type='inhouse' AND job_title NOT ILIKE '%intern%') as inhouse,
         COUNT(*) FILTER (WHERE resource_type='outsource') as outsource,
         COUNT(*) FILTER (WHERE job_title ILIKE '%intern%') as interns,
+        COUNT(*) FILTER (WHERE employment_status='active' AND otype='services') as services,
+        COUNT(*) FILTER (WHERE employment_status='active' AND otype='vehicle_supplier') as vehicle_supplier,
         COUNT(*) FILTER (WHERE employment_status='exit') as exits
       FROM scoped WHERE 1=1`;
     if (audit_age === '1month') q += ` AND days_since_audit <= 30`;
@@ -1083,7 +1107,7 @@ app.get('/api/employees/stats', auth, async (req, res) => {
     else if (audit_age === 'over2months') q += ` AND (days_since_audit IS NULL OR days_since_audit > 60)`;
     const { rows } = await pool.query(q, params);
     const r = rows[0];
-    res.json({ total_active: parseInt(r.total_active)||0, inhouse: parseInt(r.inhouse)||0, outsource: parseInt(r.outsource)||0, interns: parseInt(r.interns)||0, exits: parseInt(r.exits)||0 });
+    res.json({ total_active: parseInt(r.total_active)||0, inhouse: parseInt(r.inhouse)||0, outsource: parseInt(r.outsource)||0, interns: parseInt(r.interns)||0, services: parseInt(r.services)||0, vehicle_supplier: parseInt(r.vehicle_supplier)||0, exits: parseInt(r.exits)||0 });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -1377,7 +1401,8 @@ app.post('/api/employees', auth, async (req, res) => {
 
 // Update employee status (admin only)
 app.put('/api/employees/:id/status', auth, async (req, res) => {
-  if (!(await hasHrTask(req.user, 'edit_employee'))) return res.status(403).json({ error: 'Not authorized' });
+  // Authorized after the row loads (below): HR with edit_employee may exit anyone;
+  // an outsource subtype-manager may exit only outsource of their subtype.
   const { employment_status, exit_date } = req.body;
   if (employment_status && !['active', 'exit'].includes(employment_status)) {
     return res.status(400).json({ error: 'Invalid employment_status' });
@@ -1389,6 +1414,7 @@ app.put('/api/employees/:id/status', auth, async (req, res) => {
     await client.query('BEGIN');
     const cur = (await client.query('SELECT * FROM employees WHERE id=$1 FOR UPDATE', [req.params.id])).rows[0];
     if (!cur) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+    if (!(await canManageEmployee(req.user, cur, 'edit_employee'))) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Not authorized' }); }
     await client.query('UPDATE employees SET employment_status=$1, exit_date=$2, updated_at=NOW() WHERE id=$3', [employment_status, exit_date || null, req.params.id]);
     if (employment_status === 'exit') {
       await client.query(`UPDATE ppe_requests SET status='exit', updated_at=NOW() WHERE employee_id=$1 AND status NOT IN ('distributed','canceled','exit')`, [req.params.id]);
@@ -1432,7 +1458,8 @@ const EMPLOYEE_EDITABLE = [
   { key: 'client', label: 'Client' },
 ];
 app.put('/api/employees/:id', auth, async (req, res) => {
-  if (!(await hasHrTask(req.user, 'edit_employee'))) return res.status(403).json({ error: 'Not authorized' });
+  // Authorized after the row loads (below): HR with edit_employee may edit anyone;
+  // an outsource subtype-manager may edit only outsource of their subtype.
   const { full_name, national_id, job_title, department, project, client, reason } = req.body;
   if (!full_name || !full_name.trim()) return res.status(400).json({ error: 'Employee name is required' });
   if (!reason || !reason.trim()) return res.status(400).json({ error: 'A reason for the update is required' });
@@ -1448,6 +1475,7 @@ app.put('/api/employees/:id', auth, async (req, res) => {
     await client_db.query('BEGIN');
     const cur = (await client_db.query('SELECT * FROM employees WHERE id=$1 FOR UPDATE', [req.params.id])).rows[0];
     if (!cur) { await client_db.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+    if (!(await canManageEmployee(req.user, cur, 'edit_employee'))) { await client_db.query('ROLLBACK'); return res.status(403).json({ error: 'Not authorized' }); }
     // Field-level diff over the editable fields only (national_id is read-only).
     const norm = (v) => (v === undefined || v === null || v === '') ? null : v;
     const changes = EMPLOYEE_EDITABLE
@@ -2950,6 +2978,52 @@ app.put('/api/hr-tasks/:task/managers', auth, async (req, res) => {
         `UPDATE users SET hr_task_access = array_append(COALESCE(hr_task_access,'{}'), $1), updated_at = NOW()
           WHERE role='hr' AND id = ANY($2::uuid[]) AND NOT ($1 = ANY(COALESCE(hr_task_access,'{}')))`,
         [task, userIds]);
+    }
+    res.json({ ok: true });
+  } catch(e) { sendError(res, e); }
+});
+
+// ── Outsource access (manage Services / Vehicle Supplier) — Admin → Outsource Managers ──
+// Each grant = add + edit + exit for that outsource subtype. Admins always have both.
+// Assignable to the two outsource-facing roles: fleet and supervisor.
+const OUTSOURCE_SUBTYPES = ['services', 'vehicle_supplier'];
+const OUTSOURCE_MANAGER_ROLES = ['fleet', 'supervisor'];
+const hasOutsourceAccess = async (user, subtype) => {
+  if (user.role === 'admin') return true;
+  const { rows } = await pool.query(`SELECT 1 FROM users WHERE id=$1 AND $2 = ANY(COALESCE(outsource_access,'{}'))`, [user.id, subtype]);
+  return rows.length > 0;
+};
+// The outsource subtype ('services' | 'vehicle_supplier' | null) an org maps to.
+const outsourceSubtypeOfOrg = async (org) => {
+  if (!org || !String(org).trim()) return null;
+  const { rows } = await pool.query(`SELECT type FROM outsource_entities WHERE LOWER(TRIM(name))=LOWER(TRIM($1)) LIMIT 1`, [org]);
+  return rows.length ? rows[0].type : null;
+};
+// Can this user add/edit/exit the given employee row? HR (with the task) can manage
+// anyone; an outsource subtype-manager can manage only outsource of their subtype.
+const canManageEmployee = async (user, emp, hrTask) => {
+  if (await hasHrTask(user, hrTask)) return true;
+  if (emp && emp.resource_type === 'outsource') {
+    const sub = await outsourceSubtypeOfOrg(emp.organization);
+    if (sub && await hasOutsourceAccess(user, sub)) return true;
+  }
+  return false;
+};
+app.put('/api/outsource-tasks/:subtype/managers', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const subtype = req.params.subtype;
+  if (!OUTSOURCE_SUBTYPES.includes(subtype)) return res.status(400).json({ error: 'Unknown subtype' });
+  const userIds = Array.isArray(req.body.user_ids) ? req.body.user_ids : [];
+  try {
+    await pool.query(
+      `UPDATE users SET outsource_access = array_remove(outsource_access, $1), updated_at = NOW()
+        WHERE role = ANY($3::text[]) AND $1 = ANY(outsource_access) AND NOT (id = ANY($2::uuid[]))`,
+      [subtype, userIds, OUTSOURCE_MANAGER_ROLES]);
+    if (userIds.length) {
+      await pool.query(
+        `UPDATE users SET outsource_access = array_append(COALESCE(outsource_access,'{}'), $1), updated_at = NOW()
+          WHERE role = ANY($3::text[]) AND id = ANY($2::uuid[]) AND NOT ($1 = ANY(COALESCE(outsource_access,'{}')))`,
+        [subtype, userIds, OUTSOURCE_MANAGER_ROLES]);
     }
     res.json({ ok: true });
   } catch(e) { sendError(res, e); }
@@ -4811,14 +4885,22 @@ app.delete('/api/training-records/:id/certificate', auth, async (req, res) => {
 app.post('/api/employees/manual', auth, (req, res) => {
   certUpload.single('national_id_doc')(req, res, async (err) => {
     if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'National ID file must be 1MB or smaller.' : (err.message || 'Upload rejected') });
-    if (!(await hasHrTask(req.user, 'add_employee'))) return res.status(403).json({ error: 'Not authorized' });
     if (!R2_CONFIGURED) return res.status(503).json({ error: 'Document storage is not configured yet.' });
     if (!req.file) return res.status(400).json({ error: 'National ID document (PDF) is required' });
     let { full_name, national_id, employee_number, job_title, department, project, client, organization, resource_type } = req.body;
     resource_type = (resource_type || '').toLowerCase();
-    if (!['inhouse', 'intern'].includes(resource_type)) return res.status(400).json({ error: 'Invalid resource type' });
+    if (!['inhouse', 'intern', 'outsource'].includes(resource_type)) return res.status(400).json({ error: 'Invalid resource type' });
     const required = { full_name: 'Resource Name', national_id: 'National ID Number', department: 'Department', project: 'Project Name', client: 'Client', job_title: 'Job Title', organization: 'Organization' };
     for (const k in required) { if (!String(req.body[k] || '').trim()) return res.status(400).json({ error: `${required[k]} is required` }); }
+    // Authorize: HR with add_employee may add anyone; an outsource subtype-manager
+    // may add only an outsource resource whose organization maps to their subtype.
+    if (resource_type === 'outsource') {
+      const sub = await outsourceSubtypeOfOrg(organization);
+      if (!sub) return res.status(400).json({ error: 'That organization is not a registered outsource entity. Add it in Admin → Outsource Entities first.' });
+      if (!(await hasOutsourceAccess(req.user, sub) || await hasHrTask(req.user, 'add_employee'))) return res.status(403).json({ error: 'Not authorized' });
+    } else {
+      if (!(await hasHrTask(req.user, 'add_employee'))) return res.status(403).json({ error: 'Not authorized' });
+    }
     // Only in-house employees carry an Employment ID; interns/outsource have none.
     const empNo = resource_type === 'inhouse' ? String(employee_number || '').trim() : null;
     if (resource_type === 'inhouse' && !empNo) return res.status(400).json({ error: 'Employment ID is required' });
@@ -5246,7 +5328,7 @@ app.get('/api/graphs', auth, async (req, res) => {
 
 app.get('/api/users', auth, async (req, res) => {
   if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
-  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access, training_course_access, hr_task_access, must_reset_password, failed_login_attempts, locked_until, last_login, created_at FROM users ORDER BY created_at DESC');
+  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access, training_course_access, hr_task_access, outsource_access, must_reset_password, failed_login_attempts, locked_until, last_login, created_at FROM users ORDER BY created_at DESC');
   res.json(rows);
 });
 

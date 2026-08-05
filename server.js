@@ -560,6 +560,32 @@ async function setupDB() {
       ON CONFLICT (list_type, name) DO NOTHING
     `);
 
+    // Outsource entities (contractors / vehicle suppliers). An outsource employee's
+    // classification is derived from their organization via this table; Egypro folks
+    // are Inhouse/Intern (from job title), so only NON-Egypro orgs live here. Seeded
+    // ONCE from existing employee organizations as 'vehicle_supplier' — the ETMS export
+    // shows every current outsource org is a vehicle provider (DAMCHOTEL, the lone
+    // contractor, has no ESAT employees). Admins add/flip contractors in the panel.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS outsource_entities (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(160) UNIQUE NOT NULL,
+        type VARCHAR(20) NOT NULL DEFAULT 'vehicle_supplier' CHECK (type IN ('contractor','vehicle_supplier')),
+        is_active BOOLEAN DEFAULT TRUE,
+        sort_order INTEGER DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    // Guarded by NOT EXISTS so an admin deleting an entity doesn't get it re-added on
+    // the next boot just because employee rows still reference that organization.
+    await client.query(`
+      INSERT INTO outsource_entities (name, type)
+      SELECT DISTINCT TRIM(organization), 'vehicle_supplier' FROM employees
+      WHERE organization IS NOT NULL AND TRIM(organization) <> '' AND LOWER(TRIM(organization)) <> 'egypro'
+        AND NOT EXISTS (SELECT 1 FROM outsource_entities)
+      ON CONFLICT (name) DO NOTHING
+    `);
+
     console.log("Database setup complete");
   } catch(e) {
     console.error('DB setup error:', e.message);
@@ -923,7 +949,7 @@ app.get('/api/employees', auth, async (req, res) => {
     return res.status(403).json({ error: 'Not authorized' });
   }
   try {
-    const { status, search, national_id, employee_number, project, client, san, job_title, department, resource_type, audit_age, page, pageSize } = req.query;
+    const { status, search, national_id, employee_number, project, client, san, job_title, department, resource_type, classification, audit_age, page, pageSize } = req.query;
     // Other pages (pickers/dropdowns) call this endpoint without `page` and need
     // the old bare-array shape with every matching row -- only paginate, and only
     // switch to the {rows,total,...} shape, when a page param is actually sent.
@@ -931,7 +957,7 @@ app.get('/api/employees', auth, async (req, res) => {
     const limit = paginate ? Math.min(Math.max(parseInt(pageSize) || 25, 1), 100) : null;
     const pageNum = paginate ? Math.max(parseInt(page) || 1, 1) : 1;
     const offset = paginate ? (pageNum - 1) * limit : 0;
-    let q = `SELECT e.*, MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as days_since_audit, COUNT(epa.id) > 0 as ppe_assigned, u.full_name as ppe_last_edited_by_name, ued.full_name as last_edited_by_name, COALESCE(uc.full_name, e.created_by_name_text) as created_by_name, COALESCE(ex.changed_by_name, e.exited_by_name_text) as exited_by_name, ex.changed_at as exited_at, COUNT(*) OVER() as full_count FROM employees e LEFT JOIN audits a ON a.employee_id=e.id LEFT JOIN employee_ppe_assignments epa ON epa.employee_id=e.id LEFT JOIN users u ON u.id=e.ppe_last_edited_by LEFT JOIN users ued ON ued.id=e.last_edited_by LEFT JOIN users uc ON uc.id=e.created_by LEFT JOIN LATERAL (SELECT changed_by_name, changed_at FROM employee_change_log WHERE employee_id=e.id AND action='exit' ORDER BY changed_at DESC LIMIT 1) ex ON true WHERE 1=1`;
+    let q = `SELECT e.*, MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as days_since_audit, COUNT(epa.id) > 0 as ppe_assigned, u.full_name as ppe_last_edited_by_name, ued.full_name as last_edited_by_name, COALESCE(uc.full_name, e.created_by_name_text) as created_by_name, COALESCE(ex.changed_by_name, e.exited_by_name_text) as exited_by_name, ex.changed_at as exited_at, CASE WHEN LOWER(TRIM(e.organization))='egypro' AND COALESCE(e.job_title,'') NOT ILIKE '%intern%' THEN 'Inhouse' WHEN LOWER(TRIM(e.organization))='egypro' AND e.job_title ILIKE '%intern%' THEN 'Intern' WHEN oe.type='contractor' THEN 'Outsource (Contractor)' WHEN oe.type='vehicle_supplier' THEN 'Outsource (Vehicle Supplier)' ELSE 'Outsource' END as classification, COUNT(*) OVER() as full_count FROM employees e LEFT JOIN audits a ON a.employee_id=e.id LEFT JOIN employee_ppe_assignments epa ON epa.employee_id=e.id LEFT JOIN users u ON u.id=e.ppe_last_edited_by LEFT JOIN users ued ON ued.id=e.last_edited_by LEFT JOIN users uc ON uc.id=e.created_by LEFT JOIN outsource_entities oe ON LOWER(TRIM(oe.name))=LOWER(TRIM(e.organization)) LEFT JOIN LATERAL (SELECT changed_by_name, changed_at FROM employee_change_log WHERE employee_id=e.id AND action='exit' ORDER BY changed_at DESC LIMIT 1) ex ON true WHERE 1=1`;
     const params = [];
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
     if (search) { params.push(`%${search}%`); q += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length})`; }
@@ -949,6 +975,13 @@ app.get('/api/employees', auth, async (req, res) => {
     if (resource_type === 'intern') { q += ` AND e.job_title ILIKE '%intern%'`; }
     else if (resource_type === 'inhouse') { q += ` AND e.resource_type='inhouse' AND e.job_title NOT ILIKE '%intern%'`; }
     else if (resource_type) { params.push(resource_type); q += ` AND e.resource_type=$${params.length}`; }
+    // Classification filter (Inhouse/Intern derived from org+job title; the two
+    // Outsource kinds from the organization's entity type via the oe join).
+    if (classification === 'inhouse') { q += ` AND LOWER(TRIM(e.organization))='egypro' AND COALESCE(e.job_title,'') NOT ILIKE '%intern%'`; }
+    else if (classification === 'intern') { q += ` AND LOWER(TRIM(e.organization))='egypro' AND e.job_title ILIKE '%intern%'`; }
+    else if (classification === 'outsource_contractor') { q += ` AND oe.type='contractor'`; }
+    else if (classification === 'outsource_vehicle_supplier') { q += ` AND oe.type='vehicle_supplier'`; }
+    else if (classification === 'outsource') { q += ` AND LOWER(TRIM(e.organization))<>'egypro' AND oe.type IS NULL`; }
     const empProjects = await getProjectFilter(req.user);
     if (empProjects !== null) {
       if (empProjects.length === 0) { return res.json(paginate ? { rows: [], total: 0, page: pageNum, pageSize: limit } : []); }
@@ -959,7 +992,7 @@ app.get('/api/employees', auth, async (req, res) => {
       if (empClients.length === 0) { return res.json(paginate ? { rows: [], total: 0, page: pageNum, pageSize: limit } : []); }
       params.push(empClients); q += ` AND e.client = ANY($${params.length})`;
     }
-    q += ` GROUP BY e.id, u.full_name, ued.full_name, uc.full_name, ex.changed_by_name, ex.changed_at`;
+    q += ` GROUP BY e.id, u.full_name, ued.full_name, uc.full_name, ex.changed_by_name, ex.changed_at, oe.type`;
     // audit_age filters on an aggregate (days since the last audit), so it has
     // to be a HAVING clause -- can't reference the SELECT alias here.
     const auditAgeExpr = `CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE)`;
@@ -983,13 +1016,14 @@ app.get('/api/employees/stats', auth, async (req, res) => {
     return res.status(403).json({ error: 'Not authorized' });
   }
   try {
-    const { status, search, national_id, employee_number, project, client, san, job_title, department, resource_type, audit_age } = req.query;
+    const { status, search, national_id, employee_number, project, client, san, job_title, department, resource_type, classification, audit_age } = req.query;
     const zero = { total_active: 0, inhouse: 0, outsource: 0, interns: 0, exits: 0 };
     let q = `WITH scoped AS (
         SELECT e.employment_status, e.resource_type, e.job_title,
           CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as days_since_audit
         FROM employees e
         LEFT JOIN audits a ON a.employee_id=e.id
+        LEFT JOIN outsource_entities oe ON LOWER(TRIM(oe.name))=LOWER(TRIM(e.organization))
         WHERE 1=1`;
     const params = [];
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
@@ -1008,6 +1042,13 @@ app.get('/api/employees/stats', auth, async (req, res) => {
     if (resource_type === 'intern') { q += ` AND e.job_title ILIKE '%intern%'`; }
     else if (resource_type === 'inhouse') { q += ` AND e.resource_type='inhouse' AND e.job_title NOT ILIKE '%intern%'`; }
     else if (resource_type) { params.push(resource_type); q += ` AND e.resource_type=$${params.length}`; }
+    // Classification filter (Inhouse/Intern derived from org+job title; the two
+    // Outsource kinds from the organization's entity type via the oe join).
+    if (classification === 'inhouse') { q += ` AND LOWER(TRIM(e.organization))='egypro' AND COALESCE(e.job_title,'') NOT ILIKE '%intern%'`; }
+    else if (classification === 'intern') { q += ` AND LOWER(TRIM(e.organization))='egypro' AND e.job_title ILIKE '%intern%'`; }
+    else if (classification === 'outsource_contractor') { q += ` AND oe.type='contractor'`; }
+    else if (classification === 'outsource_vehicle_supplier') { q += ` AND oe.type='vehicle_supplier'`; }
+    else if (classification === 'outsource') { q += ` AND LOWER(TRIM(e.organization))<>'egypro' AND oe.type IS NULL`; }
     const empProjects = await getProjectFilter(req.user);
     if (empProjects !== null) {
       if (empProjects.length === 0) return res.json(zero);
@@ -3109,6 +3150,56 @@ app.delete('/api/org-lists/:id', auth, async (req, res) => {
     // Values live as free text on employee rows, so deleting an option never
     // orphans existing records — a hard delete is safe (it just stops offering it).
     const { rowCount } = await pool.query('DELETE FROM org_lists WHERE id=$1', [req.params.id]);
+    if (!rowCount) return res.status(404).json({ error: 'Not found' });
+    res.json({ success: true });
+  } catch(e) { sendError(res, e); }
+});
+
+// ── Outsource entities (contractors / vehicle suppliers) ─────────────────────
+// The organization of an outsource employee maps here to a type, which drives the
+// "Outsource (Contractor)" / "Outsource (Vehicle Supplier)" classification.
+const OUTSOURCE_TYPES = ['contractor', 'vehicle_supplier'];
+app.get('/api/outsource-entities', auth, async (req, res) => {
+  try {
+    const all = req.query.all === '1' && req.user.role === 'admin';
+    const where = all ? '1=1' : 'is_active = TRUE';
+    const { rows } = await pool.query(`SELECT id, name, type, is_active, sort_order FROM outsource_entities WHERE ${where} ORDER BY sort_order ASC, name ASC`);
+    res.json(rows);
+  } catch(e) { sendError(res, e); }
+});
+app.post('/api/outsource-entities', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { name, type, sort_order } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: 'Name is required' });
+  if (!OUTSOURCE_TYPES.includes(type)) return res.status(400).json({ error: 'Type must be contractor or vehicle_supplier' });
+  try {
+    const { rows } = await pool.query('INSERT INTO outsource_entities (name, type, sort_order) VALUES ($1,$2,$3) RETURNING *', [name.trim(), type, sort_order || 0]);
+    res.json(rows[0]);
+  } catch(e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'That entity already exists' });
+    sendError(res, e);
+  }
+});
+app.put('/api/outsource-entities/:id', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  const { name, type, is_active, sort_order } = req.body;
+  if (!name || !String(name).trim()) return res.status(400).json({ error: 'Name is required' });
+  if (!OUTSOURCE_TYPES.includes(type)) return res.status(400).json({ error: 'Type must be contractor or vehicle_supplier' });
+  try {
+    const { rows } = await pool.query('UPDATE outsource_entities SET name=$1, type=$2, is_active=$3, sort_order=$4 WHERE id=$5 RETURNING *', [name.trim(), type, is_active !== false, sort_order || 0, req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(rows[0]);
+  } catch(e) {
+    if (e.code === '23505') return res.status(400).json({ error: 'That entity already exists' });
+    sendError(res, e);
+  }
+});
+app.delete('/api/outsource-entities/:id', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    // Employees carry the organization as free text, so deleting an entity just
+    // drops those employees back to a plain "Outsource" classification — no orphaning.
+    const { rowCount } = await pool.query('DELETE FROM outsource_entities WHERE id=$1', [req.params.id]);
     if (!rowCount) return res.status(404).json({ error: 'Not found' });
     res.json({ success: true });
   } catch(e) { sendError(res, e); }

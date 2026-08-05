@@ -1502,6 +1502,50 @@ app.put('/api/employees/:id', auth, async (req, res) => {
   finally { client_db.release(); }
 });
 
+// Convert an intern to a full in-house employee: assign a real Job Title + an
+// Employment ID, mark the resource in-house, and set the Added date to the
+// conversion date (they start as an employee today). Logged to the change history,
+// so it flows into the daily employee-changes email automatically.
+app.post('/api/employees/:id/promote', auth, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const cur = (await client.query('SELECT * FROM employees WHERE id=$1 FOR UPDATE', [req.params.id])).rows[0];
+    if (!cur) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+    if (!(await canManageEmployee(req.user, cur, 'edit_employee'))) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Not authorized' }); }
+    if (!/\bintern\b/i.test(cur.job_title || '')) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Only an intern can be converted to in-house.' }); }
+    const job_title = String(req.body.job_title || '').trim();
+    const employee_number = String(req.body.employee_number || '').trim();
+    const reason = String(req.body.reason || '').trim() || 'Converted from Intern to In-House';
+    if (!job_title) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Job Title is required' }); }
+    if (/\bintern\b/i.test(job_title)) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Pick a non-intern Job Title.' }); }
+    if (!employee_number) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Employment ID is required' }); }
+    const dup = await client.query('SELECT id FROM employees WHERE employee_number=$1 AND id<>$2', [employee_number, cur.id]);
+    if (dup.rows.length) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'This Employment ID is already in use.' }); }
+    await client.query(
+      `UPDATE employees SET job_title=$1, employee_number=$2, resource_type='inhouse', added_on=CURRENT_DATE,
+         last_edited_by=$3, last_edited_at=NOW(), last_edit_reason=$4, updated_at=NOW() WHERE id=$5`,
+      [job_title, employee_number, req.user.id, reason, cur.id]);
+    const changes = [
+      { field: 'Job Title', before: cur.job_title || '—', after: job_title },
+      { field: 'Employment Number', before: cur.employee_number || '—', after: employee_number },
+      { field: 'Classification', before: 'Intern', after: 'In-House' },
+    ];
+    await client.query(
+      `INSERT INTO employee_change_log (employee_id, employee_name, national_id, employee_number, action, reason, changes, changed_by, changed_by_name)
+       VALUES ($1,$2,$3,$4,'update',$5,$6::jsonb,$7,$8)`,
+      [cur.id, cur.full_name, cur.national_id, employee_number, reason, JSON.stringify(changes), req.user.id, req.user.name || null]);
+    await client.query('COMMIT');
+    broadcastEmployeesChanged();
+    const { rows } = await pool.query('SELECT * FROM employees WHERE id=$1', [cur.id]);
+    res.json(rows[0]);
+  } catch (e) {
+    await client.query('ROLLBACK');
+    if (e.code === '23505') return res.status(409).json({ error: 'This Employment ID is already in use.' });
+    sendError(res, e);
+  } finally { client.release(); }
+});
+
 // Employee change history (admin, hr) — the written record of who changed what,
 // when, for which employee. Filterable by date range / action / employee, so the
 // "what changed yesterday" digest and an on-demand review both read from here.

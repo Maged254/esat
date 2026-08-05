@@ -4785,66 +4785,6 @@ app.get('/api/employees/:id/national-id/download', async (req, res) => {
   }
 });
 
-// ── TEMP one-time ETMS history backfill (added/exited by & date) — REMOVE AFTER RUN ──
-// Token-gated (not JWT) so it can run via a one-off script without a login. Fills the
-// added-by/exited-by NAMES + the true ETMS added/exit DATES for synced employees,
-// matched by national_id, BLANKS-ONLY (never overwrites an ESAT-recorded value or a
-// real user-based creator). `apply:false` (default) is a dry run: it rolls back and
-// only reports the match/fill/skip counts. Payload: { rows:[{national_id, created_by_name?,
-// added_on?, exited_by_name?, exit_date?}], apply:bool }.
-app.post('/api/admin/backfill-etms-history', async (req, res) => {
-  if (req.headers['x-backfill-token'] !== 'b7912b917541b793c6f5a7786d57779a') return res.status(403).json({ error: 'forbidden' });
-  const rows = req.body && req.body.rows;
-  const apply = !!(req.body && req.body.apply);
-  if (!Array.isArray(rows)) return res.status(400).json({ error: 'rows[] required' });
-  const client = await pool.connect();
-  const r = { apply, totalRows: rows.length, matched: 0, unmatchedCount: 0, unmatchedSample: [],
-    filledCreatedByName: 0, skippedCreatedByName: 0, filledAddedOn: 0, skippedAddedOn: 0,
-    filledExitedByName: 0, skippedExitedByName: 0, filledExitDate: 0, skippedExitDate: 0, samples: [] };
-  const unmatched = [];
-  try {
-    await client.query('BEGIN');
-    for (const row of rows) {
-      const nid = String(row.national_id || '').trim();
-      if (!nid) continue;
-      const { rows: found } = await client.query(
-        `SELECT id, full_name, (created_by IS NOT NULL) AS has_user_creator, created_by_name_text,
-                added_on, exited_by_name_text, exit_date FROM employees WHERE national_id=$1`, [nid]);
-      if (!found.length) { unmatched.push(nid); continue; }
-      r.matched++;
-      const e = found[0];
-      const sets = [], vals = []; let i = 1;
-      if (row.created_by_name) {
-        if (!e.has_user_creator && !e.created_by_name_text) { sets.push(`created_by_name_text=$${i++}`); vals.push(row.created_by_name); r.filledCreatedByName++; }
-        else r.skippedCreatedByName++;
-      }
-      if (row.added_on) {
-        if (!e.added_on) { sets.push(`added_on=$${i++}`); vals.push(row.added_on); r.filledAddedOn++; }
-        else r.skippedAddedOn++;
-      }
-      if (row.exited_by_name) {
-        if (!e.exited_by_name_text) { sets.push(`exited_by_name_text=$${i++}`); vals.push(row.exited_by_name); r.filledExitedByName++; }
-        else r.skippedExitedByName++;
-      }
-      if (row.exit_date) {
-        if (!e.exit_date) { sets.push(`exit_date=$${i++}`); vals.push(row.exit_date); r.filledExitDate++; }
-        else r.skippedExitDate++;
-      }
-      if (sets.length) {
-        if (r.samples.length < 10) r.samples.push({ national_id: nid, name: e.full_name, set: sets.map(s => s.split('=')[0]) });
-        if (apply) { vals.push(e.id); await client.query(`UPDATE employees SET ${sets.join(',')} WHERE id=$${i}`, vals); }
-      }
-    }
-    r.unmatchedCount = unmatched.length;
-    r.unmatchedSample = unmatched.slice(0, 20);
-    if (apply) await client.query('COMMIT'); else await client.query('ROLLBACK');
-    res.json(r);
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => {});
-    res.status(500).json({ error: String(e && e.message || e) });
-  } finally { client.release(); }
-});
-
 app.post('/api/admin/test-overdue-digest', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   try {

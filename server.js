@@ -3600,6 +3600,48 @@ app.get('/api/training-records/expiry-summary', auth, async (req, res) => {
   } catch(e) { sendError(res, e); }
 });
 
+// Training Dashboard aggregation (the ETMS "View Dashboard"): KPI totals, the
+// pending-reason breakdown, and the valid/expiring/expired split per course and
+// per project. The validity buckets ARE what the dashboard shows, so status/expiry
+// filters are ignored here — only the people-filters (client/project/course/
+// resource/employment status) + scope apply.
+app.get('/api/training-records/dashboard', auth, async (req, res) => {
+  try {
+    await ensureRenewalRequests();
+    const dashReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined, group: undefined, pending_reason: undefined, hide_expired_cert: undefined, new_only: undefined } };
+    const params = [];
+    const built = await trainingTrackerWhere(dashReq, params);
+    if (built.blocked) return res.json({ kpis: { requested: 0, valid: 0, expiring: 0, expired: 0, total: 0 }, pending_reasons: [], by_course: [], by_project: [] });
+    const where = built.where;
+    const VALID = `${CURRENT_CERT_SQL} AND t.expiry_date > CURRENT_DATE + ${EXPIRY_SOON_DAYS}`;
+    const EXPIRING = `${CURRENT_CERT_SQL} AND t.expiry_date >= CURRENT_DATE AND t.expiry_date <= CURRENT_DATE + ${EXPIRY_SOON_DAYS}`;
+    const from = `FROM training_records t JOIN training_courses c ON c.id=t.course_id LEFT JOIN employees e ON e.id=t.employee_id`;
+    const buckets = `
+      COUNT(*) FILTER (WHERE ${VALID})::int AS valid,
+      COUNT(*) FILTER (WHERE ${EXPIRING})::int AS expiring,
+      COUNT(*) FILTER (WHERE ${EXPIRED_CERT_SQL})::int AS expired`;
+    const grpOrder = `(COUNT(*) FILTER (WHERE ${VALID}) + COUNT(*) FILTER (WHERE ${EXPIRING}) + COUNT(*) FILTER (WHERE ${EXPIRED_CERT_SQL}))`;
+
+    const kpi = (await pool.query(`SELECT
+        COUNT(*) FILTER (WHERE t.status IN ('requested','scheduled','pending'))::int AS requested,
+        ${buckets} ${from} ${where}`, params)).rows[0];
+    kpi.total = kpi.valid + kpi.expiring + kpi.expired;
+
+    const pending_reasons = (await pool.query(`SELECT COALESCE(NULLIF(TRIM(t.pending_reason),''),'(no reason)') AS reason, COUNT(*)::int AS count
+        ${from} ${where} AND t.status='pending' GROUP BY 1 ORDER BY count DESC`, params)).rows;
+
+    const by_course = (await pool.query(`SELECT c.name AS course, ${buckets}
+        ${from} ${where} GROUP BY c.name HAVING ${grpOrder} > 0 ORDER BY ${grpOrder} DESC`, params)).rows
+      .map(r => ({ ...r, total: r.valid + r.expiring + r.expired }));
+
+    const by_project = (await pool.query(`SELECT COALESCE(NULLIF(TRIM(e.project),''),'(none)') AS project, ${buckets}
+        ${from} ${where} GROUP BY 1 HAVING ${grpOrder} > 0 ORDER BY ${grpOrder} DESC`, params)).rows
+      .map(r => ({ ...r, total: r.valid + r.expiring + r.expired }));
+
+    res.json({ kpis: kpi, pending_reasons, by_course, by_project });
+  } catch(e) { sendError(res, e); }
+});
+
 // ── Renew a training (new certificate, previous one kept) ───
 // A renewal is a NEW record, never an overwrite: the expired certificate stays
 // as history (with its own date, cost and -- later -- its PDF) and is marked

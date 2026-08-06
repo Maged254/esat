@@ -3628,8 +3628,9 @@ app.get('/api/training-records/dashboard', auth, async (req, res) => {
     const buckets = `
       COUNT(*) FILTER (WHERE ${VALID})::int AS valid,
       COUNT(*) FILTER (WHERE ${EXPIRING})::int AS expiring,
-      COUNT(*) FILTER (WHERE ${EXPIRED_CERT_SQL})::int AS expired`;
-    const grpOrder = `(COUNT(*) FILTER (WHERE ${VALID}) + COUNT(*) FILTER (WHERE ${EXPIRING}) + COUNT(*) FILTER (WHERE ${EXPIRED_CERT_SQL}))`;
+      COUNT(*) FILTER (WHERE ${EXPIRED_CERT_SQL})::int AS expired,
+      COUNT(*) FILTER (WHERE t.status='pending')::int AS pending`;
+    const grpOrder = `(COUNT(*) FILTER (WHERE ${VALID}) + COUNT(*) FILTER (WHERE ${EXPIRING}) + COUNT(*) FILTER (WHERE ${EXPIRED_CERT_SQL}) + COUNT(*) FILTER (WHERE t.status='pending'))`;
 
     const kpi = (await pool.query(`SELECT
         COUNT(*)::int AS all_records,
@@ -3644,11 +3645,11 @@ app.get('/api/training-records/dashboard', auth, async (req, res) => {
 
     const by_course = (await pool.query(`SELECT c.name AS course, ${buckets}
         ${from} ${where} GROUP BY c.name HAVING ${grpOrder} > 0 ORDER BY ${grpOrder} DESC`, params)).rows
-      .map(r => ({ ...r, total: r.valid + r.expiring + r.expired }));
+      .map(r => ({ ...r, total: r.valid + r.expiring + r.expired + r.pending }));
 
     const by_project = (await pool.query(`SELECT COALESCE(NULLIF(TRIM(e.project),''),'(none)') AS project, ${buckets}
         ${from} ${where} GROUP BY 1 HAVING ${grpOrder} > 0 ORDER BY ${grpOrder} DESC`, params)).rows
-      .map(r => ({ ...r, total: r.valid + r.expiring + r.expired }));
+      .map(r => ({ ...r, total: r.valid + r.expiring + r.expired + r.pending }));
 
     res.json({ kpis: kpi, pending_reasons, by_course, by_project });
   } catch(e) { sendError(res, e); }

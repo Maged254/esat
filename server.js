@@ -3616,7 +3616,9 @@ app.get('/api/training-records/expiry-summary', auth, async (req, res) => {
 // resource/employment status) + scope apply.
 app.get('/api/training-records/dashboard', auth, async (req, res) => {
   try {
-    await ensureRenewalRequests();
+    // Note: no ensureRenewalRequests() here — the dashboard is a read-only report
+    // and firing that write on every one of its 3 fetches is pure overhead. The
+    // Tracker and Update pages still materialise renewals.
     const dashReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined, group: undefined, pending_reason: undefined, hide_expired_cert: undefined, new_only: undefined } };
     const params = [];
     const built = await trainingTrackerWhere(dashReq, params);
@@ -3635,24 +3637,26 @@ app.get('/api/training-records/dashboard', auth, async (req, res) => {
       COUNT(*) FILTER (WHERE ${PENDING})::int AS pending`;
     const grpOrder = `(COUNT(*) FILTER (WHERE ${VALID}) + COUNT(*) FILTER (WHERE ${EXPIRING}) + COUNT(*) FILTER (WHERE ${PENDING}))`;
 
-    const kpi = (await pool.query(`SELECT
-        COUNT(*)::int AS all_records,
+    // Run the 4 independent aggregates concurrently (own pool connection each)
+    // instead of sequentially — cuts wall-clock to ~one query's time.
+    const [kpiR, prR, bcR, bpR] = await Promise.all([
+      pool.query(`SELECT COUNT(*)::int AS all_records,
         COUNT(*) FILTER (WHERE t.status IN ('requested','scheduled','pending'))::int AS requested,
-        ${buckets} ${from} ${where}`, params)).rows[0];
+        ${buckets} ${from} ${where}`, params),
+      pool.query(`SELECT COALESCE(NULLIF(TRIM(t.pending_reason),''), NULLIF(TRIM(t.not_eligible_reason),''), '(no reason)') AS reason, COUNT(*)::int AS count
+        ${from} ${where} AND ${PENDING} GROUP BY 1 ORDER BY count DESC`, params),
+      pool.query(`SELECT c.name AS course, ${buckets}
+        ${from} ${where} GROUP BY c.name HAVING ${grpOrder} > 0 ORDER BY ${grpOrder} DESC`, params),
+      pool.query(`SELECT COALESCE(NULLIF(TRIM(e.project),''),'(none)') AS project, ${buckets}
+        ${from} ${where} GROUP BY 1 HAVING ${grpOrder} > 0 ORDER BY ${grpOrder} DESC`, params),
+    ]);
+    const kpi = kpiR.rows[0];
     // total = valid + about-to-expire + pending (drives the validity donut);
     // all_records = every training record for the filter (drives the top KPI card).
     kpi.total = kpi.valid + kpi.expiring + kpi.pending;
-
-    const pending_reasons = (await pool.query(`SELECT COALESCE(NULLIF(TRIM(t.pending_reason),''), NULLIF(TRIM(t.not_eligible_reason),''), '(no reason)') AS reason, COUNT(*)::int AS count
-        ${from} ${where} AND ${PENDING} GROUP BY 1 ORDER BY count DESC`, params)).rows;
-
-    const by_course = (await pool.query(`SELECT c.name AS course, ${buckets}
-        ${from} ${where} GROUP BY c.name HAVING ${grpOrder} > 0 ORDER BY ${grpOrder} DESC`, params)).rows
-      .map(r => ({ ...r, total: r.valid + r.expiring + r.pending }));
-
-    const by_project = (await pool.query(`SELECT COALESCE(NULLIF(TRIM(e.project),''),'(none)') AS project, ${buckets}
-        ${from} ${where} GROUP BY 1 HAVING ${grpOrder} > 0 ORDER BY ${grpOrder} DESC`, params)).rows
-      .map(r => ({ ...r, total: r.valid + r.expiring + r.pending }));
+    const pending_reasons = prR.rows;
+    const by_course = bcR.rows.map(r => ({ ...r, total: r.valid + r.expiring + r.pending }));
+    const by_project = bpR.rows.map(r => ({ ...r, total: r.valid + r.expiring + r.pending }));
 
     res.json({ kpis: kpi, pending_reasons, by_course, by_project });
   } catch(e) { sendError(res, e); }

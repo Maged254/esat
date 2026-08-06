@@ -481,6 +481,12 @@ async function setupDB() {
     await client.query('CREATE INDEX IF NOT EXISTS idx_training_records_employee ON training_records(employee_id)');
     await client.query('CREATE INDEX IF NOT EXISTS idx_training_records_status ON training_records(status)');
     await client.query('CREATE INDEX IF NOT EXISTS idx_training_records_expiry ON training_records(expiry_date)');
+    // Support the correlated "superseded certificate" subquery (SUPERSEDED_SQL),
+    // which the /tracker and /stats aggregates evaluate per row. Without these the
+    // stats query is O(n^2) and times out once real training data exists
+    // (measured 61s @ 1,551 rows -> 0.4s with the indexes).
+    await client.query("CREATE INDEX IF NOT EXISTS idx_tr_supersede ON training_records (course_id, employee_id, completed_at) WHERE status='completed' AND is_deleted IS NOT TRUE");
+    await client.query("CREATE INDEX IF NOT EXISTS idx_tr_supersede_casual ON training_records (course_id, casual_id, completed_at) WHERE status='completed' AND is_deleted IS NOT TRUE");
 
     // Seed the initial course types carried over from ETMS -- but ONLY on a
     // brand-new (empty) table. Re-seeding on every boot would resurrect courses

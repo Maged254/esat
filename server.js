@@ -1134,17 +1134,18 @@ app.get('/api/employees/filter-options', auth, async (req, res) => {
     let q = `SELECT
         ARRAY_AGG(DISTINCT e.department) FILTER (WHERE e.department IS NOT NULL) as departments,
         ARRAY_AGG(DISTINCT e.project) FILTER (WHERE e.project IS NOT NULL) as projects,
-        ARRAY_AGG(DISTINCT e.client) FILTER (WHERE e.client IS NOT NULL) as clients
+        ARRAY_AGG(DISTINCT e.client) FILTER (WHERE e.client IS NOT NULL) as clients,
+        ARRAY_AGG(DISTINCT e.organization) FILTER (WHERE e.organization IS NOT NULL AND e.organization <> '') as organizations
       FROM employees e WHERE 1=1`;
     const params = [];
     const empProjects = await getProjectFilter(req.user);
     if (empProjects !== null) {
-      if (empProjects.length === 0) return res.json({ departments: [], projects: [], clients: [] });
+      if (empProjects.length === 0) return res.json({ departments: [], projects: [], clients: [], organizations: [] });
       params.push(empProjects); q += ` AND e.project = ANY($${params.length})`;
     }
     const empClients = await getClientFilter(req.user);
     if (empClients !== null) {
-      if (empClients.length === 0) return res.json({ departments: [], projects: [], clients: [] });
+      if (empClients.length === 0) return res.json({ departments: [], projects: [], clients: [], organizations: [] });
       params.push(empClients); q += ` AND e.client = ANY($${params.length})`;
     }
     const { rows } = await pool.query(q, params);
@@ -1152,6 +1153,7 @@ app.get('/api/employees/filter-options', auth, async (req, res) => {
       departments: (rows[0].departments || []).sort(),
       projects: (rows[0].projects || []).sort(),
       clients: (rows[0].clients || []).sort(),
+      organizations: (rows[0].organizations || []).sort(),
     });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
@@ -3447,7 +3449,7 @@ const ensureRenewalRequests = async (courseId) => {
 
 // Shared WHERE builder so /tracker and /stats always filter identically.
 const trainingTrackerWhere = async (req, params) => {
-  const { status, search, national_id, job_title, course_id, resource_type, department, expiry, employment_status, hide_expired_cert, new_only, group, pending_reason } = req.query;
+  const { status, search, national_id, job_title, course_id, resource_type, department, organization, expiry, employment_status, hide_expired_cert, new_only, group, pending_reason } = req.query;
   const projectsCsv = req.query.projects ? req.query.projects.split(',').filter(Boolean) : [];
   const clientsCsv = req.query.clients ? req.query.clients.split(',').filter(Boolean) : [];
   let w = ` WHERE t.is_deleted IS NOT TRUE AND t.employee_id IS NOT NULL`;
@@ -3458,6 +3460,7 @@ const trainingTrackerWhere = async (req, params) => {
   if (job_title) { params.push(`%${job_title}%`); w += ` AND e.job_title ILIKE $${params.length}`; }
   if (course_id) { params.push(course_id); w += ` AND t.course_id = $${params.length}`; }
   if (department) { params.push(department); w += ` AND e.department = $${params.length}`; }
+  if (organization) { params.push(organization); w += ` AND e.organization = $${params.length}`; }
   // Same intern/inhouse disjointness as the employees list.
   if (resource_type === 'intern') { w += ` AND e.job_title ILIKE '%intern%'`; }
   else if (resource_type === 'inhouse') { w += ` AND e.resource_type='inhouse' AND e.job_title NOT ILIKE '%intern%'`; }
@@ -3513,7 +3516,7 @@ app.get('/api/training-records/tracker', auth, async (req, res) => {
              (t.cloudinary_public_id IS NOT NULL) AS has_certificate, t.original_filename,
              c.name AS course_name, c.validity_months, c.needs_certificate,
              e.full_name AS employee_name, e.national_id, e.employee_number,
-             e.job_title, e.department, e.project, e.client, e.employment_status,
+             e.job_title, e.department, e.project, e.client, e.organization, e.employment_status,
              u.full_name AS requested_by_name, ru.full_name AS recorded_by_name, t.recorded_at,
              (t.expiry_date - CURRENT_DATE) AS days_to_expiry,
              CASE WHEN t.status='completed' AND ${SUPERSEDED_SQL} THEN 'superseded'

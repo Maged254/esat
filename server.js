@@ -3632,8 +3632,11 @@ app.get('/api/training-records/dashboard', auth, async (req, res) => {
     const grpOrder = `(COUNT(*) FILTER (WHERE ${VALID}) + COUNT(*) FILTER (WHERE ${EXPIRING}) + COUNT(*) FILTER (WHERE ${EXPIRED_CERT_SQL}))`;
 
     const kpi = (await pool.query(`SELECT
+        COUNT(*)::int AS all_records,
         COUNT(*) FILTER (WHERE t.status IN ('requested','scheduled','pending'))::int AS requested,
         ${buckets} ${from} ${where}`, params)).rows[0];
+    // total = current valid+expiring+expired certificates (drives the validity donut);
+    // all_records = every training record for the filter (drives the top KPI card).
     kpi.total = kpi.valid + kpi.expiring + kpi.expired;
 
     const pending_reasons = (await pool.query(`SELECT COALESCE(NULLIF(TRIM(t.pending_reason),''),'(no reason)') AS reason, COUNT(*)::int AS count

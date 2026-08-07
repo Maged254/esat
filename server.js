@@ -3619,7 +3619,10 @@ app.get('/api/training-records/dashboard', auth, async (req, res) => {
     // Note: no ensureRenewalRequests() here — the dashboard is a read-only report
     // and firing that write on every one of its 3 fetches is pure overhead. The
     // Tracker and Update pages still materialise renewals.
-    const dashReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined, group: undefined, pending_reason: undefined, hide_expired_cert: undefined, new_only: undefined } };
+    // pending_reason is honoured here (unlike the other narrowing params) so the
+    // dashboard's Pending Reason filter scopes the whole view to that reason —
+    // valid/expiring then read 0 and the charts show the pending breakdown for it.
+    const dashReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined, group: undefined, hide_expired_cert: undefined, new_only: undefined } };
     const params = [];
     const built = await trainingTrackerWhere(dashReq, params);
     if (built.blocked) return res.json({ kpis: { requested: 0, valid: 0, expiring: 0, expired: 0, total: 0 }, pending_reasons: [], by_course: [], by_project: [] });

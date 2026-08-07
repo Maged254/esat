@@ -3647,7 +3647,10 @@ app.get('/api/training-records/dashboard', auth, async (req, res) => {
         ${from} ${where} AND ${PENDING} GROUP BY 1 ORDER BY count DESC`, params),
       pool.query(`SELECT c.name AS course, ${buckets}
         ${from} ${where} GROUP BY c.name HAVING ${grpOrder} > 0 ORDER BY ${grpOrder} DESC`, params),
-      pool.query(`SELECT COALESCE(NULLIF(TRIM(e.project),''),'(none)') AS project, ${buckets}
+      pool.query(`SELECT COALESCE(NULLIF(TRIM(e.project),''),'(none)') AS project,
+        CASE WHEN COUNT(DISTINCT NULLIF(TRIM(e.client),'')) = 1 THEN MAX(NULLIF(TRIM(e.client),''))
+             WHEN COUNT(DISTINCT NULLIF(TRIM(e.client),'')) > 1 THEN 'Multiple' ELSE NULL END AS client,
+        ${buckets}
         ${from} ${where} GROUP BY 1 HAVING ${grpOrder} > 0 ORDER BY ${grpOrder} DESC`, params),
     ]);
     const kpi = kpiR.rows[0];

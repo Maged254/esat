@@ -4710,6 +4710,7 @@ cloudinary.config({
 // bytes are served straight from R2 (we only 302-redirect), so downloads don't
 // touch Render's bandwidth. Audit documents stay on Cloudinary.
 const { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { PDFDocument, degrees } = require('pdf-lib');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const R2_BUCKET = process.env.R2_BUCKET;
 const R2_CONFIGURED = !!(process.env.R2_ACCOUNT_ID && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY && R2_BUCKET);
@@ -4968,6 +4969,32 @@ app.get('/api/training-records/:id/certificate/download', async (req, res) => {
   } catch (e) {
     if (e.name === 'NoSuchKey') return res.status(404).json({ error: 'Not found' });
     if (!res.headersSent) res.status(500).json({ error: 'Download failed' });
+  }
+});
+
+// Rotate a (PDF) certificate 90° and save it back to R2 under the SAME key, so the
+// record stays linked and every viewer sees the corrected orientation. ?dir=ccw
+// for counter-clockwise; default clockwise. Same auth/course-access as upload.
+app.post('/api/training-records/:id/certificate/rotate', auth, async (req, res) => {
+  if (!TRAINING_UPDATE_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized to update training records' });
+  if (!R2_CONFIGURED) return res.status(503).json({ error: 'Certificate storage is not configured yet.' });
+  try {
+    const { rows: [rec] } = await loadTrainingRecordForCert(req.params.id);
+    if (!rec || !rec.cloudinary_public_id) return res.status(404).json({ error: 'Not found' });
+    if (!(await inScope(req.user, rec.project, rec.client))) return res.status(404).json({ error: 'Not found' });
+    if (!(await canManageCourse(req.user, rec.course_id))) return res.status(403).json({ error: `You are not assigned to manage "${rec.course_name}".` });
+    const isPdf = (rec.resource_type === 'application/pdf') || /\.pdf$/i.test(rec.cloudinary_public_id);
+    if (!isPdf) return res.status(400).json({ error: 'Only PDF certificates can be rotated.' });
+    const step = req.query.dir === 'ccw' ? -90 : 90;
+    const obj = await r2.send(new GetObjectCommand({ Bucket: R2_BUCKET, Key: rec.cloudinary_public_id }));
+    const pdf = await PDFDocument.load(await obj.Body.transformToByteArray());
+    for (const page of pdf.getPages()) page.setRotation(degrees(((page.getRotation().angle + step) % 360 + 360) % 360));
+    const out = await pdf.save();
+    await r2.send(new PutObjectCommand({ Bucket: R2_BUCKET, Key: rec.cloudinary_public_id, Body: Buffer.from(out), ContentType: 'application/pdf' }));
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('Certificate rotate error:', e.message);
+    res.status(500).json({ error: GENERIC_ERROR_MESSAGE });
   }
 });
 

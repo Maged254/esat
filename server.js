@@ -1680,29 +1680,14 @@ app.post('/api/casuals/batch', auth, async (req, res) => {
     const totalAdded = inserted.length + reactivated.length;
     if (totalAdded > 0) {
       resend.emails.send({
-        from: 'ESAT <esat@egypro.app>',
+        from: 'OneHub <esat@egypro.app>',
         to: 'e.maged@outlook.com',
-        subject: `ESAT — ${totalAdded} Casual${totalAdded > 1 ? 's' : ''} Added`,
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
-            <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
-              <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="110" height="50" style="height:50px; width:110px; display:block; margin:0 auto;" />
-            </td></tr></table>
-            <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
-              <p style="font-size: 15px; color: #374151;">
-                <strong style="color: #0f2a4a;">${totalAdded} casual${totalAdded > 1 ? 's were' : ' was'}</strong> added by <strong style="color: #0f2a4a;">${escapeHtml(req.user.name || req.user.email)}</strong>.
-              </p>
-              <p style="font-size: 15px; color: #374151;">
-                Project: <strong style="color: #0f2a4a;">${escapeHtml(project)}</strong> &middot; Client: <strong style="color: #0f2a4a;">${escapeHtml(client)}</strong>
-              </p>
-              <a href="https://esat.egypro.app/casuals"
-                style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">
-                Open ESAT
-              </a>
-              <p style="font-size: 14px; color: #374151; margin-top: 24px;">Thanks,<br/>Maged Ezzat</p>
-            </div>
-          </div>
-        `
+        subject: `OneHub — ${totalAdded} Casual${totalAdded > 1 ? 's' : ''} Added`,
+        html: mailWrap(`
+          <p>Hi,</p>
+          <p>${totalAdded} casual${totalAdded > 1 ? 's were' : ' was'} added by ${escapeHtml(req.user.name || req.user.email)} — Project: ${escapeHtml(project)}, Client: ${escapeHtml(client)}.</p>
+          ${MAIL_SIGNOFF}
+        `)
       }).catch(e => console.error('Casuals batch email error:', e.message));
     }
     res.json({ inserted, reactivated, skipped });
@@ -1749,29 +1734,14 @@ app.post('/api/casuals/reactivate', auth, async (req, res) => {
       const projectLabel = projects.length ? projects.join(', ') : '—';
       const clientLabel = clients.length ? clients.join(', ') : '—';
       resend.emails.send({
-        from: 'ESAT <esat@egypro.app>',
+        from: 'OneHub <esat@egypro.app>',
         to: 'e.maged@outlook.com',
-        subject: `ESAT — ${n} Casual${n > 1 ? 's' : ''} Reactivated`,
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
-            <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
-              <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="110" height="50" style="height:50px; width:110px; display:block; margin:0 auto;" />
-            </td></tr></table>
-            <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
-              <p style="font-size: 15px; color: #374151;">
-                <strong style="color: #0f2a4a;">${n} casual${n > 1 ? 's were' : ' was'}</strong> reactivated by <strong style="color: #0f2a4a;">${escapeHtml(req.user.name || req.user.email)}</strong>.
-              </p>
-              <p style="font-size: 15px; color: #374151;">
-                Project: <strong style="color: #0f2a4a;">${escapeHtml(projectLabel)}</strong> &middot; Client: <strong style="color: #0f2a4a;">${escapeHtml(clientLabel)}</strong>
-              </p>
-              <a href="https://esat.egypro.app/casuals"
-                style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">
-                Open ESAT
-              </a>
-              <p style="font-size: 14px; color: #374151; margin-top: 24px;">Thanks,<br/>Maged Ezzat</p>
-            </div>
-          </div>
-        `
+        subject: `OneHub — ${n} Casual${n > 1 ? 's' : ''} Reactivated`,
+        html: mailWrap(`
+          <p>Hi,</p>
+          <p>${n} casual${n > 1 ? 's were' : ' was'} reactivated by ${escapeHtml(req.user.name || req.user.email)} — Project: ${escapeHtml(projectLabel)}, Client: ${escapeHtml(clientLabel)}.</p>
+          ${MAIL_SIGNOFF}
+        `)
       }).catch(e => console.error('Casuals reactivate email error:', e.message));
     }
     res.json({ reactivated, skipped });
@@ -4101,6 +4071,14 @@ app.post('/api/admin/replace-ppe-items', async (req, res) => {
 const { Resend } = require('resend');
 const resend = new Resend(process.env.RESEND_API_KEY);
 
+// Plain, personal-style email — no logo, no card, no button. Reads like a normal
+// message a person would type. `inner` is the body HTML (<p>/<ul> etc.).
+const FONT = "'Century Gothic', CenturyGothic, 'Apple Gothic', AppleGothic, 'URW Gothic', 'Avant Garde', sans-serif";
+const mailWrap = (inner) => `<div style="font-family: ${FONT}; font-size: 11pt; font-weight: 400; line-height: 1.6; color: #222; max-width: 640px;">${inner}</div>`;
+const MAIL_SIGNOFF = `<p style="margin-top: 16px;">Thanks,<br/>Maged Ezzat</p>`;
+// "N days" with the number in red when it's been waiting (> 0 days), as before.
+const redDays = (n) => `<span style="color:${n > 0 ? '#e53e3e' : 'inherit'};font-weight:600">${n} day${n !== 1 ? 's' : ''}</span>`;
+
 async function sendDailySCMDigest() {
   try {
     const { rows: pending } = await pool.query(`
@@ -4117,37 +4095,22 @@ async function sendDailySCMDigest() {
     const orderedOldestDays = parseInt(ordered[0].oldest_days) || 0;
 
     if (count === 0 && orderedCount === 0) return;
+    // Only email when something has actually been waiting (more than 0 days).
+    if (oldestDays <= 0 && orderedOldestDays <= 0) return;
 
     await resend.emails.send({
-        from: 'ESAT <esat@egypro.app>',
+        from: 'OneHub <esat@egypro.app>',
         to: 'e.maged@outlook.com',
-        subject: `ESAT Daily SCM — ${count + orderedCount} Pending PPE/Tool Item${(count + orderedCount) > 1 ? 's' : ''} Awaiting Action`,
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
-            <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
-              <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="110" height="50" style="height:50px; width:110px; display:block; margin:0 auto;" />
-            </td></tr></table>
-            <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
-              <p style="font-size: 15px; color: #374151;">Hello Supply Chain Team,</p>
-              ${count > 0 ? `<p style="font-size: 15px; color: #374151;">
-                We have <strong style="color: #0f2a4a;">${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong>
-                to be ordered or to confirm availability. The oldest item has been waiting for
-                <strong style="color: ${oldestDays > 0 ? '#e53e3e' : '#374151'};">${oldestDays} day${oldestDays !== 1 ? 's' : ''}</strong>.
-              </p>` : ''}
-              ${orderedCount > 0 ? `<p style="font-size: 15px; color: #374151;">
-                And our Suppliers have <strong style="color: #0f2a4a;">${orderedCount} pending PPE/Tool item${orderedCount > 1 ? 's' : ''}</strong>
-                to be delivered to our warehouse. The oldest item has been waiting for
-                <strong style="color: ${orderedOldestDays > 0 ? '#e53e3e' : '#374151'};">${orderedOldestDays} day${orderedOldestDays !== 1 ? 's' : ''}</strong>.
-              </p>` : ''}
-              <p style="font-size: 15px; color: #374151;">Please check the ESAT system to clear the pending list.</p>
-              <a href="https://esat.egypro.app"
-                style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">
-                Open ESAT
-              </a>
-              <p style="font-size: 14px; color: #374151; margin-top: 24px;">Thanks,<br/>Maged Ezzat</p>
-            </div>
-          </div>
-        `
+        subject: `OneHub Daily SCM — ${count + orderedCount} Pending PPE/Tool Item${(count + orderedCount) > 1 ? 's' : ''} Awaiting Action`,
+        html: mailWrap(`
+          <p>Hello Supply Chain Team,</p>
+          <ul>
+            ${count > 0 ? `<li>We have <strong>${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong> to be ordered or to confirm availability. The oldest item has been waiting for ${redDays(oldestDays)}.</li>` : ''}
+            ${orderedCount > 0 ? `<li>And our Suppliers have <strong>${orderedCount} pending PPE/Tool item${orderedCount > 1 ? 's' : ''}</strong> to be delivered to our warehouse. The oldest item has been waiting for ${redDays(orderedOldestDays)}.</li>` : ''}
+          </ul>
+          <p>Please check the OneHub system to clear the pending list.</p>
+          ${MAIL_SIGNOFF}
+        `)
       });
     console.log('SCM digest sent — ' + count + ' pending, ' + orderedCount + ' ordered');
   } catch(e) {
@@ -4167,32 +4130,19 @@ async function sendDailyPMDigest() {
     const count = parseInt(pending[0].count);
     const oldestDays = parseInt(pending[0].oldest_days) || 0;
     if (count === 0) return;
+    // Only email when something has actually been waiting (more than 0 days).
+    if (oldestDays <= 0) return;
 
     await resend.emails.send({
-        from: 'ESAT <esat@egypro.app>',
+        from: 'OneHub <esat@egypro.app>',
         to: 'e.maged@outlook.com',
-        subject: `ESAT Daily PM — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Your Approval`,
-        html: `
-          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
-            <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
-              <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="110" height="50" style="height:50px; width:110px; display:block; margin:0 auto;" />
-            </td></tr></table>
-            <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
-              <p style="font-size: 15px; color: #374151;">Hello Isaac,</p>
-              <p style="font-size: 15px; color: #374151;">
-                We have <strong style="color: #0f2a4a;">${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong>
-                that require your approval. The oldest item has been waiting for
-                <strong style="color: ${oldestDays > 0 ? '#e53e3e' : '#374151'};">${oldestDays} day${oldestDays !== 1 ? 's' : ''}</strong>.
-              </p>
-              <p style="font-size: 15px; color: #374151;">Please check the ESAT system to clear the pending list.</p>
-              <a href="https://esat.egypro.app"
-                style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">
-                Open ESAT
-              </a>
-              <p style="font-size: 14px; color: #374151; margin-top: 24px;">Thanks,<br/>Maged Ezzat</p>
-            </div>
-          </div>
-        `
+        subject: `OneHub Daily PM — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Your Approval`,
+        html: mailWrap(`
+          <p>Hello Isaac,</p>
+          <p>We have <strong>${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong> that require your approval. The oldest item has been waiting for ${redDays(oldestDays)}.</p>
+          <p>Please check the OneHub system to clear the pending list.</p>
+          ${MAIL_SIGNOFF}
+        `)
       });
     console.log('PM digest sent — ' + count + ' pending');
   } catch(e) {
@@ -4215,6 +4165,8 @@ async function sendDailyBTSDigest() {
     const count = parseInt(pending[0].count);
     const oldestDays = parseInt(pending[0].oldest_days) || 0;
     if (count === 0) return;
+    // Only email when something has actually been waiting (more than 0 days).
+    if (oldestDays <= 0) return;
     const { rows: byProject } = await pool.query(`
       SELECT COALESCE(e.project, c.project) as project, COALESCE(e.client, c.client) as client, COUNT(*) as count, MAX(CURRENT_DATE - date_available::date) as oldest_days
       FROM ppe_requests r
@@ -4227,44 +4179,29 @@ async function sendDailyBTSDigest() {
     `, [btsProjects]);
     const projectRowsHtml = byProject.map(p => `
       <tr>
-        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #374151;">${escapeHtml(p.project)}${p.client ? `<div style="font-size: 11px; color: #9ca3af; margin-top: 2px;">${escapeHtml(p.client)}</div>` : ''}</td>
-        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #0f2a4a; font-weight: 600; text-align: center;">${p.count}</td>
-        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; text-align: center; color: ${parseInt(p.oldest_days) > 0 ? '#e53e3e' : '#374151'};">${parseInt(p.oldest_days) || 0}</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-family: ${FONT}; font-size: 11pt; color: #374151;">${escapeHtml(p.project)}${p.client ? `<div style="font-family: ${FONT}; font-size: 9pt; color: #9ca3af; margin-top: 2px;">${escapeHtml(p.client)}</div>` : ''}</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-family: ${FONT}; font-size: 11pt; color: #0f2a4a; font-weight: 600; text-align: center;">${p.count}</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-family: ${FONT}; font-size: 11pt; text-align: center; color: ${parseInt(p.oldest_days) > 0 ? '#e53e3e' : '#374151'};">${parseInt(p.oldest_days) || 0}</td>
       </tr>`).join('');
 
     await resend.emails.send({
-      from: 'ESAT <esat@egypro.app>',
+      from: 'OneHub <esat@egypro.app>',
       to: 'e.maged@outlook.com',
-      subject: `ESAT Daily BTS Projects — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
-          <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
-            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="110" height="50" style="height:50px; width:110px; display:block; margin:0 auto;" />
-          </td></tr></table>
-          <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
-            <p style="font-size: 15px; color: #374151;">Hello BTS Project Team,</p>
-            <p style="font-size: 15px; color: #374151;">
-              We have <strong style="color: #0f2a4a;">${count} available PPE/Tool item${count > 1 ? 's' : ''}</strong>
-              at our warehouse to be collected. The oldest item has been waiting for
-              <strong style="color: ${oldestDays > 0 ? '#e53e3e' : '#374151'};">${oldestDays} day${oldestDays !== 1 ? 's' : ''}</strong>.
-            </p>
-            <table width="100%" cellpadding="0" cellspacing="0" style="margin: 16px 0; border: 1px solid #e5e7eb; border-radius: 6px; overflow: hidden;">
-              <tr style="background: #f3f4f6;">
-                <th style="padding: 8px 12px; text-align: left; font-size: 12px; color: #6b7280; text-transform: uppercase;">Project</th>
-                <th style="padding: 8px 12px; text-align: center; font-size: 12px; color: #6b7280; text-transform: uppercase;">Items</th>
-                <th style="padding: 8px 12px; text-align: center; font-size: 12px; color: #6b7280; text-transform: uppercase;">Oldest (days)</th>
-              </tr>
-              ${projectRowsHtml}
-            </table>
-            <p style="font-size: 15px; color: #374151;">Please check the ESAT system to clear the pending list.</p>
-            <a href="https://esat.egypro.app"
-              style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">
-              Open ESAT
-            </a>
-            <p style="font-size: 14px; color: #374151; margin-top: 24px;">Thanks,<br/>Maged Ezzat</p>
-          </div>
-        </div>
-      `
+      subject: `OneHub Daily BTS Projects — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
+      html: mailWrap(`
+          <p>Hello BTS Project Team,</p>
+          <p>We have <strong>${count} available PPE/Tool item${count > 1 ? 's' : ''}</strong> at our warehouse to be collected. The oldest item has been waiting for ${redDays(oldestDays)}:</p>
+          <table cellpadding="0" cellspacing="0" style="border-collapse: collapse; margin: 8px 0 12px; border: 1px solid #e5e7eb; border-radius: 6px; overflow: hidden; font-family: ${FONT};">
+            <tr style="background: #f3f4f6;">
+              <th style="padding: 8px 12px; text-align: left; font-family: ${FONT}; font-size: 10pt; color: #6b7280; text-transform: uppercase;">Project</th>
+              <th style="padding: 8px 12px; text-align: center; font-family: ${FONT}; font-size: 10pt; color: #6b7280; text-transform: uppercase;">Items</th>
+              <th style="padding: 8px 12px; text-align: center; font-family: ${FONT}; font-size: 10pt; color: #6b7280; text-transform: uppercase;">Oldest (days)</th>
+            </tr>
+            ${projectRowsHtml}
+          </table>
+          <p>Please check the OneHub system to clear the pending list.</p>
+          ${MAIL_SIGNOFF}
+        `)
     });
     console.log('BTS digest sent — ' + count + ' items');
   } catch(e) {
@@ -4286,6 +4223,8 @@ async function sendDailyFibreDigest() {
     const count = parseInt(pending[0].count);
     const oldestDays = parseInt(pending[0].oldest_days) || 0;
     if (count === 0) return;
+    // Only email when something has actually been waiting (more than 0 days).
+    if (oldestDays <= 0) return;
     const { rows: byProject } = await pool.query(`
       SELECT COALESCE(e.project, c.project) as project, COALESCE(e.client, c.client) as client, COUNT(*) as count, MAX(CURRENT_DATE - date_available::date) as oldest_days
       FROM ppe_requests r
@@ -4298,44 +4237,29 @@ async function sendDailyFibreDigest() {
     `, [fibreProjects]);
     const projectRowsHtml = byProject.map(p => `
       <tr>
-        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #374151;">${escapeHtml(p.project)}${p.client ? `<div style="font-size: 11px; color: #9ca3af; margin-top: 2px;">${escapeHtml(p.client)}</div>` : ''}</td>
-        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; color: #0f2a4a; font-weight: 600; text-align: center;">${p.count}</td>
-        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; text-align: center; color: ${parseInt(p.oldest_days) > 0 ? '#e53e3e' : '#374151'};">${parseInt(p.oldest_days) || 0}</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-family: ${FONT}; font-size: 11pt; color: #374151;">${escapeHtml(p.project)}${p.client ? `<div style="font-family: ${FONT}; font-size: 9pt; color: #9ca3af; margin-top: 2px;">${escapeHtml(p.client)}</div>` : ''}</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-family: ${FONT}; font-size: 11pt; color: #0f2a4a; font-weight: 600; text-align: center;">${p.count}</td>
+        <td style="padding: 8px 12px; border-bottom: 1px solid #e5e7eb; font-family: ${FONT}; font-size: 11pt; text-align: center; color: ${parseInt(p.oldest_days) > 0 ? '#e53e3e' : '#374151'};">${parseInt(p.oldest_days) || 0}</td>
       </tr>`).join('');
 
     await resend.emails.send({
-      from: 'ESAT <esat@egypro.app>',
+      from: 'OneHub <esat@egypro.app>',
       to: 'e.maged@outlook.com',
-      subject: `ESAT Daily Fibre Projects — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
-          <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
-            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="110" height="50" style="height:50px; width:110px; display:block; margin:0 auto;" />
-          </td></tr></table>
-          <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
-            <p style="font-size: 15px; color: #374151;">Hello Fibre Project Team,</p>
-            <p style="font-size: 15px; color: #374151;">
-              We have <strong style="color: #0f2a4a;">${count} available PPE/Tool item${count > 1 ? 's' : ''}</strong>
-              at our warehouse to be collected. The oldest item has been waiting for
-              <strong style="color: ${oldestDays > 0 ? '#e53e3e' : '#374151'};">${oldestDays} day${oldestDays !== 1 ? 's' : ''}</strong>.
-            </p>
-            <table width="100%" cellpadding="0" cellspacing="0" style="margin: 16px 0; border: 1px solid #e5e7eb; border-radius: 6px; overflow: hidden;">
-              <tr style="background: #f3f4f6;">
-                <th style="padding: 8px 12px; text-align: left; font-size: 12px; color: #6b7280; text-transform: uppercase;">Project</th>
-                <th style="padding: 8px 12px; text-align: center; font-size: 12px; color: #6b7280; text-transform: uppercase;">Items</th>
-                <th style="padding: 8px 12px; text-align: center; font-size: 12px; color: #6b7280; text-transform: uppercase;">Oldest (days)</th>
-              </tr>
-              ${projectRowsHtml}
-            </table>
-            <p style="font-size: 15px; color: #374151;">Please check the ESAT system to clear the pending list.</p>
-            <a href="https://esat.egypro.app"
-              style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">
-              Open ESAT
-            </a>
-            <p style="font-size: 14px; color: #374151; margin-top: 24px;">Thanks,<br/>Maged Ezzat</p>
-          </div>
-        </div>
-      `
+      subject: `OneHub Daily Fibre Projects — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
+      html: mailWrap(`
+          <p>Hello Fibre Project Team,</p>
+          <p>We have <strong>${count} available PPE/Tool item${count > 1 ? 's' : ''}</strong> at our warehouse to be collected. The oldest item has been waiting for ${redDays(oldestDays)}:</p>
+          <table cellpadding="0" cellspacing="0" style="border-collapse: collapse; margin: 8px 0 12px; border: 1px solid #e5e7eb; border-radius: 6px; overflow: hidden; font-family: ${FONT};">
+            <tr style="background: #f3f4f6;">
+              <th style="padding: 8px 12px; text-align: left; font-family: ${FONT}; font-size: 10pt; color: #6b7280; text-transform: uppercase;">Project</th>
+              <th style="padding: 8px 12px; text-align: center; font-family: ${FONT}; font-size: 10pt; color: #6b7280; text-transform: uppercase;">Items</th>
+              <th style="padding: 8px 12px; text-align: center; font-family: ${FONT}; font-size: 10pt; color: #6b7280; text-transform: uppercase;">Oldest (days)</th>
+            </tr>
+            ${projectRowsHtml}
+          </table>
+          <p>Please check the OneHub system to clear the pending list.</p>
+          ${MAIL_SIGNOFF}
+        `)
     });
     console.log('Fibre digest sent — ' + count + ' items');
   } catch(e) {
@@ -4352,32 +4276,19 @@ async function sendDailyEHSDigest() {
     const count = parseInt(pending[0].count);
     const oldestDays = parseInt(pending[0].oldest_days) || 0;
     if (count === 0) return;
+    // Only email when something has actually been waiting (more than 0 days).
+    if (oldestDays <= 0) return;
 
     await resend.emails.send({
-      from: 'ESAT <esat@egypro.app>',
+      from: 'OneHub <esat@egypro.app>',
       to: 'e.maged@outlook.com',
-      subject: `ESAT Daily EHS — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
-          <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
-            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="110" height="50" style="height:50px; width:110px; display:block; margin:0 auto;" />
-          </td></tr></table>
-          <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
-            <p style="font-size: 15px; color: #374151;">Hello John,</p>
-            <p style="font-size: 15px; color: #374151;">
-              We have <strong style="color: #0f2a4a;">${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong>
-              that require a purchase request. The oldest item has been waiting for
-              <strong style="color: ${oldestDays > 0 ? '#e53e3e' : '#374151'};">${oldestDays} day${oldestDays !== 1 ? 's' : ''}</strong>.
-            </p>
-            <p style="font-size: 15px; color: #374151;">Please check the ESAT system to clear the pending list.</p>
-            <a href="https://esat.egypro.app"
-              style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">
-              Open ESAT
-            </a>
-            <p style="font-size: 14px; color: #374151; margin-top: 24px;">Thanks,<br/>Maged Ezzat</p>
-          </div>
-        </div>
-      `
+      subject: `OneHub Daily EHS — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
+      html: mailWrap(`
+          <p>Hello John,</p>
+          <p>We have <strong>${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong> that require a purchase request. The oldest item has been waiting for ${redDays(oldestDays)}.</p>
+          <p>Please check the OneHub system to clear the pending list.</p>
+          ${MAIL_SIGNOFF}
+        `)
     });
     console.log('EHS digest sent — ' + count + ' pending items');
   } catch(e) {
@@ -4401,52 +4312,49 @@ async function sendDailyEmployeeChangesDigest() {
     if (rows.length === 0) return; // nothing changed yesterday — no email
 
     const actionTag = (a) => a === 'exit'
-      ? '<span style="background:#fde8e8;color:#c0392b;font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px;">EXIT</span>'
+      ? '<span style="background:#fde8e8;color:#c0392b;font-size:9pt;font-weight:700;padding:2px 8px;border-radius:10px;">EXIT</span>'
       : a === 'reactivate'
-      ? '<span style="background:#e6f4ea;color:#1d9e75;font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px;">REACTIVATE</span>'
-      : '<span style="background:#eef2ff;color:#3730a3;font-size:11px;font-weight:700;padding:2px 8px;border-radius:10px;">UPDATE</span>';
+      ? '<span style="background:#e6f4ea;color:#1d9e75;font-size:9pt;font-weight:700;padding:2px 8px;border-radius:10px;">REACTIVATE</span>'
+      : a === 'add'
+      ? '<span style="background:#e6f4ea;color:#1d9e75;font-size:9pt;font-weight:700;padding:2px 8px;border-radius:10px;">ONBOARDED</span>'
+      : '<span style="background:#eef2ff;color:#3730a3;font-size:9pt;font-weight:700;padding:2px 8px;border-radius:10px;">UPDATE</span>';
 
     let tableRows = '';
     rows.forEach(r => {
-      const when = new Date(r.changed_at).toLocaleString('en-GB', { timeZone: 'Africa/Nairobi', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false });
-      const diffs = (r.changes || []).map(c =>
-        `<div style="margin:1px 0;"><b>${escapeHtml(c.field)}:</b> <span style="color:#9ca3af;text-decoration:line-through;">${escapeHtml(String(c.before ?? '—'))}</span> &rarr; <span style="color:#0f2a4a;font-weight:600;">${escapeHtml(String(c.after ?? '—'))}</span></div>`
+      const when = new Date(r.changed_at).toLocaleDateString('en-GB', { timeZone: 'Africa/Nairobi', day: '2-digit', month: 'short' });
+      // For an onboard (add) there is no before→after — just show the onboarding details (Project/Client).
+      const diffs = (r.changes || []).map(c => r.action === 'add'
+        ? `<div style="margin:1px 0;"><b>${escapeHtml(c.field)}:</b> <span style="color:#0f2a4a;font-weight:600;">${escapeHtml(String(c.after ?? '—'))}</span></div>`
+        : `<div style="margin:1px 0;"><b>${escapeHtml(c.field)}:</b> <span style="color:#9ca3af;text-decoration:line-through;">${escapeHtml(String(c.before ?? '—'))}</span> &rarr; <span style="color:#0f2a4a;font-weight:600;">${escapeHtml(String(c.after ?? '—'))}</span></div>`
       ).join('');
       tableRows += `
         <tr style="border-bottom:1px solid #e5e7eb;">
-          <td style="padding:8px 12px;font-size:12px;vertical-align:top;">
+          <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">
             <div style="font-weight:600;color:#111;">${escapeHtml(r.employee_name || '—')}</div>
-            <div style="color:#9ca3af;font-size:11px;">${escapeHtml(r.national_id || r.employee_number || '')}</div>
+            <div style="color:#9ca3af;font-size:9pt;">${escapeHtml(r.national_id || r.employee_number || '')}</div>
           </td>
-          <td style="padding:8px 12px;font-size:12px;vertical-align:top;">${actionTag(r.action)}<div style="margin-top:4px;">${diffs}</div>${r.reason ? `<div style="color:#6b7280;font-style:italic;margin-top:4px;">"${escapeHtml(r.reason)}"</div>` : ''}</td>
-          <td style="padding:8px 12px;font-size:12px;vertical-align:top;white-space:nowrap;">${escapeHtml(r.changed_by_name || '—')}<div style="color:#9ca3af;font-size:11px;">${when}</div></td>
+          <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">${actionTag(r.action)}<div style="margin-top:4px;">${diffs}</div>${r.reason ? `<div style="color:#6b7280;font-style:italic;margin-top:4px;">"${escapeHtml(r.reason)}"</div>` : ''}</td>
+          <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;white-space:nowrap;">${escapeHtml(r.changed_by_name || '—')}<div style="color:#9ca3af;font-size:9pt;">${when}</div></td>
         </tr>`;
     });
 
     await resend.emails.send({
-      from: 'ESAT <esat@egypro.app>',
+      from: 'OneHub <esat@egypro.app>',
       to: 'e.maged@outlook.com',
-      subject: `ESAT Daily — ${rows.length} employee record change${rows.length > 1 ? 's' : ''} yesterday`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 640px; margin: 0 auto; padding: 24px;">
-          <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
-            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="110" height="50" style="height:50px; width:110px; display:block; margin:0 auto;" />
-          </td></tr></table>
-          <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
-            <p style="margin:0 0 16px;font-size:15px;color:#111;">Hello Maged,</p>
-            <p style="margin:0 0 20px;font-size:14px;color:#374151;">Employee records changed yesterday: <strong>${rows.length} change${rows.length > 1 ? 's' : ''}</strong>.</p>
-            <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;background:white;">
-              <tr style="background:#f3f4f6;">
-                <th align="left" style="padding:8px 12px;font-size:11px;color:#6b7280;text-transform:uppercase;">Employee</th>
-                <th align="left" style="padding:8px 12px;font-size:11px;color:#6b7280;text-transform:uppercase;">What changed</th>
-                <th align="left" style="padding:8px 12px;font-size:11px;color:#6b7280;text-transform:uppercase;">By / When</th>
-              </tr>
-              ${tableRows}
-            </table>
-            <p style="margin:20px 0 0;font-size:12px;color:#9ca3af;">Full history is on the Change History page in ESAT.</p>
-          </div>
-        </div>
-      `
+      subject: `OneHub Daily HR Updates — ${rows.length} Change${rows.length > 1 ? 's' : ''}`,
+      html: mailWrap(`
+          <p>Hello Maged,</p>
+          <p>Employee records changed yesterday: <strong>${rows.length} change${rows.length > 1 ? 's' : ''}</strong>.</p>
+          <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;background:white;margin:8px 0 12px;font-family:${FONT};">
+            <tr style="background:#f3f4f6;">
+              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Employee</th>
+              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">What changed</th>
+              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">By / When</th>
+            </tr>
+            ${tableRows}
+          </table>
+          ${MAIL_SIGNOFF}
+        `)
     });
     console.log('Employee changes digest sent — ' + rows.length + ' changes');
   } catch(e) {
@@ -4468,35 +4376,24 @@ function scheduleAt(utcHour, utcMin, label, fn) {
 async function sendDailyOverdueDigest() {
   try {
     const { rows } = await pool.query(`
-      SELECT
-        e.client,
-        e.project,
-        COUNT(*) as overdue_count,
-        MAX(COALESCE(CURRENT_DATE - a.audit_date::date, 9999)) as max_days,
-        (SELECT e2.full_name FROM employees e2
-          LEFT JOIN audits a2 ON a2.employee_id = e2.id
-          WHERE e2.project = e.project AND e2.client = e.client
-            AND e2.employment_status = 'active' AND e2.san = true
-          GROUP BY e2.id, e2.full_name
-          ORDER BY MAX(COALESCE(CURRENT_DATE - a2.audit_date::date, 9999)) DESC
-          LIMIT 1) as oldest_employee,
-        (SELECT MAX(COALESCE(CURRENT_DATE - a2.audit_date::date, 9999))
-          FROM employees e2
-          LEFT JOIN audits a2 ON a2.employee_id = e2.id
-          WHERE e2.project = e.project AND e2.client = e.client
-            AND e2.employment_status = 'active' AND e2.san = true
-          GROUP BY e2.id
-          ORDER BY 1 DESC
-          LIMIT 1) as oldest_days
-      FROM employees e
-      LEFT JOIN (
-        SELECT DISTINCT ON (employee_id) employee_id, audit_date
-        FROM audits WHERE employee_present = TRUE ORDER BY employee_id, audit_date DESC
-      ) a ON a.employee_id = e.id
-      WHERE e.employment_status = 'active' AND e.san = true
-        AND COALESCE(CURRENT_DATE - a.audit_date::date, 9999) > 30
-      GROUP BY e.client, e.project
-      ORDER BY e.client, e.project
+      SELECT client, project, total, overdue_count, audited_30
+      FROM (
+        SELECT
+          e.client,
+          e.project,
+          COUNT(*) AS total,
+          COUNT(*) FILTER (WHERE COALESCE(CURRENT_DATE - a.audit_date::date, 9999) > 30) AS overdue_count,
+          COUNT(*) FILTER (WHERE COALESCE(CURRENT_DATE - a.audit_date::date, 9999) <= 30) AS audited_30
+        FROM employees e
+        LEFT JOIN (
+          SELECT DISTINCT ON (employee_id) employee_id, audit_date
+          FROM audits WHERE employee_present = TRUE ORDER BY employee_id, audit_date DESC
+        ) a ON a.employee_id = e.id
+        WHERE e.employment_status = 'active' AND e.san = true
+        GROUP BY e.client, e.project
+      ) sub
+      WHERE overdue_count > 0
+      ORDER BY client, project
     `);
 
     if (rows.length === 0) return;
@@ -4513,42 +4410,38 @@ async function sendDailyOverdueDigest() {
 
     let tableRows = '';
     Object.entries(byClient).forEach(([client, projects]) => {
-      tableRows += `<tr><td colspan="3" style="background:#0f2a4a;color:white;font-weight:700;font-size:13px;padding:8px 12px;">${escapeHtml(client)}</td></tr>`;
+      tableRows += `<tr><td colspan="3" style="background:#0f2a4a;color:white;font-weight:700;font-family:${FONT};font-size:11pt;padding:8px 12px;">${escapeHtml(client)}</td></tr>`;
       projects.forEach(r => {
-        const days = parseInt(r.oldest_days) || 0;
-        const daysColor = days > 60 ? '#e53e3e' : days > 30 ? '#e65100' : '#1d9e75';
+        const total = parseInt(r.total) || 0;
+        const rate = total > 0 ? Math.round((parseInt(r.audited_30) || 0) / total * 100) : 0;
+        const rateColor = rate >= 80 ? '#1d9e75' : rate >= 50 ? '#e65100' : '#e53e3e';
         tableRows += `
           <tr style="border-bottom:1px solid #e5e7eb;">
-            <td style="padding:8px 12px;font-size:13px;padding-left:24px;">${escapeHtml(r.project) || '—'}</td>
-            <td style="padding:8px 12px;font-size:13px;text-align:center;font-weight:700;color:#0f2a4a;">${r.overdue_count}</td>
-            <td style="padding:8px 12px;font-size:12px;">${escapeHtml(r.oldest_employee) || '—'} <span style="color:${daysColor};font-weight:700;">(${days}d)</span></td>
+            <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;padding-left:24px;">${escapeHtml(r.project) || '—'}</td>
+            <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;text-align:center;font-weight:700;color:#0f2a4a;">${r.overdue_count}</td>
+            <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;text-align:center;font-weight:700;color:${rateColor};">${rate}%</td>
           </tr>`;
       });
     });
 
     await resend.emails.send({
-      from: 'ESAT <esat@egypro.app>',
+      from: 'OneHub <esat@egypro.app>',
       to: 'e.maged@outlook.com',
-      subject: `ESAT Daily — ${totalOverdue} Overdue Audit${totalOverdue > 1 ? 's' : ''} Across Projects`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
-          <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
-            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="110" height="50" style="height:50px; width:110px; display:block; margin:0 auto;" />
-          </td></tr></table>
-          <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
-            <p style="margin:0 0 16px;font-size:15px;color:#111;">Hello Maged,</p>
-            <p style="margin:0 0 20px;font-size:14px;color:#374151;">Here is today's overdue audit summary. <strong>${totalOverdue} employee${totalOverdue > 1 ? 's are' : ' is'}</strong> overdue for a PPE/Tool audit (>30 days).</p>
-            <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;background:white;">
-              <tr style="background:#f3f4f6;">
-                <th style="padding:8px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;">PROJECT</th>
-                <th style="padding:8px 12px;text-align:center;font-size:12px;color:#6b7280;font-weight:600;">OVERDUE</th>
-                <th style="padding:8px 12px;text-align:left;font-size:12px;color:#6b7280;font-weight:600;">OLDEST DUE</th>
-              </tr>
-              ${tableRows}
-            </table>
-            <p style="margin:24px 0 0;font-size:13px;color:#6b7280;">Thanks, Maged Ezzat</p>
-          </div>
-        </div>`
+      subject: `OneHub Daily Audit — ${totalOverdue} Overdue Audit${totalOverdue > 1 ? 's' : ''} Across Projects`,
+      html: mailWrap(`
+          <p>Hello Maged,</p>
+          <p>Here is today's overdue audit summary. <strong>${totalOverdue} employee${totalOverdue > 1 ? 's are' : ' is'}</strong> overdue for a PPE/Tool audit (more than 30 days).</p>
+          <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;background:white;margin:8px 0 12px;font-family:${FONT};">
+            <tr style="background:#f3f4f6;">
+              <th style="padding:8px 12px;text-align:left;font-family:${FONT};font-size:10pt;color:#6b7280;font-weight:600;">PROJECT</th>
+              <th style="padding:8px 12px;text-align:center;font-family:${FONT};font-size:10pt;color:#6b7280;font-weight:600;">OVERDUE</th>
+              <th style="padding:8px 12px;text-align:center;font-family:${FONT};font-size:10pt;color:#6b7280;font-weight:600;">AUDIT RATE</th>
+            </tr>
+            ${tableRows}
+          </table>
+          <p style="font-size:9pt;color:#9ca3af;">Audit Rate = share of SAN employees audited in the last 30 days.</p>
+          ${MAIL_SIGNOFF}
+        `)
     });
     console.log('Overdue digest sent — ' + totalOverdue + ' overdue');
   } catch(e) { console.error('Overdue digest error:', e.message); }
@@ -4606,31 +4499,17 @@ app.post('/api/admin/test-ehs-digest', auth, async (req, res) => {
     const count = parseInt(pending[0].count);
     const oldestDays = parseInt(pending[0].oldest_days) || 0;
     if (count === 0) return res.json({ success: true, count, message: 'No pending items, email not sent' });
+    if (oldestDays <= 0) return res.json({ success: true, count, oldestDays, message: 'Nothing waiting more than 0 days, email not sent' });
     await resend.emails.send({
-      from: 'ESAT <esat@egypro.app>',
+      from: 'OneHub <esat@egypro.app>',
       to: 'e.maged@outlook.com',
-      subject: `ESAT Daily EHS — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
-          <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px;">
-            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="110" height="50" style="height:50px; width:110px; display:block; margin:0 auto;" />
-          </td></tr></table>
-          <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
-            <p style="font-size: 15px; color: #374151;">Hello John,</p>
-            <p style="font-size: 15px; color: #374151;">
-              We have <strong style="color: #0f2a4a;">${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong>
-              that require a purchase request. The oldest item has been waiting for
-              <strong style="color: ${oldestDays > 0 ? '#e53e3e' : '#374151'};">${oldestDays} day${oldestDays !== 1 ? 's' : ''}</strong>.
-            </p>
-            <p style="font-size: 15px; color: #374151;">Please check the ESAT system to clear the pending list.</p>
-            <a href="https://esat.egypro.app"
-              style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">
-              Open ESAT
-            </a>
-            <p style="font-size: 14px; color: #374151; margin-top: 24px;">Thanks,<br/>Maged Ezzat</p>
-          </div>
-        </div>
-      `
+      subject: `OneHub Daily EHS — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
+      html: mailWrap(`
+          <p>Hello John,</p>
+          <p>We have <strong>${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong> that require a purchase request. The oldest item has been waiting for ${redDays(oldestDays)}.</p>
+          <p>Please check the OneHub system to clear the pending list.</p>
+          ${MAIL_SIGNOFF}
+        `)
     });
     res.json({ success: true, count, oldestDays });
   } catch(e) { sendError(res, e); }
@@ -4652,36 +4531,20 @@ app.post('/api/admin/test-scm-digest', auth, async (req, res) => {
     const orderedCount = parseInt(ordered[0].count);
     const orderedOldestDays = parseInt(ordered[0].oldest_days) || 0;
     if (count === 0 && orderedCount === 0) return res.json({ success: true, count, orderedCount, message: 'No pending items, email not sent' });
+    if (oldestDays <= 0 && orderedOldestDays <= 0) return res.json({ success: true, count, orderedCount, message: 'Nothing waiting more than 0 days, email not sent' });
     await resend.emails.send({
-      from: 'ESAT <esat@egypro.app>',
+      from: 'OneHub <esat@egypro.app>',
       to: 'e.maged@outlook.com',
-      subject: `ESAT Daily SCM — ${count + orderedCount} Pending PPE/Tool Item${(count + orderedCount) > 1 ? 's' : ''} Awaiting Action`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px;">
-          <table width="100%" cellpadding="0" cellspacing="0" style="border-radius: 8px 8px 0 0; border-bottom: 2px solid #0f2a4a;"><tr><td bgcolor="#ffffff" align="center" style="padding: 16px 24px; background-color: #ffffff !important;">
-            <img src="https://esat.egypro.app/esat-login-logo.png" alt="ESAT" width="110" height="50" style="height:50px; width:110px; display:block; margin:0 auto;" />
-          </td></tr></table>
-          <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
-            <p style="font-size: 15px; color: #374151;">Hello Supply Chain Team,</p>
-            ${count > 0 ? `<p style="font-size: 15px; color: #374151;">
-              We have <strong style="color: #0f2a4a;">${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong>
-              to be ordered or to confirm availability. The oldest item has been waiting for
-              <strong style="color: ${oldestDays > 0 ? '#e53e3e' : '#374151'};">${oldestDays} day${oldestDays !== 1 ? 's' : ''}</strong>.
-            </p>` : ''}
-            ${orderedCount > 0 ? `<p style="font-size: 15px; color: #374151;">
-              And our Suppliers have <strong style="color: #0f2a4a;">${orderedCount} pending PPE/Tool item${orderedCount > 1 ? 's' : ''}</strong>
-              to be delivered to our warehouse. The oldest item has been waiting for
-              <strong style="color: ${orderedOldestDays > 0 ? '#e53e3e' : '#374151'};">${orderedOldestDays} day${orderedOldestDays !== 1 ? 's' : ''}</strong>.
-            </p>` : ''}
-            <p style="font-size: 15px; color: #374151;">Please check the ESAT system to clear the pending list.</p>
-            <a href="https://esat.egypro.app" 
-              style="display: inline-block; background: #1D9E75; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 8px;">
-              Open ESAT
-            </a>
-            <p style="font-size: 14px; color: #374151; margin-top: 24px;">Thanks,<br/>Maged Ezzat</p>
-          </div>
-        </div>
-      `
+      subject: `OneHub Daily SCM — ${count + orderedCount} Pending PPE/Tool Item${(count + orderedCount) > 1 ? 's' : ''} Awaiting Action`,
+      html: mailWrap(`
+          <p>Hello Supply Chain Team,</p>
+          <ul>
+            ${count > 0 ? `<li>We have <strong>${count} pending PPE/Tool item${count > 1 ? 's' : ''}</strong> to be ordered or to confirm availability. The oldest item has been waiting for ${redDays(oldestDays)}.</li>` : ''}
+            ${orderedCount > 0 ? `<li>And our Suppliers have <strong>${orderedCount} pending PPE/Tool item${orderedCount > 1 ? 's' : ''}</strong> to be delivered to our warehouse. The oldest item has been waiting for ${redDays(orderedOldestDays)}.</li>` : ''}
+          </ul>
+          <p>Please check the OneHub system to clear the pending list.</p>
+          ${MAIL_SIGNOFF}
+        `)
     });
     res.json({ success: true, count, oldestDays, orderedCount, orderedOldestDays });
   } catch(e) { sendError(res, e); }
@@ -5084,6 +4947,13 @@ app.post('/api/employees/manual', auth, (req, res) => {
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$11) RETURNING *`,
           [empNo, full_name.trim(), national_id.trim(), job_title.trim(), department.trim(), project.trim(), client.trim(), organization.trim(), resource_type, req.user.id, key]
         );
+        // Record the onboarding in the employee history so it shows in the daily HR digest.
+        const emp = rows[0];
+        await pool.query(
+          `INSERT INTO employee_change_log (employee_id, employee_name, national_id, employee_number, action, reason, changes, changed_by, changed_by_name)
+           VALUES ($1,$2,$3,$4,'add',NULL,$5::jsonb,$6,$7)`,
+          [emp.id, emp.full_name, emp.national_id, emp.employee_number, JSON.stringify([{ field: 'Project', after: emp.project }, { field: 'Client', after: emp.client }]), req.user.id, req.user.name || null]
+        ).catch(e2 => console.error('onboard change-log error:', e2.message));
         broadcastEmployeesChanged();
         res.status(201).json(rows[0]);
       } catch (e) {

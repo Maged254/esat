@@ -2965,7 +2965,7 @@ app.get('/api/training-courses', auth, async (req, res) => {
       const { rows } = await pool.query(
         `SELECT ${cols} FROM training_courses
           WHERE is_active = TRUE
-            AND id = ANY( (SELECT COALESCE(training_course_access,'{}') FROM users WHERE id = $1) )
+            AND id IN (SELECT unnest(COALESCE(training_course_access, '{}'::uuid[])) FROM users WHERE id = $1)
           ORDER BY sort_order ASC, name ASC`, [req.user.id]);
       return res.json(rows);
     }

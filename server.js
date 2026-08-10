@@ -987,7 +987,7 @@ function outsourceScopeClause(req, params) {
 
 // Employees
 app.get('/api/employees', auth, async (req, res) => {
-  if (!['admin','ehs_manager','ehs_officer','supervisor','fleet'].includes(req.user.role)) {
+  if (!['admin','hr','ehs_manager','ehs_officer','supervisor','fleet'].includes(req.user.role)) {
     return res.status(403).json({ error: 'Not authorized' });
   }
   try {
@@ -1055,7 +1055,7 @@ app.get('/api/employees', auth, async (req, res) => {
 // History's pattern since these cards already reflected active filters
 // before pagination (unlike PPE Tracker's global counts).
 app.get('/api/employees/stats', auth, async (req, res) => {
-  if (!['admin','ehs_manager','ehs_officer','supervisor','fleet'].includes(req.user.role)) {
+  if (!['admin','hr','ehs_manager','ehs_officer','supervisor','fleet'].includes(req.user.role)) {
     return res.status(403).json({ error: 'Not authorized' });
   }
   try {
@@ -1139,7 +1139,7 @@ async function nationalIdConflict(nationalId, { excludeEmployeeId = null, exclud
 }
 
 app.get('/api/employees/filter-options', auth, async (req, res) => {
-  if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) {
+  if (!['admin','hr','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) {
     return res.status(403).json({ error: 'Not authorized' });
   }
   try {

@@ -4701,14 +4701,23 @@ const upload = multer({
     else cb(new Error('Only PDF and image files (JPEG, PNG, HEIC) are allowed'));
   }
 });
-// Training certificates are small scans/PDFs -- cap at 1MB (separate from the
+// Training certificates are small scans/PDFs -- cap at 2MB (separate from the
 // 10MB audit-document uploader).
 const certUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 2 * 1024 * 1024 }, // 2MB
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === 'application/pdf') cb(null, true);
+    else cb(new Error('Certificate must be a PDF.'));
+  }
+});
+// National ID documents keep the original 1MB cap.
+const idUpload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 1 * 1024 * 1024 }, // 1MB
   fileFilter: (req, file, cb) => {
     if (file.mimetype === 'application/pdf') cb(null, true);
-    else cb(new Error('Certificate must be a PDF.'));
+    else cb(new Error('Document must be a PDF.'));
   }
 });
 // Strips anything but alphanumerics/hyphen/underscore so user-controlled values
@@ -4906,7 +4915,7 @@ const loadTrainingRecordForCert = (id) => pool.query(
 
 app.post('/api/training-records/:id/certificate', auth, (req, res) => {
   certUpload.single('file')(req, res, async (err) => {
-    if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'Certificate must be 1MB or smaller.' : (err.message || 'Upload rejected') });
+    if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'Certificate must be 2MB or smaller.' : (err.message || 'Upload rejected') });
     if (!TRAINING_UPDATE_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized to update training records' });
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     if (!R2_CONFIGURED) return res.status(503).json({ error: 'Certificate storage is not configured yet.' });
@@ -5035,7 +5044,7 @@ app.delete('/api/training-records/:id/certificate', auth, async (req, res) => {
 // Separate from POST /employees (which stays JSON for CSV import) because this one
 // is multipart and must live after the R2 client is defined.
 app.post('/api/employees/manual', auth, (req, res) => {
-  certUpload.single('national_id_doc')(req, res, async (err) => {
+  idUpload.single('national_id_doc')(req, res, async (err) => {
     if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'National ID file must be 1MB or smaller.' : (err.message || 'Upload rejected') });
     if (!R2_CONFIGURED) return res.status(503).json({ error: 'Document storage is not configured yet.' });
     if (!req.file) return res.status(400).json({ error: 'National ID document (PDF) is required' });

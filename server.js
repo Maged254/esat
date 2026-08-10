@@ -4343,8 +4343,8 @@ async function sendDailyEmployeeChangesDigest() {
       to: 'e.maged@outlook.com',
       subject: `OneHub Daily HR Updates — ${rows.length} Change${rows.length > 1 ? 's' : ''}`,
       html: mailWrap(`
-          <p>Hello Maged,</p>
-          <p>Employee records changed yesterday: <strong>${rows.length} change${rows.length > 1 ? 's' : ''}</strong>.</p>
+          <p>Hello Team,</p>
+          <p>Please find below our in-house employee records that have been changed yesterday: <strong>${rows.length} change${rows.length > 1 ? 's' : ''}</strong>.</p>
           <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;background:white;margin:8px 0 12px;font-family:${FONT};">
             <tr style="background:#f3f4f6;">
               <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Employee</th>
@@ -4409,7 +4409,11 @@ async function sendDailyOverdueDigest() {
     });
 
     let tableRows = '';
-    Object.entries(byClient).forEach(([client, projects]) => {
+    // Fixed client display order; any others fall after, alphabetically.
+    const CLIENT_ORDER = ['Safaricom', 'Huawei', 'Zuku', 'ATC', 'Airtel', 'Multiple'];
+    const clientRank = (c) => { const i = CLIENT_ORDER.indexOf(c); return i === -1 ? CLIENT_ORDER.length : i; };
+    Object.keys(byClient).sort((a, b) => clientRank(a) - clientRank(b) || a.localeCompare(b)).forEach(client => {
+      const projects = byClient[client];
       tableRows += `<tr><td colspan="3" style="background:#0f2a4a;color:white;font-weight:700;font-family:${FONT};font-size:11pt;padding:8px 12px;">${escapeHtml(client)}</td></tr>`;
       projects.forEach(r => {
         const total = parseInt(r.total) || 0;
@@ -4429,8 +4433,8 @@ async function sendDailyOverdueDigest() {
       to: 'e.maged@outlook.com',
       subject: `OneHub Daily Audit — ${totalOverdue} Overdue Audit${totalOverdue > 1 ? 's' : ''} Across Projects`,
       html: mailWrap(`
-          <p>Hello Maged,</p>
-          <p>Here is today's overdue audit summary. <strong>${totalOverdue} employee${totalOverdue > 1 ? 's are' : ' is'}</strong> overdue for a PPE/Tool audit (more than 30 days).</p>
+          <p>Hello John,</p>
+          <p>Here is today's overdue audit summary. <strong>${totalOverdue} employee${totalOverdue > 1 ? 's are' : ' is'}</strong> overdue for audit (more than 30 days).</p>
           <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;background:white;margin:8px 0 12px;font-family:${FONT};">
             <tr style="background:#f3f4f6;">
               <th style="padding:8px 12px;text-align:left;font-family:${FONT};font-size:10pt;color:#6b7280;font-weight:600;">PROJECT</th>

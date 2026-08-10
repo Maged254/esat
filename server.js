@@ -3637,10 +3637,11 @@ app.get('/api/training-records/dashboard', auth, async (req, res) => {
     const where = built.where;
     const VALID = `${CURRENT_CERT_SQL} AND (t.expiry_date IS NULL OR t.expiry_date > CURRENT_DATE + ${EXPIRY_SOON_DAYS})`;
     const EXPIRING = `${CURRENT_CERT_SQL} AND t.expiry_date >= CURRENT_DATE AND t.expiry_date <= CURRENT_DATE + ${EXPIRY_SOON_DAYS}`;
-    // "Pending" on the dashboard includes not-eligible: ETMS records "Employee is
-    // not Eligible" as a pending reason, so it counts under Pending here (the
-    // record keeps its distinct not_eligible status; this only affects the count).
-    const PENDING = `t.status IN ('pending','not_eligible')`;
+    // "Pending" on the dashboard = the whole Outstanding group (matches the
+    // Trainings Tracker's "Pending" card): requested + scheduled + pending +
+    // not_eligible. Records keep their distinct status; this only affects counts
+    // and the pending-reason breakdown below.
+    const PENDING = `t.status IN ('requested','scheduled','pending','not_eligible')`;
     const from = `FROM training_records t JOIN training_courses c ON c.id=t.course_id LEFT JOIN employees e ON e.id=t.employee_id`;
     const buckets = `
       COUNT(*) FILTER (WHERE ${VALID})::int AS valid,
@@ -3654,7 +3655,7 @@ app.get('/api/training-records/dashboard', auth, async (req, res) => {
       pool.query(`SELECT COUNT(*)::int AS all_records,
         COUNT(*) FILTER (WHERE t.status IN ('requested','scheduled','pending'))::int AS requested,
         ${buckets} ${from} ${where}`, params),
-      pool.query(`SELECT COALESCE(NULLIF(TRIM(t.pending_reason),''), NULLIF(TRIM(t.not_eligible_reason),''), '(no reason)') AS reason, COUNT(*)::int AS count
+      pool.query(`SELECT COALESCE(NULLIF(TRIM(t.pending_reason),''), NULLIF(TRIM(t.not_eligible_reason),''), INITCAP(REPLACE(t.status,'_',' '))) AS reason, COUNT(*)::int AS count
         ${from} ${where} AND ${PENDING} GROUP BY 1 ORDER BY count DESC`, params),
       pool.query(`SELECT c.name AS course, ${buckets}
         ${from} ${where} GROUP BY c.name HAVING ${grpOrder} > 0 ORDER BY ${grpOrder} DESC`, params),

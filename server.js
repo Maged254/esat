@@ -11,6 +11,24 @@ app.set('trust proxy', true); // so req.ip reflects the real client IP behind Re
 app.use(compression());
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: "10mb" }));
+// Trim leading/trailing whitespace on every JSON string input (names, national
+// IDs, project/client, organization/company names, training names, ...) so stray
+// spaces from copy-paste can't create duplicates or lookup mismatches. Password
+// fields are left untouched (a stored password could contain intentional spaces).
+const SKIP_TRIM_KEYS = new Set(['password', 'currentPassword', 'newPassword', 'confirmPassword', 'current_password', 'new_password', 'confirm_password']);
+const deepTrim = (val, key) => {
+  if (typeof val === 'string') {
+    if (SKIP_TRIM_KEYS.has(key)) return val;
+    const t = val.trim();
+    // National IDs are numeric — strip any stray non-digits (spaces, quotes,
+    // Excel apostrophes) so "1231232'" and "1231232 " normalise to "1231232".
+    return key === 'national_id' ? t.replace(/[^0-9]/g, '') : t;
+  }
+  if (Array.isArray(val)) return val.map(v => deepTrim(v));
+  if (val && typeof val === 'object') { for (const k of Object.keys(val)) val[k] = deepTrim(val[k], k); return val; }
+  return val;
+};
+app.use((req, _res, next) => { if (req.body && typeof req.body === 'object') deepTrim(req.body); next(); });
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL.split('?')[0],
@@ -218,6 +236,14 @@ async function setupDB() {
     await client.query('CREATE INDEX IF NOT EXISTS idx_casuals_client ON casuals(client)');
     await client.query('CREATE INDEX IF NOT EXISTS idx_casuals_national_id ON casuals(national_id)');
     await client.query('CREATE INDEX IF NOT EXISTS idx_casuals_employment_status ON casuals(employment_status)');
+    // Uniqueness backstops (normalised): no two casuals may share a national ID
+    // (digits only) or a full name (case/space-insensitive). Wrapped so a boot
+    // never crashes if legacy duplicates still exist -- it self-heals on the next
+    // boot once they are removed. New adds are already blocked at the app layer.
+    try { await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_casuals_national_id ON casuals (regexp_replace(national_id, '[^0-9]', '', 'g'))`); }
+    catch (e) { console.warn('casuals national_id unique index deferred (duplicates present?):', e.message); }
+    try { await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_casuals_full_name ON casuals (LOWER(TRIM(full_name)))`); }
+    catch (e) { console.warn('casuals full_name unique index deferred (duplicates present?):', e.message); }
 
     // Ensure distribution columns exist on ppe_requests
     await client.query('ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS distribution_method VARCHAR(50)');
@@ -1636,10 +1662,12 @@ app.post('/api/casuals/batch', auth, async (req, res) => {
 
     // One lookup for the whole batch instead of one SELECT per casual.
     const nationalIds = casuals.map(c => c.national_id).filter(Boolean);
-    const { rows: existingRows } = nationalIds.length
-      ? await client_db.query('SELECT * FROM casuals WHERE national_id = ANY($1::text[])', [nationalIds])
+    const namesLower = casuals.map(c => (c.full_name || '').toLowerCase()).filter(Boolean);
+    const { rows: existingRows } = (nationalIds.length || namesLower.length)
+      ? await client_db.query('SELECT * FROM casuals WHERE national_id = ANY($1::text[]) OR LOWER(full_name) = ANY($2::text[])', [nationalIds, namesLower])
       : { rows: [] };
     const existingByNationalId = new Map(existingRows.map(r => [r.national_id, r]));
+    const existingByName = new Map(existingRows.map(r => [(r.full_name || '').toLowerCase(), r]));
 
     for (const c of casuals) {
       if (!c.full_name || !c.national_id) {
@@ -1664,9 +1692,16 @@ app.post('/api/casuals/batch', auth, async (req, res) => {
             [c.full_name, project, client, organization || 'Egypro', req.user.id, match.id]
           );
           existingByNationalId.set(c.national_id, rows[0]); // catch duplicate national_ids within this same batch
+          existingByName.set((c.full_name || '').toLowerCase(), rows[0]);
           reactivated.push(rows[0]);
           continue;
         }
+      }
+      // Full name must be unique too (a different national ID with the same name = a duplicate person).
+      const nameMatch = existingByName.get((c.full_name || '').toLowerCase());
+      if (nameMatch) {
+        skipped.push({ full_name: c.full_name, reason: `Full name "${c.full_name}" already exists as another casual (National ID ${nameMatch.national_id})` });
+        continue;
       }
       const { rows } = await client_db.query(
         `INSERT INTO casuals (full_name, national_id, job_title, project, client, organization, created_by, last_edited_by)
@@ -1674,6 +1709,7 @@ app.post('/api/casuals/batch', auth, async (req, res) => {
         [c.full_name, c.national_id, project, client, organization || 'Egypro', req.user.id]
       );
       existingByNationalId.set(c.national_id, rows[0]); // catch duplicate national_ids within this same batch
+      existingByName.set((c.full_name || '').toLowerCase(), rows[0]);
       inserted.push(rows[0]);
     }
     await client_db.query('COMMIT');

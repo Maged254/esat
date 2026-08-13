@@ -3557,7 +3557,7 @@ app.get('/api/training-records/tracker', auth, async (req, res) => {
       LEFT JOIN users u ON u.id = t.requested_by
       LEFT JOIN users ru ON ru.id = t.recorded_by
       ${built.where}
-      ORDER BY t.requested_at DESC
+      ORDER BY t.requested_at DESC, t.id
       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
     params.push(limit, offset);
     const { rows } = await pool.query(q, params);

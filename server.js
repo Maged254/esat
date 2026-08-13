@@ -4339,11 +4339,14 @@ async function sendDailyEHSDigest() {
 async function sendDailyEmployeeChangesDigest() {
   try {
     const { rows } = await pool.query(`
-      SELECT employee_name, national_id, employee_number, action, reason, changes, changed_by_name, changed_at
-      FROM employee_change_log
-      WHERE changed_at >= (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi')) - INTERVAL '1 day') AT TIME ZONE 'Africa/Nairobi'
-        AND changed_at <  (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi'))) AT TIME ZONE 'Africa/Nairobi'
-      ORDER BY changed_at
+      SELECT l.employee_name, l.national_id, l.employee_number, l.action, l.reason, l.changes, l.changed_by_name, l.changed_at,
+             e.organization AS current_org, e.project AS current_project, e.client AS current_client
+      FROM employee_change_log l
+      JOIN employees e ON e.id = l.employee_id
+      WHERE l.changed_at >= (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi')) - INTERVAL '1 day') AT TIME ZONE 'Africa/Nairobi'
+        AND l.changed_at <  (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi'))) AT TIME ZONE 'Africa/Nairobi'
+        AND LOWER(TRIM(e.organization)) = 'egypro'  -- in-house only; outsource digest comes later
+      ORDER BY l.changed_at
     `);
     if (rows.length === 0) return; // nothing changed yesterday — no email
 
@@ -4355,9 +4358,16 @@ async function sendDailyEmployeeChangesDigest() {
       ? '<span style="background:#e6f4ea;color:#1d9e75;font-size:9pt;font-weight:700;padding:2px 8px;border-radius:10px;">ONBOARDED</span>'
       : '<span style="background:#eef2ff;color:#3730a3;font-size:9pt;font-weight:700;padding:2px 8px;border-radius:10px;">UPDATE</span>';
 
+    // Prefer the current value on the employee record (which already reflects a change
+    // that was applied yesterday); fall back to the change's "after" value for rows whose
+    // employee was since deleted (employee_id → NULL, so the join yields nothing).
+    const changeAfter = (r, field) => { const c = (r.changes || []).find(x => x.field === field); return c ? (c.after ?? null) : null; };
     let tableRows = '';
     rows.forEach(r => {
       const when = new Date(r.changed_at).toLocaleDateString('en-GB', { timeZone: 'Africa/Nairobi', day: '2-digit', month: 'short' });
+      const org  = r.current_org     || changeAfter(r, 'Organization') || '—';
+      const proj = r.current_project || changeAfter(r, 'Project')      || '—';
+      const cli  = r.current_client  || changeAfter(r, 'Client')       || '—';
       // For an onboard (add) there is no before→after — just show the onboarding details (Project/Client).
       const diffs = (r.changes || []).map(c => r.action === 'add'
         ? `<div style="margin:1px 0;"><b>${escapeHtml(c.field)}:</b> <span style="color:#0f2a4a;font-weight:600;">${escapeHtml(String(c.after ?? '—'))}</span></div>`
@@ -4369,7 +4379,12 @@ async function sendDailyEmployeeChangesDigest() {
             <div style="font-weight:600;color:#111;">${escapeHtml(r.employee_name || '—')}</div>
             <div style="color:#9ca3af;font-size:9pt;">${escapeHtml(r.national_id || r.employee_number || '')}</div>
           </td>
-          <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">${actionTag(r.action)}<div style="margin-top:4px;">${diffs}</div>${r.reason ? `<div style="color:#6b7280;font-style:italic;margin-top:4px;">"${escapeHtml(r.reason)}"</div>` : ''}</td>
+          <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">${escapeHtml(org)}</td>
+          <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">
+            <div style="font-weight:600;color:#111;">${escapeHtml(proj)}</div>
+            <div style="color:#9ca3af;font-size:9pt;">${escapeHtml(cli)}</div>
+          </td>
+          <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">${actionTag(r.action)}<div style="margin-top:4px;">${diffs}</div></td>
           <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;white-space:nowrap;">${escapeHtml(r.changed_by_name || '—')}<div style="color:#9ca3af;font-size:9pt;">${when}</div></td>
         </tr>`;
     });
@@ -4377,13 +4392,15 @@ async function sendDailyEmployeeChangesDigest() {
     await resend.emails.send({
       from: 'OneHub <esat@egypro.app>',
       to: 'e.maged@outlook.com',
-      subject: `OneHub Daily HR Updates — ${rows.length} Change${rows.length > 1 ? 's' : ''}`,
+      subject: `OneHub Daily HR In-house Updates — ${rows.length} Change${rows.length > 1 ? 's' : ''}`,
       html: mailWrap(`
           <p>Hello Team,</p>
           <p>Please find below our in-house employee records that have been changed yesterday: <strong>${rows.length} change${rows.length > 1 ? 's' : ''}</strong>.</p>
           <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;background:white;margin:8px 0 12px;font-family:${FONT};">
             <tr style="background:#f3f4f6;">
               <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Employee</th>
+              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Organization</th>
+              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Current Project / Client</th>
               <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">What changed</th>
               <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">By / When</th>
             </tr>
@@ -4406,6 +4423,19 @@ function scheduleAt(utcHour, utcMin, label, fn) {
   const ms = next - now;
   console.log(label + ' scheduled in ' + Math.floor(ms/3600000) + 'h ' + Math.floor((ms%3600000)/60000) + 'm');
   setTimeout(() => { fn(); setInterval(fn, 24*60*60*1000); }, ms);
+}
+
+// Fire once at the next occurrence of the given UTC weekday+time (0=Sun..6=Sat), then weekly.
+function scheduleWeekly(utcDay, utcHour, utcMin, label, fn) {
+  const now = new Date();
+  const next = new Date();
+  next.setUTCHours(utcHour, utcMin, 0, 0);
+  let addDays = (utcDay - next.getUTCDay() + 7) % 7;
+  if (addDays === 0 && next <= now) addDays = 7;
+  next.setUTCDate(next.getUTCDate() + addDays);
+  const ms = next - now;
+  console.log(label + ' scheduled in ' + Math.floor(ms/86400000) + 'd ' + Math.floor((ms%86400000)/3600000) + 'h ' + Math.floor((ms%3600000)/60000) + 'm');
+  setTimeout(() => { fn(); setInterval(fn, 7*24*60*60*1000); }, ms);
 }
 
 
@@ -4467,10 +4497,10 @@ async function sendDailyOverdueDigest() {
     await resend.emails.send({
       from: 'OneHub <esat@egypro.app>',
       to: 'e.maged@outlook.com',
-      subject: `OneHub Daily Audit — ${totalOverdue} Overdue Audit${totalOverdue > 1 ? 's' : ''} Across Projects`,
+      subject: `OneHub Weekly Audit — ${totalOverdue} Overdue Audit${totalOverdue > 1 ? 's' : ''} Across Projects`,
       html: mailWrap(`
           <p>Hello John,</p>
-          <p>Here is today's overdue audit summary. <strong>${totalOverdue} employee${totalOverdue > 1 ? 's are' : ' is'}</strong> overdue for audit (more than 30 days).</p>
+          <p>Here is this week's overdue audit summary. <strong>${totalOverdue} employee${totalOverdue > 1 ? 's are' : ' is'}</strong> overdue for audit (more than 30 days).</p>
           <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;background:white;margin:8px 0 12px;font-family:${FONT};">
             <tr style="background:#f3f4f6;">
               <th style="padding:8px 12px;text-align:left;font-family:${FONT};font-size:10pt;color:#6b7280;font-weight:600;">PROJECT</th>
@@ -4500,7 +4530,7 @@ function scheduleDailyDigest() {
   scheduleAt(5, 40, 'PM digest', sendDailyPMDigest);        // 8:40am EAT
   scheduleAt(5, 45, 'EHS digest', sendDailyEHSDigest);      // 8:45am EAT
   scheduleAt(6,  0, 'SCM digest', sendDailySCMDigest);      // 9:00am EAT
-  scheduleAt(13, 0, 'Overdue digest', sendDailyOverdueDigest); // 4:00pm EAT
+  scheduleWeekly(1, 6, 15, 'Overdue digest', sendDailyOverdueDigest); // Mondays 9:15am EAT
   scheduleAt(5, 15, 'Employee changes digest', sendDailyEmployeeChangesDigest); // 8:15am EAT
   scheduleAt(2,  0, 'Log prune', pruneOldRequestLogs);      // 5:00am EAT
 }

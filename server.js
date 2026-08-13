@@ -4612,6 +4612,82 @@ async function sendDailyNewCertificatesDigest() {
   }
 }
 
+// Daily digest of PPE/Tool items distributed to a person by courier yesterday
+// (status 'distributed', distribution_method 'courier', date_distributed in
+// yesterday's Africa/Nairobi window). Covers employees and casuals; none → no email.
+async function sendDailyCourierDistributionDigest() {
+  try {
+    const { rows } = await pool.query(`
+      SELECT COALESCE(e.full_name, c.full_name)     AS person_name,
+             COALESCE(e.national_id, c.national_id) AS national_id,
+             e.employee_number,
+             pi.name                                AS item_name,
+             pr.size_value,
+             COALESCE(e.project, c.project)         AS project,
+             COALESCE(e.client,  c.client)          AS client,
+             pr.courier_tracking_number,
+             u.full_name                            AS distributed_by_name,
+             to_char((pr.date_distributed AT TIME ZONE 'Africa/Nairobi'), 'DD Mon, HH24:MI') AS distributed_label,
+             to_char((pr.date_distributed AT TIME ZONE 'Africa/Nairobi'), 'DD/MM/YYYY')       AS date_label
+      FROM ppe_requests pr
+      JOIN ppe_items pi ON pi.id = pr.ppe_item_id
+      LEFT JOIN employees e ON e.id = pr.employee_id
+      LEFT JOIN casuals   c ON c.id = pr.casual_id
+      LEFT JOIN users     u ON u.id = pr.distributed_by
+      WHERE pr.status = 'distributed' AND pr.distribution_method = 'courier'
+        AND pr.date_distributed >= (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi')) - INTERVAL '1 day') AT TIME ZONE 'Africa/Nairobi'
+        AND pr.date_distributed <  (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi'))) AT TIME ZONE 'Africa/Nairobi'
+      ORDER BY person_name, pi.name
+    `);
+    if (rows.length === 0) return; // nothing distributed by courier yesterday — no email
+
+    const N = rows.length;
+    const dateLabel = rows[0].date_label;
+    const tableRows = rows.map(r => `
+      <tr style="border-bottom:1px solid #e5e7eb;">
+        <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">
+          <div style="font-weight:600;color:#111;">${escapeHtml(r.person_name || '—')}</div>
+          <div style="color:#9ca3af;font-size:9pt;">${escapeHtml(r.national_id || r.employee_number || '')}</div>
+        </td>
+        <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">
+          <div style="font-weight:600;color:#111;">${escapeHtml(r.item_name || '—')}</div>
+          ${r.size_value ? `<div style="color:#9ca3af;font-size:9pt;">Size: ${escapeHtml(r.size_value)}</div>` : ''}
+        </td>
+        <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">
+          <div style="font-weight:600;color:#111;">${escapeHtml(r.project || '—')}</div>
+          <div style="color:#9ca3af;font-size:9pt;">${escapeHtml(r.client || '—')}</div>
+        </td>
+        <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">${escapeHtml(r.courier_tracking_number || '—')}</td>
+        <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;white-space:nowrap;">${escapeHtml(r.distributed_by_name || '—')}<div style="color:#9ca3af;font-size:9pt;">${escapeHtml(r.distributed_label || '')}</div></td>
+      </tr>`).join('');
+
+    await resend.emails.send({
+      from: 'OneHub <esat@egypro.app>',
+      to: 'e.maged@outlook.com',
+      subject: `OneHub Daily Courier Distributions — ${N} Item${N > 1 ? 's' : ''}`,
+      html: mailWrap(`
+          <p>Hello Team,</p>
+          <p>Outlined below <strong>${N}</strong> PPE/Tool item${N > 1 ? 's' : ''} ${N > 1 ? 'were' : 'was'} distributed to employees by courier on ${dateLabel}:</p>
+          <p style="background:#fff8e1;border-left:4px solid #e65100;padding:10px 14px;margin:8px 0;">Please communicate the same to your teams to make sure they have confirmed receipt of these items. In case there is any issue receiving them, please escalate to our Supply Chain department.</p>
+          <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;background:white;margin:8px 0 12px;font-family:${FONT};">
+            <tr style="background:#f3f4f6;">
+              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Employee</th>
+              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Item</th>
+              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Project / Client</th>
+              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Courier Tracking #</th>
+              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Distributed By</th>
+            </tr>
+            ${tableRows}
+          </table>
+          ${MAIL_SIGNOFF}
+        `)
+    });
+    console.log('Courier distributions digest sent — ' + N + ' items');
+  } catch(e) {
+    console.error('Courier distributions digest error:', e.message);
+  }
+}
+
 // Hourly digest of casual add/reactivate events from the previous clock hour. Groups by
 // action + project/client + who did it; no events in that hour → no email.
 async function sendHourlyCasualDigest() {
@@ -4772,6 +4848,7 @@ function scheduleDailyDigest() {
   scheduleAt(5, 20, 'Fleet drivers changes digest', sendDailyFleetDriverChangesDigest); // 8:20am EAT
   scheduleAt(5, 25, 'Outsourced services changes digest', sendDailyOutsourceServicesChangesDigest); // 8:25am EAT
   scheduleAt(5, 30, 'New certificates digest', sendDailyNewCertificatesDigest); // 8:30am EAT
+  scheduleAt(6, 10, 'Courier distributions digest', sendDailyCourierDistributionDigest); // 9:10am EAT
   scheduleHourly('Casual updates digest', sendHourlyCasualDigest); // top of every hour
   scheduleAt(2,  0, 'Log prune', pruneOldRequestLogs);      // 5:00am EAT
 }

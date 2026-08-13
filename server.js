@@ -4531,6 +4531,87 @@ async function sendDailyOutsourceServicesChangesDigest() {
   }
 }
 
+// Daily digest of training certificates recorded yesterday (status flipped to
+// 'completed' with recorded_at in yesterday's Africa/Nairobi window). Covers both
+// employees and casuals; no records → no email.
+async function sendDailyNewCertificatesDigest() {
+  try {
+    const { rows } = await pool.query(`
+      SELECT COALESCE(e.full_name, c2.full_name)              AS person_name,
+             COALESCE(e.national_id, c2.national_id)          AS national_id,
+             e.employee_number,
+             co.name                                          AS course_name,
+             t.partnership,
+             to_char(t.completed_at, 'DD Mon YYYY')           AS completed_label,
+             CASE WHEN co.no_expiry THEN NULL
+                  WHEN t.expiry_date IS NULL THEN NULL
+                  ELSE to_char(t.expiry_date, 'DD Mon YYYY') END AS expiry_label,
+             co.no_expiry,
+             COALESCE(t.project_at_completion, e.project, c2.project) AS project,
+             COALESCE(t.client_at_completion,  e.client,  c2.client) AS client,
+             u.full_name                                      AS recorded_by_name,
+             to_char((t.recorded_at AT TIME ZONE 'Africa/Nairobi'), 'DD/MM/YYYY') AS recorded_label
+      FROM training_records t
+      JOIN training_courses co ON co.id = t.course_id
+      LEFT JOIN employees e ON e.id = t.employee_id
+      LEFT JOIN casuals   c2 ON c2.id = t.casual_id
+      LEFT JOIN users     u ON u.id = t.recorded_by
+      WHERE t.status = 'completed' AND t.is_deleted IS NOT TRUE
+        AND t.recorded_at >= (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi')) - INTERVAL '1 day') AT TIME ZONE 'Africa/Nairobi'
+        AND t.recorded_at <  (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi'))) AT TIME ZONE 'Africa/Nairobi'
+      ORDER BY co.name, person_name
+    `);
+    if (rows.length === 0) return; // nothing recorded yesterday — no email
+
+    const N = rows.length;
+    const recordedLabel = rows[0].recorded_label;
+    const tableRows = rows.map(r => `
+      <tr style="border-bottom:1px solid #e5e7eb;">
+        <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">
+          <div style="font-weight:600;color:#111;">${escapeHtml(r.person_name || '—')}</div>
+          <div style="color:#9ca3af;font-size:9pt;">${escapeHtml(r.national_id || r.employee_number || '')}</div>
+        </td>
+        <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">
+          <div style="font-weight:600;color:#111;">${escapeHtml(r.course_name || '—')}</div>
+          ${r.partnership ? `<div style="color:#9ca3af;font-size:9pt;">${escapeHtml(r.partnership)}</div>` : ''}
+        </td>
+        <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;white-space:nowrap;">
+          <div style="color:#111;">${escapeHtml(r.completed_label || '—')}</div>
+          <div style="color:#9ca3af;font-size:9pt;">${r.no_expiry ? 'No expiry' : (r.expiry_label ? 'Expires ' + escapeHtml(r.expiry_label) : '—')}</div>
+        </td>
+        <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">
+          <div style="font-weight:600;color:#111;">${escapeHtml(r.project || '—')}</div>
+          <div style="color:#9ca3af;font-size:9pt;">${escapeHtml(r.client || '—')}</div>
+        </td>
+        <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">${escapeHtml(r.recorded_by_name || '—')}</td>
+      </tr>`).join('');
+
+    await resend.emails.send({
+      from: 'OneHub <esat@egypro.app>',
+      to: 'e.maged@outlook.com',
+      subject: `OneHub Daily New Certificates — ${N} Recorded`,
+      html: mailWrap(`
+          <p>Hello Egypro Team,</p>
+          <p>Outlined below <strong>${N}</strong> new Acquired Certificate${N > 1 ? 's' : ''} ${N > 1 ? 'were' : 'was'} recorded on ${recordedLabel}:</p>
+          <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;background:white;margin:8px 0 12px;font-family:${FONT};">
+            <tr style="background:#f3f4f6;">
+              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Employee</th>
+              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Certificate</th>
+              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Completed / Expiry</th>
+              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Project / Client</th>
+              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Recorded By</th>
+            </tr>
+            ${tableRows}
+          </table>
+          ${MAIL_SIGNOFF}
+        `)
+    });
+    console.log('New certificates digest sent — ' + N + ' recorded');
+  } catch(e) {
+    console.error('New certificates digest error:', e.message);
+  }
+}
+
 // Hourly digest of casual add/reactivate events from the previous clock hour. Groups by
 // action + project/client + who did it; no events in that hour → no email.
 async function sendHourlyCasualDigest() {
@@ -4690,6 +4771,7 @@ function scheduleDailyDigest() {
   scheduleAt(5, 15, 'Employee changes digest', sendDailyEmployeeChangesDigest); // 8:15am EAT
   scheduleAt(5, 20, 'Fleet drivers changes digest', sendDailyFleetDriverChangesDigest); // 8:20am EAT
   scheduleAt(5, 25, 'Outsourced services changes digest', sendDailyOutsourceServicesChangesDigest); // 8:25am EAT
+  scheduleAt(5, 30, 'New certificates digest', sendDailyNewCertificatesDigest); // 8:30am EAT
   scheduleHourly('Casual updates digest', sendHourlyCasualDigest); // top of every hour
   scheduleAt(2,  0, 'Log prune', pruneOldRequestLogs);      // 5:00am EAT
 }

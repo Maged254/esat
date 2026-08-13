@@ -4381,6 +4381,66 @@ async function sendDailyEHSDigest() {
 // "What changed yesterday" — emailed each morning. Reads the append-only
 // employee_change_log for the previous calendar day (Africa/Nairobi) so early-
 // morning edits from yesterday aren't missed by a naive last-24h window.
+// Shared body for the employee-change digests (in-house + outsourced fleet drivers).
+// `intro` is the sentence shown after "Hello Team,"; `rows` are change_log rows joined
+// to the employee's current org/project/client. Layout is identical across both digests.
+function renderEmployeeChangesEmail(intro, rows) {
+  const actionTag = (a) => a === 'exit'
+    ? '<span style="background:#fde8e8;color:#c0392b;font-size:9pt;font-weight:700;padding:2px 8px;border-radius:10px;">EXIT</span>'
+    : a === 'reactivate'
+    ? '<span style="background:#e6f4ea;color:#1d9e75;font-size:9pt;font-weight:700;padding:2px 8px;border-radius:10px;">REACTIVATE</span>'
+    : a === 'add'
+    ? '<span style="background:#e6f4ea;color:#1d9e75;font-size:9pt;font-weight:700;padding:2px 8px;border-radius:10px;">ONBOARDED</span>'
+    : '<span style="background:#eef2ff;color:#3730a3;font-size:9pt;font-weight:700;padding:2px 8px;border-radius:10px;">UPDATE</span>';
+
+  // Prefer the current value on the employee record (which already reflects a change
+  // that was applied yesterday); fall back to the change's "after" value for rows whose
+  // employee was since deleted (employee_id → NULL, so the join yields nothing).
+  const changeAfter = (r, field) => { const c = (r.changes || []).find(x => x.field === field); return c ? (c.after ?? null) : null; };
+  let tableRows = '';
+  rows.forEach(r => {
+    const when = new Date(r.changed_at).toLocaleDateString('en-GB', { timeZone: 'Africa/Nairobi', day: '2-digit', month: 'short' });
+    const org  = r.current_org     || changeAfter(r, 'Organization') || '—';
+    const proj = r.current_project || changeAfter(r, 'Project')      || '—';
+    const cli  = r.current_client  || changeAfter(r, 'Client')       || '—';
+    // For an onboard (add) there is no before→after — just show the onboarding details (Project/Client).
+    const diffs = (r.changes || []).map(c => r.action === 'add'
+      ? `<div style="margin:1px 0;"><b>${escapeHtml(c.field)}:</b> <span style="color:#0f2a4a;font-weight:600;">${escapeHtml(String(c.after ?? '—'))}</span></div>`
+      : `<div style="margin:1px 0;"><b>${escapeHtml(c.field)}:</b> <span style="color:#9ca3af;text-decoration:line-through;">${escapeHtml(String(c.before ?? '—'))}</span> &rarr; <span style="color:#0f2a4a;font-weight:600;">${escapeHtml(String(c.after ?? '—'))}</span></div>`
+    ).join('');
+    tableRows += `
+      <tr style="border-bottom:1px solid #e5e7eb;">
+        <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">
+          <div style="font-weight:600;color:#111;">${escapeHtml(r.employee_name || '—')}</div>
+          <div style="color:#9ca3af;font-size:9pt;">${escapeHtml(r.national_id || r.employee_number || '')}</div>
+        </td>
+        <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">${escapeHtml(org)}</td>
+        <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">
+          <div style="font-weight:600;color:#111;">${escapeHtml(proj)}</div>
+          <div style="color:#9ca3af;font-size:9pt;">${escapeHtml(cli)}</div>
+        </td>
+        <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">${actionTag(r.action)}<div style="margin-top:4px;">${diffs}</div></td>
+        <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;white-space:nowrap;">${escapeHtml(r.changed_by_name || '—')}<div style="color:#9ca3af;font-size:9pt;">${when}</div></td>
+      </tr>`;
+  });
+
+  return mailWrap(`
+      <p>Hello Team,</p>
+      ${intro}
+      <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;background:white;margin:8px 0 12px;font-family:${FONT};">
+        <tr style="background:#f3f4f6;">
+          <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Employee</th>
+          <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Organization</th>
+          <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Current Project / Client</th>
+          <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">What changed</th>
+          <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">By / When</th>
+        </tr>
+        ${tableRows}
+      </table>
+      ${MAIL_SIGNOFF}
+  `);
+}
+
 async function sendDailyEmployeeChangesDigest() {
   try {
     const { rows } = await pool.query(`
@@ -4390,73 +4450,84 @@ async function sendDailyEmployeeChangesDigest() {
       JOIN employees e ON e.id = l.employee_id
       WHERE l.changed_at >= (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi')) - INTERVAL '1 day') AT TIME ZONE 'Africa/Nairobi'
         AND l.changed_at <  (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi'))) AT TIME ZONE 'Africa/Nairobi'
-        AND LOWER(TRIM(e.organization)) = 'egypro'  -- in-house only; outsource digest comes later
+        AND LOWER(TRIM(e.organization)) = 'egypro'  -- in-house only
       ORDER BY l.changed_at
     `);
     if (rows.length === 0) return; // nothing changed yesterday — no email
-
-    const actionTag = (a) => a === 'exit'
-      ? '<span style="background:#fde8e8;color:#c0392b;font-size:9pt;font-weight:700;padding:2px 8px;border-radius:10px;">EXIT</span>'
-      : a === 'reactivate'
-      ? '<span style="background:#e6f4ea;color:#1d9e75;font-size:9pt;font-weight:700;padding:2px 8px;border-radius:10px;">REACTIVATE</span>'
-      : a === 'add'
-      ? '<span style="background:#e6f4ea;color:#1d9e75;font-size:9pt;font-weight:700;padding:2px 8px;border-radius:10px;">ONBOARDED</span>'
-      : '<span style="background:#eef2ff;color:#3730a3;font-size:9pt;font-weight:700;padding:2px 8px;border-radius:10px;">UPDATE</span>';
-
-    // Prefer the current value on the employee record (which already reflects a change
-    // that was applied yesterday); fall back to the change's "after" value for rows whose
-    // employee was since deleted (employee_id → NULL, so the join yields nothing).
-    const changeAfter = (r, field) => { const c = (r.changes || []).find(x => x.field === field); return c ? (c.after ?? null) : null; };
-    let tableRows = '';
-    rows.forEach(r => {
-      const when = new Date(r.changed_at).toLocaleDateString('en-GB', { timeZone: 'Africa/Nairobi', day: '2-digit', month: 'short' });
-      const org  = r.current_org     || changeAfter(r, 'Organization') || '—';
-      const proj = r.current_project || changeAfter(r, 'Project')      || '—';
-      const cli  = r.current_client  || changeAfter(r, 'Client')       || '—';
-      // For an onboard (add) there is no before→after — just show the onboarding details (Project/Client).
-      const diffs = (r.changes || []).map(c => r.action === 'add'
-        ? `<div style="margin:1px 0;"><b>${escapeHtml(c.field)}:</b> <span style="color:#0f2a4a;font-weight:600;">${escapeHtml(String(c.after ?? '—'))}</span></div>`
-        : `<div style="margin:1px 0;"><b>${escapeHtml(c.field)}:</b> <span style="color:#9ca3af;text-decoration:line-through;">${escapeHtml(String(c.before ?? '—'))}</span> &rarr; <span style="color:#0f2a4a;font-weight:600;">${escapeHtml(String(c.after ?? '—'))}</span></div>`
-      ).join('');
-      tableRows += `
-        <tr style="border-bottom:1px solid #e5e7eb;">
-          <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">
-            <div style="font-weight:600;color:#111;">${escapeHtml(r.employee_name || '—')}</div>
-            <div style="color:#9ca3af;font-size:9pt;">${escapeHtml(r.national_id || r.employee_number || '')}</div>
-          </td>
-          <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">${escapeHtml(org)}</td>
-          <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">
-            <div style="font-weight:600;color:#111;">${escapeHtml(proj)}</div>
-            <div style="color:#9ca3af;font-size:9pt;">${escapeHtml(cli)}</div>
-          </td>
-          <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">${actionTag(r.action)}<div style="margin-top:4px;">${diffs}</div></td>
-          <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;white-space:nowrap;">${escapeHtml(r.changed_by_name || '—')}<div style="color:#9ca3af;font-size:9pt;">${when}</div></td>
-        </tr>`;
-    });
 
     await resend.emails.send({
       from: 'OneHub <esat@egypro.app>',
       to: 'e.maged@outlook.com',
       subject: `OneHub Daily HR In-house Updates — ${rows.length} Change${rows.length > 1 ? 's' : ''}`,
-      html: mailWrap(`
-          <p>Hello Team,</p>
-          <p>Please find below our in-house employee records that have been changed yesterday: <strong>${rows.length} change${rows.length > 1 ? 's' : ''}</strong>.</p>
-          <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;background:white;margin:8px 0 12px;font-family:${FONT};">
-            <tr style="background:#f3f4f6;">
-              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Employee</th>
-              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Organization</th>
-              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Current Project / Client</th>
-              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">What changed</th>
-              <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">By / When</th>
-            </tr>
-            ${tableRows}
-          </table>
-          ${MAIL_SIGNOFF}
-        `)
+      html: renderEmployeeChangesEmail(
+        `<p>Please find below our in-house employee records that have been changed yesterday: <strong>${rows.length} change${rows.length > 1 ? 's' : ''}</strong>.</p>`,
+        rows)
     });
     console.log('Employee changes digest sent — ' + rows.length + ' changes');
   } catch(e) {
     console.error('Employee changes digest error:', e.message);
+  }
+}
+
+// Same as the in-house digest, but for outsourced fleet drivers — employees whose
+// organization is an outsource entity of type 'vehicle_supplier'.
+async function sendDailyFleetDriverChangesDigest() {
+  try {
+    const { rows } = await pool.query(`
+      SELECT l.employee_name, l.national_id, l.employee_number, l.action, l.reason, l.changes, l.changed_by_name, l.changed_at,
+             e.organization AS current_org, e.project AS current_project, e.client AS current_client
+      FROM employee_change_log l
+      JOIN employees e ON e.id = l.employee_id
+      JOIN outsource_entities oe ON LOWER(TRIM(oe.name)) = LOWER(TRIM(e.organization))
+      WHERE l.changed_at >= (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi')) - INTERVAL '1 day') AT TIME ZONE 'Africa/Nairobi'
+        AND l.changed_at <  (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi'))) AT TIME ZONE 'Africa/Nairobi'
+        AND oe.type = 'vehicle_supplier'
+      ORDER BY l.changed_at
+    `);
+    if (rows.length === 0) return; // nothing changed yesterday — no email
+
+    await resend.emails.send({
+      from: 'OneHub <esat@egypro.app>',
+      to: 'e.maged@outlook.com',
+      subject: `OneHub Daily Fleet Drivers Updates — ${rows.length} Change${rows.length > 1 ? 's' : ''}`,
+      html: renderEmployeeChangesEmail(
+        `<p>Please find below our outsourced fleet drivers records that have been changed yesterday: <strong>${rows.length} change${rows.length > 1 ? 's' : ''}</strong>.</p>`,
+        rows)
+    });
+    console.log('Fleet drivers changes digest sent — ' + rows.length + ' changes');
+  } catch(e) {
+    console.error('Fleet drivers changes digest error:', e.message);
+  }
+}
+
+// Same again, but for outsourced services — organizations that are outsource entities
+// of type 'services'.
+async function sendDailyOutsourceServicesChangesDigest() {
+  try {
+    const { rows } = await pool.query(`
+      SELECT l.employee_name, l.national_id, l.employee_number, l.action, l.reason, l.changes, l.changed_by_name, l.changed_at,
+             e.organization AS current_org, e.project AS current_project, e.client AS current_client
+      FROM employee_change_log l
+      JOIN employees e ON e.id = l.employee_id
+      JOIN outsource_entities oe ON LOWER(TRIM(oe.name)) = LOWER(TRIM(e.organization))
+      WHERE l.changed_at >= (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi')) - INTERVAL '1 day') AT TIME ZONE 'Africa/Nairobi'
+        AND l.changed_at <  (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi'))) AT TIME ZONE 'Africa/Nairobi'
+        AND oe.type = 'services'
+      ORDER BY l.changed_at
+    `);
+    if (rows.length === 0) return; // nothing changed yesterday — no email
+
+    await resend.emails.send({
+      from: 'OneHub <esat@egypro.app>',
+      to: 'e.maged@outlook.com',
+      subject: `OneHub Daily Outsourced Services Updates — ${rows.length} Change${rows.length > 1 ? 's' : ''}`,
+      html: renderEmployeeChangesEmail(
+        `<p>Please find below our outsourced services records that have been changed yesterday: <strong>${rows.length} change${rows.length > 1 ? 's' : ''}</strong>.</p>`,
+        rows)
+    });
+    console.log('Outsourced services changes digest sent — ' + rows.length + ' changes');
+  } catch(e) {
+    console.error('Outsourced services changes digest error:', e.message);
   }
 }
 
@@ -4617,6 +4688,8 @@ function scheduleDailyDigest() {
   scheduleAt(6,  0, 'SCM digest', sendDailySCMDigest);      // 9:00am EAT
   scheduleWeekly(1, 6, 15, 'Overdue digest', sendDailyOverdueDigest); // Mondays 9:15am EAT
   scheduleAt(5, 15, 'Employee changes digest', sendDailyEmployeeChangesDigest); // 8:15am EAT
+  scheduleAt(5, 20, 'Fleet drivers changes digest', sendDailyFleetDriverChangesDigest); // 8:20am EAT
+  scheduleAt(5, 25, 'Outsourced services changes digest', sendDailyOutsourceServicesChangesDigest); // 8:25am EAT
   scheduleHourly('Casual updates digest', sendHourlyCasualDigest); // top of every hour
   scheduleAt(2,  0, 'Log prune', pruneOldRequestLogs);      // 5:00am EAT
 }

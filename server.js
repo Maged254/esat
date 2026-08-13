@@ -353,6 +353,19 @@ async function setupDB() {
       )`);
     await client.query("CREATE INDEX IF NOT EXISTS idx_employee_change_log_changed_at ON employee_change_log(changed_at)");
     await client.query("CREATE INDEX IF NOT EXISTS idx_employee_change_log_employee ON employee_change_log(employee_id)");
+    // Append-only log of casual add/reactivate events; feeds the hourly Casual Resources Updates digest.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS casual_events (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        casual_id UUID REFERENCES casuals(id) ON DELETE SET NULL,
+        action VARCHAR(20) NOT NULL,
+        project VARCHAR(150),
+        client VARCHAR(150),
+        actor_id UUID REFERENCES users(id),
+        actor_name VARCHAR(150),
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )`);
+    await client.query("CREATE INDEX IF NOT EXISTS idx_casual_events_created_at ON casual_events(created_at)");
     await client.query("ALTER TABLE ncr_items ALTER COLUMN status TYPE VARCHAR(50)");
     await client.query("ALTER TABLE ppe_requests ALTER COLUMN status TYPE VARCHAR(50)");
     await client.query("UPDATE employees SET san = TRUE WHERE san IS NULL");
@@ -1646,6 +1659,24 @@ app.get('/api/casuals', auth, async (req, res) => {
   } catch(e) { sendError(res, e); }
 });
 
+// Append one casual_events row per casual, inside the caller's transaction, so the
+// event log is atomic with the add/reactivate. `actor` is { id, name }.
+async function logCasualEvents(db, action, casualRows, actor) {
+  if (!casualRows || !casualRows.length) return;
+  await db.query(
+    `INSERT INTO casual_events (casual_id, action, project, client, actor_id, actor_name)
+     SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::text[], $4::text[], $5::uuid[], $6::text[])`,
+    [
+      casualRows.map(c => c.id),
+      casualRows.map(() => action),
+      casualRows.map(c => c.project || null),
+      casualRows.map(c => c.client || null),
+      casualRows.map(() => actor.id),
+      casualRows.map(() => actor.name),
+    ]
+  );
+}
+
 // Batch add casuals (admin, supervisor only)
 app.post('/api/casuals/batch', auth, async (req, res) => {
   if (!CASUAL_EDIT_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
@@ -1712,20 +1743,11 @@ app.post('/api/casuals/batch', auth, async (req, res) => {
       existingByName.set((c.full_name || '').toLowerCase(), rows[0]);
       inserted.push(rows[0]);
     }
+    // Log events (new inserts, and re-adds of exited casuals) for the hourly digest.
+    const actor = { id: req.user.id, name: req.user.name || req.user.email };
+    await logCasualEvents(client_db, 'added', inserted, actor);
+    await logCasualEvents(client_db, 'reactivated', reactivated, actor);
     await client_db.query('COMMIT');
-    const totalAdded = inserted.length + reactivated.length;
-    if (totalAdded > 0) {
-      resend.emails.send({
-        from: 'OneHub <esat@egypro.app>',
-        to: 'e.maged@outlook.com',
-        subject: `OneHub — ${totalAdded} Casual${totalAdded > 1 ? 's' : ''} Added`,
-        html: mailWrap(`
-          <p>Hi,</p>
-          <p>${totalAdded} casual${totalAdded > 1 ? 's were' : ' was'} added by ${escapeHtml(req.user.name || req.user.email)} — Project: ${escapeHtml(project)}, Client: ${escapeHtml(client)}.</p>
-          ${MAIL_SIGNOFF}
-        `)
-      }).catch(e => console.error('Casuals batch email error:', e.message));
-    }
     res.json({ inserted, reactivated, skipped });
   } catch(e) { await client_db.query('ROLLBACK'); sendError(res, e); }
   finally { client_db.release(); }
@@ -1761,25 +1783,8 @@ app.post('/api/casuals/reactivate', auth, async (req, res) => {
       );
       reactivated.push(rows[0]);
     }
+    await logCasualEvents(client_db, 'reactivated', reactivated, { id: req.user.id, name: req.user.name || req.user.email });
     await client_db.query('COMMIT');
-
-    const n = reactivated.length;
-    if (n > 0) {
-      const projects = [...new Set(reactivated.map(c => c.project).filter(Boolean))];
-      const clients = [...new Set(reactivated.map(c => c.client).filter(Boolean))];
-      const projectLabel = projects.length ? projects.join(', ') : '—';
-      const clientLabel = clients.length ? clients.join(', ') : '—';
-      resend.emails.send({
-        from: 'OneHub <esat@egypro.app>',
-        to: 'e.maged@outlook.com',
-        subject: `OneHub — ${n} Casual${n > 1 ? 's' : ''} Reactivated`,
-        html: mailWrap(`
-          <p>Hi,</p>
-          <p>${n} casual${n > 1 ? 's were' : ' was'} reactivated by ${escapeHtml(req.user.name || req.user.email)} — Project: ${escapeHtml(projectLabel)}, Client: ${escapeHtml(clientLabel)}.</p>
-          ${MAIL_SIGNOFF}
-        `)
-      }).catch(e => console.error('Casuals reactivate email error:', e.message));
-    }
     res.json({ reactivated, skipped });
   } catch(e) { await client_db.query('ROLLBACK'); sendError(res, e); }
   finally { client_db.release(); }
@@ -4115,6 +4120,46 @@ const MAIL_SIGNOFF = `<p style="margin-top: 16px;">Thanks,<br/>Maged Ezzat</p>`;
 // "N days" with the number in red when it's been waiting (> 0 days), as before.
 const redDays = (n) => `<span style="color:${n > 0 ? '#e53e3e' : 'inherit'};font-weight:600">${n} day${n !== 1 ? 's' : ''}</span>`;
 
+// Unified "Casual Resources Updates" email — one table row per (action, project, client, actor)
+// group. Shared by the casual batch-add and reactivate endpoints. `groups` is an array of
+// { action: 'added' | 'reactivated', project, client, count, by }.
+const CASUAL_ACTION_TAG = {
+  added:       `<span style="background:#e6f4ea;color:#1d9e75;font-size:9pt;font-weight:700;padding:2px 8px;border-radius:10px;">ADDED</span>`,
+  reactivated: `<span style="background:#eef2ff;color:#3730a3;font-size:9pt;font-weight:700;padding:2px 8px;border-radius:10px;">REACTIVATED</span>`,
+};
+function renderCasualUpdateTable(groups) {
+  const rank = { added: 0, reactivated: 1 };
+  const sorted = [...groups].sort((a, b) =>
+    (rank[a.action] - rank[b.action]) || String(a.project || '').localeCompare(String(b.project || '')));
+  const rows = sorted.map(g => `
+    <tr style="border-bottom:1px solid #e5e7eb;">
+      <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">${CASUAL_ACTION_TAG[g.action] || escapeHtml(g.action)}</td>
+      <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">
+        <div style="font-weight:600;color:#111;">${escapeHtml(g.project || '—')}</div>
+        <div style="color:#9ca3af;font-size:9pt;">${escapeHtml(g.client || '—')}</div>
+      </td>
+      <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;text-align:center;font-weight:700;color:#0f2a4a;vertical-align:top;">${g.count}</td>
+      <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">
+        ${escapeHtml(g.by || '—')}
+        <div style="color:#9ca3af;font-size:9pt;">${escapeHtml(g.date || '')}</div>
+      </td>
+    </tr>`).join('');
+  return mailWrap(`
+      <p>Hello Team,</p>
+      <p>Please find below casual resources records updates:</p>
+      <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;background:white;margin:8px 0 12px;font-family:${FONT};">
+        <tr style="background:#f3f4f6;">
+          <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Action</th>
+          <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Project / Client</th>
+          <th align="center" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">Count</th>
+          <th align="left" style="padding:8px 12px;font-family:${FONT};font-size:10pt;color:#6b7280;text-transform:uppercase;">By</th>
+        </tr>
+        ${rows}
+      </table>
+      ${MAIL_SIGNOFF}
+  `);
+}
+
 async function sendDailySCMDigest() {
   try {
     const { rows: pending } = await pool.query(`
@@ -4415,6 +4460,35 @@ async function sendDailyEmployeeChangesDigest() {
   }
 }
 
+// Hourly digest of casual add/reactivate events from the previous clock hour. Groups by
+// action + project/client + who did it; no events in that hour → no email.
+async function sendHourlyCasualDigest() {
+  try {
+    const { rows } = await pool.query(`
+      SELECT action, project, client, actor_name,
+             COUNT(*)::int AS count,
+             to_char(MAX(created_at) AT TIME ZONE 'Africa/Nairobi', 'DD Mon YYYY') AS last_date
+      FROM casual_events
+      WHERE created_at >= date_trunc('hour', now()) - interval '1 hour'
+        AND created_at <  date_trunc('hour', now())
+      GROUP BY action, project, client, actor_name
+      ORDER BY action, project, client
+    `);
+    if (rows.length === 0) return; // nothing happened in the past hour — no email
+    const groups = rows.map(r => ({
+      action: r.action, project: r.project, client: r.client,
+      count: r.count, by: r.actor_name, date: r.last_date,
+    }));
+    await resend.emails.send({
+      from: 'OneHub <esat@egypro.app>',
+      to: 'e.maged@outlook.com',
+      subject: 'OneHub Casual Resources Updates',
+      html: renderCasualUpdateTable(groups),
+    });
+    console.log('Casual updates digest sent — ' + rows.reduce((s, r) => s + r.count, 0) + ' event(s)');
+  } catch(e) { console.error('Casual updates digest error:', e.message); }
+}
+
 function scheduleAt(utcHour, utcMin, label, fn) {
   const now = new Date();
   const next = new Date();
@@ -4436,6 +4510,17 @@ function scheduleWeekly(utcDay, utcHour, utcMin, label, fn) {
   const ms = next - now;
   console.log(label + ' scheduled in ' + Math.floor(ms/86400000) + 'd ' + Math.floor((ms%86400000)/3600000) + 'h ' + Math.floor((ms%3600000)/60000) + 'm');
   setTimeout(() => { fn(); setInterval(fn, 7*24*60*60*1000); }, ms);
+}
+
+// Fire at the top of the next hour, then every hour.
+function scheduleHourly(label, fn) {
+  const now = new Date();
+  const next = new Date(now);
+  next.setUTCMinutes(0, 0, 0);
+  next.setUTCHours(next.getUTCHours() + 1);
+  const ms = next - now;
+  console.log(label + ' scheduled in ' + Math.floor(ms/60000) + 'm');
+  setTimeout(() => { fn(); setInterval(fn, 60*60*1000); }, ms);
 }
 
 
@@ -4532,6 +4617,7 @@ function scheduleDailyDigest() {
   scheduleAt(6,  0, 'SCM digest', sendDailySCMDigest);      // 9:00am EAT
   scheduleWeekly(1, 6, 15, 'Overdue digest', sendDailyOverdueDigest); // Mondays 9:15am EAT
   scheduleAt(5, 15, 'Employee changes digest', sendDailyEmployeeChangesDigest); // 8:15am EAT
+  scheduleHourly('Casual updates digest', sendHourlyCasualDigest); // top of every hour
   scheduleAt(2,  0, 'Log prune', pruneOldRequestLogs);      // 5:00am EAT
 }
 

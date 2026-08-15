@@ -651,6 +651,33 @@ async function setupDB() {
       ON CONFLICT (name) DO NOTHING
     `);
 
+    // Per-project PDA (Project Director Approval) requirement for a PPE/Tool item.
+    // A row with project '*' means "all projects". An item with no rows never needs PDA.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS ppe_item_pda_projects (
+        ppe_item_id UUID NOT NULL REFERENCES ppe_items(id) ON DELETE CASCADE,
+        project VARCHAR(100) NOT NULL,
+        PRIMARY KEY (ppe_item_id, project)
+      )`);
+    // Whether a request for `p_item` by someone on `p_project` needs PDA: the item lists
+    // that project explicitly, or lists '*' (all projects).
+    await client.query(`
+      CREATE OR REPLACE FUNCTION ppe_needs_pda(p_item UUID, p_project TEXT) RETURNS BOOLEAN AS $$
+        SELECT EXISTS (
+          SELECT 1 FROM ppe_item_pda_projects ipp
+          WHERE ipp.ppe_item_id = p_item
+            AND (ipp.project = '*' OR ipp.project = p_project)
+        );
+      $$ LANGUAGE sql STABLE`);
+    // One-time seed: existing "Needs PDA" items required PDA for everyone, so map them to
+    // '*'. Guarded by NOT EXISTS so admin edits aren't undone on the next boot.
+    await client.query(`
+      INSERT INTO ppe_item_pda_projects (ppe_item_id, project)
+      SELECT id, '*' FROM ppe_items
+      WHERE needs_pda = true AND NOT EXISTS (SELECT 1 FROM ppe_item_pda_projects)
+      ON CONFLICT DO NOTHING
+    `);
+
     console.log("Database setup complete");
   } catch(e) {
     console.error('DB setup error:', e.message);
@@ -1921,7 +1948,12 @@ app.delete('/api/casuals/:id', auth, async (req, res) => {
 
 // PPE Items
 app.get('/api/ppe', auth, async (req, res) => {
-  const { rows } = await pool.query('SELECT * FROM ppe_items WHERE is_active=true ORDER BY sort_order');
+  // pda_projects: the projects for which this item needs Project Director Approval.
+  // ['*'] means all projects; [] means it never needs PDA.
+  const { rows } = await pool.query(`
+    SELECT pi.*,
+      COALESCE((SELECT array_agg(project ORDER BY project) FROM ppe_item_pda_projects WHERE ppe_item_id = pi.id), ARRAY[]::varchar[]) AS pda_projects
+    FROM ppe_items pi WHERE is_active=true ORDER BY sort_order`);
   res.json(rows);
 });
 
@@ -2387,7 +2419,7 @@ app.get('/api/ncr', auth, async (req, res) => {
         COALESCE(e.client, c.client) as client,
         COALESCE(e.organization, c.organization) as organization,
         (n.casual_id IS NOT NULL) as is_casual,
-        p.name as ppe_name,p.category,p.needs_pda,u.full_name as audited_by_name,COALESCE(ai.quantity,1) as quantity,
+        p.name as ppe_name,p.category,ppe_needs_pda(p.id, COALESCE(e.project, c.project)) as needs_pda,u.full_name as audited_by_name,COALESCE(ai.quantity,1) as quantity,
         (SELECT MAX(pr.date_distributed) FROM ppe_requests pr
          WHERE pr.ppe_item_id=n.ppe_item_id AND pr.date_distributed IS NOT NULL
            AND ((n.employee_id IS NOT NULL AND pr.employee_id=n.employee_id) OR (n.casual_id IS NOT NULL AND pr.casual_id=n.casual_id))
@@ -2406,8 +2438,8 @@ app.get('/api/ncr', auth, async (req, res) => {
     if (project) { params.push(project); q += ` AND COALESCE(e.project, c.project)=$${params.length}`; }
     if (period === 'current') { q += ` AND date_trunc('month', n.created_at) = date_trunc('month', NOW())`; }
     else if (period === 'previous') { q += ` AND date_trunc('month', n.created_at) = date_trunc('month', NOW() - INTERVAL '1 month')`; }
-    if (status === 'pda_pending') { q += ` AND n.status='ehs_purchase_requested' AND p.needs_pda=true`; }
-    else if (status === 'ehs_purchase_requested') { q += ` AND n.status='ehs_purchase_requested' AND p.needs_pda IS NOT TRUE`; }
+    if (status === 'pda_pending') { q += ` AND n.status='ehs_purchase_requested' AND ppe_needs_pda(p.id, COALESCE(e.project, c.project))`; }
+    else if (status === 'ehs_purchase_requested') { q += ` AND n.status='ehs_purchase_requested' AND NOT ppe_needs_pda(p.id, COALESCE(e.project, c.project))`; }
     else if (status === 'distributed_this_month') { q += ` AND n.status IN ('resolved','distributed') AND date_trunc('month', n.updated_at) = date_trunc('month', NOW())`; }
     else if (status) { params.push(status); q += ` AND n.status=$${params.length}`; }
     if (ncrProjects !== null) { params.push(ncrProjects); q += ` AND COALESCE(e.project, c.project) = ANY($${params.length})`; }
@@ -2462,7 +2494,7 @@ app.get('/api/ncr/stats', auth, async (req, res) => {
     let q = `SELECT
         COUNT(*) FILTER (WHERE n.status NOT IN ('resolved','distributed','canceled','exit')) as total_open,
         COUNT(*) FILTER (WHERE n.status='pending') as pending,
-        COUNT(*) FILTER (WHERE n.status='ehs_purchase_requested' AND p.needs_pda=true) as pending_pm,
+        COUNT(*) FILTER (WHERE n.status='ehs_purchase_requested' AND ppe_needs_pda(p.id, COALESCE(e.project, c.project))) as pending_pm,
         COUNT(*) FILTER (WHERE n.status IN ('resolved','distributed') AND date_trunc('month', n.updated_at) = date_trunc('month', NOW())) as resolved_this_month
       FROM ncr_items n
       JOIN ppe_items p ON p.id = n.ppe_item_id
@@ -2504,12 +2536,12 @@ app.put('/api/ncr/:id/status', auth, async (req, res) => {
   try {
     await client.query('BEGIN');
     const { rows: [current] } = await client.query(
-      `SELECT n.status, pr.id as ppe_request_id, pr.pda_approved_date, pi.needs_pda
+      `SELECT n.status, pr.id as ppe_request_id, pr.pda_approved_date, ppe_needs_pda(pi.id, $2) as needs_pda
        FROM ncr_items n
        LEFT JOIN ppe_requests pr ON pr.ncr_item_id = n.id
        LEFT JOIN ppe_items pi ON pi.id = n.ppe_item_id
        WHERE n.id = $1`,
-      [req.params.id]
+      [req.params.id, ncrScope.project || null]
     );
     if (!current) {
       await client.query('ROLLBACK');
@@ -2606,26 +2638,58 @@ app.delete('/api/ppe/:id', auth, async (req, res) => {
   }
 });
 
+// Normalise the pda_projects the client sends: an array of project names, or ['*'] for
+// all projects. '*' wins (collapses to just ['*']); blanks/dupes dropped.
+const normalizePdaProjects = (input) => {
+  const arr = Array.isArray(input) ? input.map(p => String(p == null ? '' : p).trim()).filter(Boolean) : [];
+  if (arr.includes('*')) return ['*'];
+  return [...new Set(arr)];
+};
+// Replace an item's PDA-project rows inside the given client/transaction.
+const writePdaProjects = async (client, itemId, projects) => {
+  await client.query('DELETE FROM ppe_item_pda_projects WHERE ppe_item_id=$1', [itemId]);
+  for (const project of projects) {
+    await client.query('INSERT INTO ppe_item_pda_projects (ppe_item_id, project) VALUES ($1,$2) ON CONFLICT DO NOTHING', [itemId, project]);
+  }
+};
+
 app.post('/api/ppe', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-  const { name, category, has_size, size_type, sort_order, needs_pda } = req.body;
+  const { name, category, has_size, size_type, sort_order } = req.body;
   if (!name || !category) return res.status(400).json({ error: 'name and category required' });
-  const { rows } = await pool.query(
-    'INSERT INTO ppe_items (name, category, has_size, size_type, sort_order, is_active, needs_pda) VALUES ($1,$2,$3,$4,$5,true,$6) RETURNING *',
-    [name, category, has_size || false, size_type || null, sort_order || 99, needs_pda || false]
-  );
-  res.json(rows[0]);
+  const pdaProjects = normalizePdaProjects(req.body.pda_projects);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      // needs_pda kept in sync as a coarse "has any PDA rule" flag for legacy/display.
+      'INSERT INTO ppe_items (name, category, has_size, size_type, sort_order, is_active, needs_pda) VALUES ($1,$2,$3,$4,$5,true,$6) RETURNING *',
+      [name, category, has_size || false, size_type || null, sort_order || 99, pdaProjects.length > 0]
+    );
+    await writePdaProjects(client, rows[0].id, pdaProjects);
+    await client.query('COMMIT');
+    res.json({ ...rows[0], pda_projects: pdaProjects });
+  } catch (e) { await client.query('ROLLBACK'); sendError(res, e); }
+  finally { client.release(); }
 });
 
 app.put('/api/ppe/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Forbidden' });
-  const { name, category, has_size, size_type, sort_order, is_active, needs_pda } = req.body;
-  const { rows } = await pool.query(
-    'UPDATE ppe_items SET name=$1, category=$2, has_size=$3, size_type=$4, sort_order=$5, is_active=$6, needs_pda=$7 WHERE id=$8 RETURNING *',
-    [name, category, has_size, size_type || null, sort_order, is_active, needs_pda || false, req.params.id]
-  );
-  if (!rows.length) return res.status(404).json({ error: 'Not found' });
-  res.json(rows[0]);
+  const { name, category, has_size, size_type, sort_order, is_active } = req.body;
+  const pdaProjects = normalizePdaProjects(req.body.pda_projects);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      'UPDATE ppe_items SET name=$1, category=$2, has_size=$3, size_type=$4, sort_order=$5, is_active=$6, needs_pda=$7 WHERE id=$8 RETURNING *',
+      [name, category, has_size, size_type || null, sort_order, is_active, pdaProjects.length > 0, req.params.id]
+    );
+    if (!rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+    await writePdaProjects(client, req.params.id, pdaProjects);
+    await client.query('COMMIT');
+    res.json({ ...rows[0], pda_projects: pdaProjects });
+  } catch (e) { await client.query('ROLLBACK'); sendError(res, e); }
+  finally { client.release(); }
 });
 
 app.get('/api/ppe-requests', auth, async (req, res) => {
@@ -2643,7 +2707,7 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
         COALESCE(e.project, c.project) as project,
         COALESCE(e.client, c.client) as client,
         (r.casual_id IS NOT NULL) as is_casual,
-        p.name as ppe_name, p.category, p.needs_pda,
+        p.name as ppe_name, p.category, ppe_needs_pda(p.id, COALESCE(e.project, c.project)) as needs_pda,
         n.comment,
         u0.full_name as flagged_by_name,
         u1.full_name as purchase_requested_by_name,
@@ -2675,9 +2739,9 @@ app.get('/api/ppe-requests', auth, async (req, res) => {
       WHERE 1=1`;
     const params = [];
 
-    if (status === 'pda_pending') { q += ` AND r.status='ehs_purchase_requested' AND p.needs_pda=true`; }
-    else if (status === 'pending_scm') { q += ` AND (r.status='pda_approved' OR (r.status='ehs_purchase_requested' AND NOT (p.needs_pda=true AND r.pda_approved_date IS NULL)))`; }
-    else if (status === 'ehs_purchase_requested') { q += ` AND r.status='ehs_purchase_requested' AND NOT (p.needs_pda=true AND r.pda_approved_date IS NULL)`; }
+    if (status === 'pda_pending') { q += ` AND r.status='ehs_purchase_requested' AND ppe_needs_pda(p.id, COALESCE(e.project, c.project))`; }
+    else if (status === 'pending_scm') { q += ` AND (r.status='pda_approved' OR (r.status='ehs_purchase_requested' AND NOT (ppe_needs_pda(p.id, COALESCE(e.project, c.project)) AND r.pda_approved_date IS NULL)))`; }
+    else if (status === 'ehs_purchase_requested') { q += ` AND r.status='ehs_purchase_requested' AND NOT (ppe_needs_pda(p.id, COALESCE(e.project, c.project)) AND r.pda_approved_date IS NULL)`; }
     else if (status) { params.push(status); q += ` AND r.status=$${params.length}`; }
 
     // Mirrors the tracker's Warehouse column logic: real pipeline outcomes
@@ -2758,11 +2822,11 @@ app.get('/api/ppe-requests/stats', auth, async (req, res) => {
     let q = `SELECT
         COUNT(*) FILTER (WHERE r.status='pending') as pending_ehs,
         MIN(r.date_flagged) FILTER (WHERE r.status='pending') as pending_ehs_oldest,
-        COUNT(*) FILTER (WHERE r.status='ehs_purchase_requested' AND p.needs_pda=true) as pending_pm,
-        MIN(r.date_purchase_requested) FILTER (WHERE r.status='ehs_purchase_requested' AND p.needs_pda=true) as pending_pm_oldest,
-        COUNT(*) FILTER (WHERE r.status='pda_approved' OR (r.status='ehs_purchase_requested' AND NOT (p.needs_pda=true AND r.pda_approved_date IS NULL))) as pending_scm,
-        MIN(CASE WHEN p.needs_pda THEN r.pda_approved_date ELSE r.date_purchase_requested END)
-          FILTER (WHERE r.status='pda_approved' OR (r.status='ehs_purchase_requested' AND NOT (p.needs_pda=true AND r.pda_approved_date IS NULL))) as pending_scm_oldest,
+        COUNT(*) FILTER (WHERE r.status='ehs_purchase_requested' AND ppe_needs_pda(p.id, COALESCE(e.project, c.project))) as pending_pm,
+        MIN(r.date_purchase_requested) FILTER (WHERE r.status='ehs_purchase_requested' AND ppe_needs_pda(p.id, COALESCE(e.project, c.project))) as pending_pm_oldest,
+        COUNT(*) FILTER (WHERE r.status='pda_approved' OR (r.status='ehs_purchase_requested' AND NOT (ppe_needs_pda(p.id, COALESCE(e.project, c.project)) AND r.pda_approved_date IS NULL))) as pending_scm,
+        MIN(CASE WHEN ppe_needs_pda(p.id, COALESCE(e.project, c.project)) THEN r.pda_approved_date ELSE r.date_purchase_requested END)
+          FILTER (WHERE r.status='pda_approved' OR (r.status='ehs_purchase_requested' AND NOT (ppe_needs_pda(p.id, COALESCE(e.project, c.project)) AND r.pda_approved_date IS NULL))) as pending_scm_oldest,
         COUNT(*) FILTER (WHERE r.status='scm_ordered') as pending_suppliers,
         MIN(r.date_ordered) FILTER (WHERE r.status='scm_ordered') as pending_suppliers_oldest,
         COUNT(*) FILTER (WHERE r.status='warehouse_available') as pending_projects,
@@ -2853,8 +2917,8 @@ app.put('/api/ppe-requests/:id/status', auth, async (req, res) => {
   try {
     await client.query('BEGIN');
     const { rows: [current] } = await client.query(
-      'SELECT pr.status, pr.pda_approved_date, pi.needs_pda FROM ppe_requests pr JOIN ppe_items pi ON pr.ppe_item_id = pi.id WHERE pr.id = $1',
-      [req.params.id]
+      'SELECT pr.status, pr.pda_approved_date, ppe_needs_pda(pi.id, $2) as needs_pda FROM ppe_requests pr JOIN ppe_items pi ON pr.ppe_item_id = pi.id WHERE pr.id = $1',
+      [req.params.id, reqScope.project || null]
     );
     if (!current) {
       await client.query('ROLLBACK');
@@ -4206,7 +4270,9 @@ async function sendDailyPMDigest() {
       SELECT COUNT(*) as count, MAX(CURRENT_DATE - r.date_purchase_requested::date) as oldest_days
       FROM ppe_requests r
       JOIN ppe_items p ON p.id = r.ppe_item_id
-      WHERE r.status = 'ehs_purchase_requested' AND p.needs_pda = true AND r.pda_approved_date IS NULL
+      LEFT JOIN employees e ON e.id = r.employee_id
+      LEFT JOIN casuals c ON c.id = r.casual_id
+      WHERE r.status = 'ehs_purchase_requested' AND ppe_needs_pda(p.id, COALESCE(e.project, c.project)) AND r.pda_approved_date IS NULL
     `);
     const count = parseInt(pending[0].count);
     const oldestDays = parseInt(pending[0].oldest_days) || 0;
@@ -5512,7 +5578,7 @@ app.get('/api/graphs', auth, async (req, res) => {
       `, scopeParams),
       pool.query(`
         WITH scoped_requests AS (
-          SELECT r.*, p.needs_pda
+          SELECT r.*, ppe_needs_pda(p.id, COALESCE(e.project, c.project)) as needs_pda
           FROM ppe_requests r
           LEFT JOIN employees e ON e.id = r.employee_id
           LEFT JOIN casuals c ON c.id = r.casual_id

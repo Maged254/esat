@@ -2572,6 +2572,19 @@ app.put('/api/ncr/:id/status', auth, async (req, res) => {
     if (status === 'rejected') {
       const reason = (req.body.reason || '').trim();
       if (!reason) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'A rejection reason is required' }); }
+      // Stage rules: Safety (EHS) rejects only Flagged items; PM (PD) rejects only
+      // Pending PM items (needs PDA, at EHS Purchase Requested). Admin may do either.
+      const isFlagged = current.status === 'pending';
+      const isPendingPm = current.needs_pda && current.status === 'ehs_purchase_requested';
+      const canReject = req.user.role === 'ehs_manager' ? isFlagged
+        : req.user.role === 'project_director' ? isPendingPm
+        : (isFlagged || isPendingPm);
+      if (!canReject) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: req.user.role === 'ehs_manager' ? 'Safety can only reject Flagged items.'
+          : req.user.role === 'project_director' ? 'PM can only reject Pending PM items.'
+          : 'This item is not at a stage that can be rejected.' });
+      }
       const { rows: [rej] } = await client.query(
         `UPDATE ncr_items SET status='canceled', reject_reason=$1, rejected_by=$2, rejected_at=NOW(), resolved_at=NULL, updated_at=NOW() WHERE id=$3 RETURNING *`,
         [reason, req.user.id, req.params.id]

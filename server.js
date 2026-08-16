@@ -271,6 +271,13 @@ async function setupDB() {
       )
     `);
 
+    // A rejection (Safety or PM) closes the NCR out: stored as status='canceled'
+    // (already excluded from every open/count query) but distinguished — and labelled
+    // "Rejected" — by having a reject_reason.
+    await client.query('ALTER TABLE ncr_items ADD COLUMN IF NOT EXISTS reject_reason TEXT');
+    await client.query('ALTER TABLE ncr_items ADD COLUMN IF NOT EXISTS rejected_by UUID REFERENCES users(id)');
+    await client.query('ALTER TABLE ncr_items ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMPTZ');
+
     // Ensure location_id column exists on audits
     await client.query('ALTER TABLE audits ADD COLUMN IF NOT EXISTS location_id INTEGER REFERENCES locations(id)');
 
@@ -2419,7 +2426,7 @@ app.get('/api/ncr', auth, async (req, res) => {
         COALESCE(e.client, c.client) as client,
         COALESCE(e.organization, c.organization) as organization,
         (n.casual_id IS NOT NULL) as is_casual,
-        p.name as ppe_name,p.category,ppe_needs_pda(p.id, COALESCE(e.project, c.project)) as needs_pda,u.full_name as audited_by_name,COALESCE(ai.quantity,1) as quantity,
+        p.name as ppe_name,p.category,ppe_needs_pda(p.id, COALESCE(e.project, c.project)) as needs_pda,u.full_name as audited_by_name,n.reject_reason,COALESCE(ai.quantity,1) as quantity,
         (SELECT MAX(pr.date_distributed) FROM ppe_requests pr
          WHERE pr.ppe_item_id=n.ppe_item_id AND pr.date_distributed IS NOT NULL
            AND ((n.employee_id IS NOT NULL AND pr.employee_id=n.employee_id) OR (n.casual_id IS NOT NULL AND pr.casual_id=n.casual_id))
@@ -2523,8 +2530,8 @@ app.put('/api/ncr/:id/status', auth, async (req, res) => {
   const { status } = req.body;
   const allowedRoles = ['admin', 'ehs_manager', 'project_director'];
   if (!allowedRoles.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
-  if (req.user.role === 'project_director' && status !== 'pda_approved') {
-    return res.status(403).json({ error: 'Project Director can only set status to PDA Approved' });
+  if (req.user.role === 'project_director' && !['pda_approved', 'rejected'].includes(status)) {
+    return res.status(403).json({ error: 'Project Director can only approve or reject at the PM stage' });
   }
   const { rows: [ncrPerson] } = await pool.query('SELECT COALESCE(employee_id, casual_id) as person_id FROM ncr_items WHERE id=$1', [req.params.id]);
   if (!ncrPerson) return res.status(404).json({ error: 'NCR item not found' });
@@ -2558,6 +2565,20 @@ app.put('/api/ncr/:id/status', auth, async (req, res) => {
     if (skippingPda) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'This PPE item requires Project Director Approval before it can move to SCM Ordered' });
+    }
+    // Reject (Safety or PM): close the NCR out with a mandatory reason. Stored as
+    // 'canceled' (already excluded from every open/count query) but distinguished — and
+    // shown as "Rejected" — via reject_reason. The linked PPE/Tool request is cancelled too.
+    if (status === 'rejected') {
+      const reason = (req.body.reason || '').trim();
+      if (!reason) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'A rejection reason is required' }); }
+      const { rows: [rej] } = await client.query(
+        `UPDATE ncr_items SET status='canceled', reject_reason=$1, rejected_by=$2, rejected_at=NOW(), resolved_at=NULL, updated_at=NOW() WHERE id=$3 RETURNING *`,
+        [reason, req.user.id, req.params.id]
+      );
+      await client.query(`UPDATE ppe_requests SET status='canceled', updated_at=NOW() WHERE ncr_item_id=$1`, [req.params.id]);
+      await client.query('COMMIT');
+      return res.json(rej);
     }
     let updateQ;
     if (status === 'resolved') {

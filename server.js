@@ -4715,7 +4715,14 @@ async function sendDailyNewCertificatesDigest() {
 // Daily digest of PPE/Tool items distributed to a person by courier yesterday
 // (status 'distributed', distribution_method 'courier', date_distributed in
 // yesterday's Africa/Nairobi window). Covers employees and casuals; none → no email.
-async function sendDailyCourierDistributionDigest() {
+// Projects covered by each courier-distribution digest. Items on other projects appear
+// in neither email.
+const COURIER_BTS_PROJECTS   = ['Active MS', 'BTS - MS', 'BTS - MS - MK', 'BTS - MS - NE', 'BTS - Rollout', 'Fuel', 'Workshop', 'TI'];
+const COURIER_FIBRE_PROJECTS = ['FTTX Rollout', 'Fibre Home', 'Fibre MS', 'Fibre Rollout'];
+
+// One courier-distribution digest for a named project group (e.g. "BTS" / "Fibre"):
+// PPE/Tool items distributed by courier yesterday whose person's project is in `projects`.
+async function sendCourierDigest(label, projects) {
   try {
     const { rows } = await pool.query(`
       SELECT COALESCE(e.full_name, c.full_name)     AS person_name,
@@ -4737,24 +4744,25 @@ async function sendDailyCourierDistributionDigest() {
       WHERE pr.status = 'distributed' AND pr.distribution_method = 'courier'
         AND pr.date_distributed >= (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi')) - INTERVAL '1 day') AT TIME ZONE 'Africa/Nairobi'
         AND pr.date_distributed <  (date_trunc('day', (now() AT TIME ZONE 'Africa/Nairobi'))) AT TIME ZONE 'Africa/Nairobi'
+        AND COALESCE(e.project, c.project) = ANY($1)
       ORDER BY person_name, pi.name
-    `);
-    if (rows.length === 0) return; // nothing distributed by courier yesterday — no email
+    `, [projects]);
+    if (rows.length === 0) return; // nothing distributed by courier yesterday for this group — no email
 
     const N = rows.length;
     const dateLabel = rows[0].date_label;
     const tableRows = rows.map(r => `
       <tr style="border-bottom:1px solid #e5e7eb;">
         <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">
-          <div style="font-weight:600;color:#111;">${escapeHtml(r.person_name || '—')}</div>
+          <div style="color:#111;">${escapeHtml(r.person_name || '—')}</div>
           <div style="color:#9ca3af;font-size:9pt;">${escapeHtml(r.national_id || r.employee_number || '')}</div>
         </td>
         <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">
-          <div style="font-weight:600;color:#111;">${escapeHtml(r.item_name || '—')}</div>
+          <div style="color:#111;">${escapeHtml(r.item_name || '—')}</div>
           ${r.size_value ? `<div style="color:#9ca3af;font-size:9pt;">Size: ${escapeHtml(r.size_value)}</div>` : ''}
         </td>
         <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">
-          <div style="font-weight:600;color:#111;">${escapeHtml(r.project || '—')}</div>
+          <div style="color:#111;">${escapeHtml(r.project || '—')}</div>
           <div style="color:#9ca3af;font-size:9pt;">${escapeHtml(r.client || '—')}</div>
         </td>
         <td style="padding:8px 12px;font-family:${FONT};font-size:11pt;vertical-align:top;">${escapeHtml(r.courier_tracking_number || '—')}</td>
@@ -4764,7 +4772,7 @@ async function sendDailyCourierDistributionDigest() {
     await resend.emails.send({
       from: 'OneHub <esat@egypro.app>',
       to: 'e.maged@outlook.com',
-      subject: `OneHub Daily Courier Distributions — ${N} Item${N > 1 ? 's' : ''}`,
+      subject: `OneHub Daily ${label} Courier Distributions — ${N} Item${N > 1 ? 's' : ''}`,
       html: mailWrap(`
           <p>Hello Team,</p>
           <p>Outlined below <strong>${N}</strong> PPE/Tool item${N > 1 ? 's' : ''} ${N > 1 ? 'were' : 'was'} distributed to employees by courier on ${dateLabel}:</p>
@@ -4782,10 +4790,15 @@ async function sendDailyCourierDistributionDigest() {
           ${MAIL_SIGNOFF}
         `)
     });
-    console.log('Courier distributions digest sent — ' + N + ' items');
+    console.log(label + ' courier distributions digest sent — ' + N + ' items');
   } catch(e) {
-    console.error('Courier distributions digest error:', e.message);
+    console.error(label + ' courier distributions digest error:', e.message);
   }
+}
+
+async function sendDailyCourierDistributionDigest() {
+  await sendCourierDigest('BTS', COURIER_BTS_PROJECTS);
+  await sendCourierDigest('Fibre', COURIER_FIBRE_PROJECTS);
 }
 
 // Hourly digest of casual add/reactivate events from the previous clock hour. Groups by

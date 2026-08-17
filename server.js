@@ -595,9 +595,26 @@ async function setupDB() {
     // These three are written automatically by the expiry->renewal sweep
     // (ensureRenewalRequests), so they must always be selectable in the Pending
     // Reason filters -- seeded on every boot, unlike the admin's own reasons.
+    // They keep the wording ETMS used, so the automation and the history that
+    // came over from it read as one set rather than near-duplicate pairs.
     await client.query(`
-      INSERT INTO training_pending_reasons (label) VALUES ('Pending HR'), ('Pending Fleet'), ('Pending Operation')
+      INSERT INTO training_pending_reasons (label)
+      VALUES ('Pending HR Dept.'), ('Pending Fleet Training Approval'), ('Pending Operation Dept.')
       ON CONFLICT (label) DO NOTHING
+    `);
+    // The automation first shipped with short labels ('Pending HR' etc), which
+    // duplicated the ETMS wording above. Fold them back in: re-label the records
+    // that carry one, then drop the short options from the dropdown.
+    await client.query(`
+      UPDATE training_records SET pending_reason = CASE pending_reason
+               WHEN 'Pending HR' THEN 'Pending HR Dept.'
+               WHEN 'Pending Fleet' THEN 'Pending Fleet Training Approval'
+               ELSE 'Pending Operation Dept.' END,
+             updated_at = NOW()
+       WHERE pending_reason IN ('Pending HR','Pending Fleet','Pending Operation')
+    `);
+    await client.query(`
+      DELETE FROM training_pending_reasons WHERE label IN ('Pending HR','Pending Fleet','Pending Operation')
     `);
 
     // Admin-managed option lists for the employee Add/Edit dropdowns
@@ -671,10 +688,7 @@ async function setupDB() {
     await client.query(`
       UPDATE training_records t
          SET status = 'pending',
-             pending_reason = CASE
-               WHEN e.resource_type = 'outsource' AND oe.type = 'vehicle_supplier' THEN 'Pending Fleet'
-               WHEN e.resource_type = 'outsource' AND oe.type = 'services' THEN 'Pending Operation'
-               ELSE 'Pending HR' END,
+             pending_reason = ${PENDING_TEAM_REASON_SQL},
              updated_at = NOW()
         FROM employees e
         LEFT JOIN outsource_entities oe ON LOWER(TRIM(oe.name)) = LOWER(TRIM(e.organization))
@@ -3571,9 +3585,9 @@ const GROUP_SQL = { valid: GRP_VALID_SQL, expiring: GRP_EXPIRING_SQL, outstandin
 // so any query joining both can drop it in. An outsource org that isn't registered
 // in outsource_entities has no owning team, so it falls back to HR.
 const PENDING_TEAM_REASON_SQL = `CASE
-        WHEN e.resource_type = 'outsource' AND oe.type = 'vehicle_supplier' THEN 'Pending Fleet'
-        WHEN e.resource_type = 'outsource' AND oe.type = 'services' THEN 'Pending Operation'
-        ELSE 'Pending HR' END`;
+        WHEN e.resource_type = 'outsource' AND oe.type = 'vehicle_supplier' THEN 'Pending Fleet Training Approval'
+        WHEN e.resource_type = 'outsource' AND oe.type = 'services' THEN 'Pending Operation Dept.'
+        ELSE 'Pending HR Dept.' END`;
 
 // When a certificate expires, a renewal has to happen -- so we auto-open a
 // `pending` record for it, which then flows through the normal Update process

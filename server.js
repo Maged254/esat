@@ -3587,6 +3587,15 @@ const PENDING_TEAM_REASON_SQL = `CASE
 // certificate (not superseded history) belonging to an ACTIVE employee that does
 // not already have an open request. The partial unique index is the final guard
 // against duplicates, so concurrent calls are safe (23505 is swallowed).
+//
+// A renewal that was CANCELLED or marked NOT ELIGIBLE is a decision that this
+// person no longer needs the course, so the sweep must not raise it again the
+// next time a page loads. The decline is tied to the expired certificate it was
+// made against (`prior_expiry_date` = that cert's `expiry_date`), so it retires
+// that certificate for good without muzzling anything else: a human can still
+// request the course manually at any time, and once a NEW certificate is earned
+// and later expires, that fresh cycle carries a different date and opens
+// normally.
 const ensureRenewalRequests = async (courseId) => {
   const params = [];
   let courseClause = '';
@@ -3610,6 +3619,12 @@ const ensureRenewalRequests = async (courseId) => {
            WHERE o.employee_id = t.employee_id AND o.course_id = t.course_id
              AND o.is_deleted IS NOT TRUE
              AND o.status IN ('requested','scheduled','pending'))
+        AND NOT EXISTS (
+          SELECT 1 FROM training_records d
+           WHERE d.employee_id = t.employee_id AND d.course_id = t.course_id
+             AND d.is_deleted IS NOT TRUE
+             AND d.status IN ('cancelled','not_eligible')
+             AND d.prior_expiry_date = t.expiry_date)
     `, params);
   } catch (e) {
     if (e.code !== '23505') throw e; // unique index caught a race -- already exists
@@ -4020,11 +4035,24 @@ app.post('/api/training-requests', auth, async (req, res) => {
     // Raising the request IS the action -- there is no separate "someone must
     // pick this up" step -- so it opens straight as Pending against the team that
     // owns the training (same rule as the expiry-opened renewals above).
+    //
+    // If the person already holds an EXPIRED certificate for this course, this is
+    // a renewal however it was raised -- typically re-asking for one that was
+    // cancelled earlier. Carry that certificate's expiry across as
+    // `prior_expiry_date` so the record keeps its history ("Expired on <date>")
+    // and files under Expired rather than posing as a brand-new request.
     const { rows: [rec] } = await pool.query(
-      `INSERT INTO training_records (employee_id, course_id, status, pending_reason, requested_by, requested_at)
-       SELECT e.id, $2, 'pending', ${PENDING_TEAM_REASON_SQL}, $3, NOW()
+      `INSERT INTO training_records (employee_id, course_id, status, pending_reason, prior_expiry_date, requested_by, requested_at)
+       SELECT e.id, $2::uuid, 'pending', ${PENDING_TEAM_REASON_SQL},
+              CASE WHEN prev.expiry_date < CURRENT_DATE THEN prev.expiry_date END, $3, NOW()
        FROM employees e
        LEFT JOIN outsource_entities oe ON LOWER(TRIM(oe.name)) = LOWER(TRIM(e.organization))
+       LEFT JOIN LATERAL (
+         SELECT p.expiry_date FROM training_records p
+          WHERE p.employee_id = e.id AND p.course_id = $2::uuid
+            AND p.status = 'completed' AND p.is_deleted IS NOT TRUE
+          ORDER BY p.completed_at DESC, p.id DESC LIMIT 1
+       ) prev ON TRUE
        WHERE e.id = $1
        RETURNING *`,
       [employee_id, course_id, req.user.id]

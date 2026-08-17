@@ -1050,7 +1050,10 @@ function outsourceScopeClause(req, params) {
   const wants = req.query.outsource_scope === '1' || req.user.role === 'fleet';
   if (!wants) return '';
   let c = ` AND e.resource_type='outsource'`;
-  if (req.user.role !== 'admin') {
+  // The subtype grant (outsource_access) limits outsource MANAGERS (fleet/supervisor)
+  // to the subtype(s) they manage. Admin and oversight roles (project_director) see all
+  // subtypes, still scoped to their projects/clients by the filters applied separately.
+  if (req.user.role !== 'admin' && req.user.role !== 'project_director') {
     const subs = Array.isArray(req.user.outsource_access) ? req.user.outsource_access : [];
     if (!subs.length) return ` AND 1=0`; // no subtype granted → sees nothing
     params.push(subs); c += ` AND oe.type = ANY($${params.length})`;

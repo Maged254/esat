@@ -664,10 +664,10 @@ async function setupDB() {
         AND NOT EXISTS (SELECT 1 FROM outsource_entities)
       ON CONFLICT (name) DO NOTHING
     `);
-    // Expiry-opened renewals used to land as 'requested' with no reason. Bring the
-    // ones still sitting in that state onto the new Pending + owning-team footing
-    // (see ensureRenewalRequests). A no-op once done, since the sweep no longer
-    // creates 'requested' renewals.
+    // Open training records used to land as 'requested' with no reason -- both the
+    // expiry-opened renewals and the manually raised requests. Nothing creates that
+    // state any more (both now open as Pending against the owning team), so bring
+    // the leftovers onto the same footing. A no-op once done.
     await client.query(`
       UPDATE training_records t
          SET status = 'pending',
@@ -680,7 +680,6 @@ async function setupDB() {
         LEFT JOIN outsource_entities oe ON LOWER(TRIM(oe.name)) = LOWER(TRIM(e.organization))
        WHERE e.id = t.employee_id
          AND t.status = 'requested'
-         AND t.prior_expiry_date IS NOT NULL
          AND t.is_deleted IS NOT TRUE
     `);
 
@@ -3566,12 +3565,12 @@ const GRP_EXPIRING_SQL = `e.employment_status <> 'exit' AND ${CURRENT_CERT_SQL} 
 const GRP_OUTSTANDING_SQL = `e.employment_status <> 'exit' AND t.status IN ('requested','scheduled','pending','not_eligible')`;
 const GROUP_SQL = { valid: GRP_VALID_SQL, expiring: GRP_EXPIRING_SQL, outstanding: GRP_OUTSTANDING_SQL, archived: GRP_ARCHIVED_SQL };
 
-// Who owns chasing a renewal, derived from the resource's own classification:
+// Who owns chasing a training, derived from the resource's own classification:
 // in-house (incl. interns) -> HR; outsource vehicle supplier -> Fleet; outsource
 // services -> Operation. Correlates on `e` (employees) + `oe` (outsource_entities),
 // so any query joining both can drop it in. An outsource org that isn't registered
 // in outsource_entities has no owning team, so it falls back to HR.
-const RENEWAL_PENDING_REASON_SQL = `CASE
+const PENDING_TEAM_REASON_SQL = `CASE
         WHEN e.resource_type = 'outsource' AND oe.type = 'vehicle_supplier' THEN 'Pending Fleet'
         WHEN e.resource_type = 'outsource' AND oe.type = 'services' THEN 'Pending Operation'
         ELSE 'Pending HR' END`;
@@ -3595,7 +3594,7 @@ const ensureRenewalRequests = async (courseId) => {
   try {
     await pool.query(`
       INSERT INTO training_records (employee_id, course_id, status, pending_reason, requested_at, prior_expiry_date, created_at, updated_at)
-      SELECT t.employee_id, t.course_id, 'pending', ${RENEWAL_PENDING_REASON_SQL}, NOW(), t.expiry_date, NOW(), NOW()
+      SELECT t.employee_id, t.course_id, 'pending', ${PENDING_TEAM_REASON_SQL}, NOW(), t.expiry_date, NOW(), NOW()
       FROM training_records t
       JOIN employees e ON e.id = t.employee_id
       LEFT JOIN outsource_entities oe ON LOWER(TRIM(oe.name)) = LOWER(TRIM(e.organization))
@@ -4018,9 +4017,16 @@ app.post('/api/training-requests', auth, async (req, res) => {
     if (emp.employment_status !== 'active') {
       return res.status(400).json({ error: 'Cannot request training for a non-active employee' });
     }
+    // Raising the request IS the action -- there is no separate "someone must
+    // pick this up" step -- so it opens straight as Pending against the team that
+    // owns the training (same rule as the expiry-opened renewals above).
     const { rows: [rec] } = await pool.query(
-      `INSERT INTO training_records (employee_id, course_id, status, requested_by, requested_at)
-       VALUES ($1,$2,'requested',$3,NOW()) RETURNING *`,
+      `INSERT INTO training_records (employee_id, course_id, status, pending_reason, requested_by, requested_at)
+       SELECT e.id, $2, 'pending', ${PENDING_TEAM_REASON_SQL}, $3, NOW()
+       FROM employees e
+       LEFT JOIN outsource_entities oe ON LOWER(TRIM(oe.name)) = LOWER(TRIM(e.organization))
+       WHERE e.id = $1
+       RETURNING *`,
       [employee_id, course_id, req.user.id]
     );
     res.json(rec);

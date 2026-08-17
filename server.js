@@ -2411,7 +2411,10 @@ app.put('/api/audits/:id', auth, async (req, res) => {
 // NCR
 app.get('/api/ncr', auth, async (req, res) => {
   try {
-    const { search, project, ppe, period, status, page, pageSize, export: isExport } = req.query;
+    const { search, project, projects, clients, ppe, period, status, page, pageSize, export: isExport } = req.query;
+    // project/client filters are multi-select (CSV); `project` kept for back-compat.
+    const projectsCsv = String(projects ?? project ?? '').split(',').map(s => s.trim()).filter(Boolean);
+    const clientsCsv = String(clients ?? '').split(',').map(s => s.trim()).filter(Boolean);
     const limit = isExport === 'true' ? 100000 : Math.min(Math.max(parseInt(pageSize) || 25, 1), 100);
     const pageNum = isExport === 'true' ? 1 : Math.max(parseInt(page) || 1, 1);
     const offset = (pageNum - 1) * limit;
@@ -2443,9 +2446,10 @@ app.get('/api/ncr', auth, async (req, res) => {
       LEFT JOIN audits a ON a.id=ai.audit_id
       LEFT JOIN users u ON u.id=a.audited_by WHERE 1=1`;
     const params = [];
-    if (search) { params.push(`%${search}%`); q += ` AND COALESCE(e.full_name, c.full_name) ILIKE $${params.length}`; }
+    if (search) { params.push(`%${search}%`); q += ` AND (COALESCE(e.full_name, c.full_name) ILIKE $${params.length} OR COALESCE(e.national_id, c.national_id) ILIKE $${params.length})`; }
     if (ppe) { params.push(ppe); q += ` AND p.name=$${params.length}`; }
-    if (project) { params.push(project); q += ` AND COALESCE(e.project, c.project)=$${params.length}`; }
+    if (projectsCsv.length) { params.push(projectsCsv); q += ` AND COALESCE(e.project, c.project) = ANY($${params.length})`; }
+    if (clientsCsv.length) { params.push(clientsCsv); q += ` AND COALESCE(e.client, c.client) = ANY($${params.length})`; }
     if (period === 'current') { q += ` AND date_trunc('month', n.created_at) = date_trunc('month', NOW())`; }
     else if (period === 'previous') { q += ` AND date_trunc('month', n.created_at) = date_trunc('month', NOW() - INTERVAL '1 month')`; }
     if (status === 'pda_pending') { q += ` AND n.status='ehs_purchase_requested' AND ppe_needs_pda(p.id, COALESCE(e.project, c.project))`; }
@@ -2470,7 +2474,8 @@ app.get('/api/ncr/filter-options', auth, async (req, res) => {
   try {
     let q = `SELECT
         ARRAY_AGG(DISTINCT p.name) FILTER (WHERE p.name IS NOT NULL) as ppe_names,
-        ARRAY_AGG(DISTINCT COALESCE(e.project, c.project)) FILTER (WHERE COALESCE(e.project, c.project) IS NOT NULL) as projects
+        ARRAY_AGG(DISTINCT COALESCE(e.project, c.project)) FILTER (WHERE COALESCE(e.project, c.project) IS NOT NULL) as projects,
+        ARRAY_AGG(DISTINCT COALESCE(e.client, c.client)) FILTER (WHERE COALESCE(e.client, c.client) IS NOT NULL) as clients
       FROM ncr_items n
       JOIN ppe_items p ON p.id=n.ppe_item_id
       LEFT JOIN employees e ON e.id=n.employee_id
@@ -2479,18 +2484,19 @@ app.get('/api/ncr/filter-options', auth, async (req, res) => {
     const params = [];
     const ncrProjects = await getProjectFilter(req.user);
     if (ncrProjects !== null) {
-      if (ncrProjects.length === 0) return res.json({ ppe_names: [], projects: [] });
+      if (ncrProjects.length === 0) return res.json({ ppe_names: [], projects: [], clients: [] });
       params.push(ncrProjects); q += ` AND COALESCE(e.project, c.project) = ANY($${params.length})`;
     }
     const ncrClients = await getClientFilter(req.user);
     if (ncrClients !== null) {
-      if (ncrClients.length === 0) return res.json({ ppe_names: [], projects: [] });
+      if (ncrClients.length === 0) return res.json({ ppe_names: [], projects: [], clients: [] });
       params.push(ncrClients); q += ` AND COALESCE(e.client, c.client) = ANY($${params.length})`;
     }
     const { rows } = await pool.query(q, params);
     res.json({
       ppe_names: (rows[0].ppe_names || []).sort(),
       projects: (rows[0].projects || []).sort(),
+      clients: (rows[0].clients || []).sort(),
     });
   } catch(e) { sendError(res, e); }
 });

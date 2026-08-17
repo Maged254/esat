@@ -1673,7 +1673,7 @@ app.delete('/api/employee-change-log/:id', auth, async (req, res) => {
 
 // ── Casuals ──────────────────────────────────────────────────
 const CASUAL_EDIT_ROLES = ['admin', 'supervisor'];
-const CASUAL_VIEW_ROLES = ['admin', 'supervisor', 'ehs_officer', 'ehs_manager'];
+const CASUAL_VIEW_ROLES = ['admin', 'supervisor', 'ehs_officer', 'ehs_manager', 'project_director'];
 
 // List casuals (view: admin, supervisor, ehs_officer, ehs_manager; project-scoped)
 app.get('/api/casuals', auth, async (req, res) => {

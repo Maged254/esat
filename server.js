@@ -592,6 +592,13 @@ async function setupDB() {
         created_at TIMESTAMPTZ DEFAULT NOW()
       )
     `);
+    // These three are written automatically by the expiry->renewal sweep
+    // (ensureRenewalRequests), so they must always be selectable in the Pending
+    // Reason filters -- seeded on every boot, unlike the admin's own reasons.
+    await client.query(`
+      INSERT INTO training_pending_reasons (label) VALUES ('Pending HR'), ('Pending Fleet'), ('Pending Operation')
+      ON CONFLICT (label) DO NOTHING
+    `);
 
     // Admin-managed option lists for the employee Add/Edit dropdowns
     // (Department / Project / Client). As ESAT goes independent of ETMS these
@@ -656,6 +663,25 @@ async function setupDB() {
       WHERE organization IS NOT NULL AND TRIM(organization) <> '' AND LOWER(TRIM(organization)) <> 'egypro'
         AND NOT EXISTS (SELECT 1 FROM outsource_entities)
       ON CONFLICT (name) DO NOTHING
+    `);
+    // Expiry-opened renewals used to land as 'requested' with no reason. Bring the
+    // ones still sitting in that state onto the new Pending + owning-team footing
+    // (see ensureRenewalRequests). A no-op once done, since the sweep no longer
+    // creates 'requested' renewals.
+    await client.query(`
+      UPDATE training_records t
+         SET status = 'pending',
+             pending_reason = CASE
+               WHEN e.resource_type = 'outsource' AND oe.type = 'vehicle_supplier' THEN 'Pending Fleet'
+               WHEN e.resource_type = 'outsource' AND oe.type = 'services' THEN 'Pending Operation'
+               ELSE 'Pending HR' END,
+             updated_at = NOW()
+        FROM employees e
+        LEFT JOIN outsource_entities oe ON LOWER(TRIM(oe.name)) = LOWER(TRIM(e.organization))
+       WHERE e.id = t.employee_id
+         AND t.status = 'requested'
+         AND t.prior_expiry_date IS NOT NULL
+         AND t.is_deleted IS NOT TRUE
     `);
 
     // Per-project PDA (Project Director Approval) requirement for a PPE/Tool item.
@@ -3540,13 +3566,25 @@ const GRP_EXPIRING_SQL = `e.employment_status <> 'exit' AND ${CURRENT_CERT_SQL} 
 const GRP_OUTSTANDING_SQL = `e.employment_status <> 'exit' AND t.status IN ('requested','scheduled','pending','not_eligible')`;
 const GROUP_SQL = { valid: GRP_VALID_SQL, expiring: GRP_EXPIRING_SQL, outstanding: GRP_OUTSTANDING_SQL, archived: GRP_ARCHIVED_SQL };
 
+// Who owns chasing a renewal, derived from the resource's own classification:
+// in-house (incl. interns) -> HR; outsource vehicle supplier -> Fleet; outsource
+// services -> Operation. Correlates on `e` (employees) + `oe` (outsource_entities),
+// so any query joining both can drop it in. An outsource org that isn't registered
+// in outsource_entities has no owning team, so it falls back to HR.
+const RENEWAL_PENDING_REASON_SQL = `CASE
+        WHEN e.resource_type = 'outsource' AND oe.type = 'vehicle_supplier' THEN 'Pending Fleet'
+        WHEN e.resource_type = 'outsource' AND oe.type = 'services' THEN 'Pending Operation'
+        ELSE 'Pending HR' END`;
+
 // When a certificate expires, a renewal has to happen -- so we auto-open a
-// `requested` record for it, which then flows through the normal Update process
-// (scheduled / pending / completed) like any other request. The expired
-// certificate itself is left untouched (still reads "Expired"); the new request
+// `pending` record for it, which then flows through the normal Update process
+// (scheduled / completed) like any other request. It opens as Pending (not
+// Requested) because nobody has to raise it: the expiry itself is the trigger,
+// and the pending reason names the team that owns the renewal. The expired
+// certificate itself is left untouched (still reads "Expired"); the new record
 // carries `prior_expiry_date` so the UI can show "Expired on <date>".
 //
-// This is idempotent and lazy: it inserts a request only for a CURRENT expired
+// This is idempotent and lazy: it inserts a record only for a CURRENT expired
 // certificate (not superseded history) belonging to an ACTIVE employee that does
 // not already have an open request. The partial unique index is the final guard
 // against duplicates, so concurrent calls are safe (23505 is swallowed).
@@ -3556,10 +3594,11 @@ const ensureRenewalRequests = async (courseId) => {
   if (courseId) { params.push(courseId); courseClause = ` AND t.course_id = $${params.length}`; }
   try {
     await pool.query(`
-      INSERT INTO training_records (employee_id, course_id, status, requested_at, prior_expiry_date, created_at, updated_at)
-      SELECT t.employee_id, t.course_id, 'requested', NOW(), t.expiry_date, NOW(), NOW()
+      INSERT INTO training_records (employee_id, course_id, status, pending_reason, requested_at, prior_expiry_date, created_at, updated_at)
+      SELECT t.employee_id, t.course_id, 'pending', ${RENEWAL_PENDING_REASON_SQL}, NOW(), t.expiry_date, NOW(), NOW()
       FROM training_records t
       JOIN employees e ON e.id = t.employee_id
+      LEFT JOIN outsource_entities oe ON LOWER(TRIM(oe.name)) = LOWER(TRIM(e.organization))
       WHERE t.status = 'completed'
         AND t.expiry_date < CURRENT_DATE
         AND t.is_deleted IS NOT TRUE

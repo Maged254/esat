@@ -4109,15 +4109,20 @@ app.put('/api/training-records/:id/cancel', auth, async (req, res) => {
   } catch(e) { sendError(res, e); }
 });
 
-// Undo a removal -- the mirror of /cancel, same roles. Removing is easy to do by
-// mistake and used to be permanent (the record could only be resurrected from the
-// database), so a request removed in error comes straight back here: open again,
-// keeping the pending reason and the "Expired on <date>" history it was carrying.
-// It only fails if the person has since picked up another open record for the same
-// course, which the one-open-request index would reject anyway.
+// Undo a removal. Removing is easy to do by mistake and used to be permanent
+// (the record could only be resurrected from the database), so a request removed
+// in error comes straight back here: open again, keeping the pending reason and
+// the "Expired on <date>" history it was carrying. It only fails if the person
+// has since picked up another open record for the same course, which the
+// one-open-request index would reject anyway.
+//
+// ADMIN ONLY -- narrower than /cancel, which EHS managers may also use. Restoring
+// clears the removal outright (who removed it, when and why), and nothing else
+// records that it ever happened, so it is deliberately held to the role that is
+// accountable for the data.
 app.put('/api/training-records/:id/restore', auth, async (req, res) => {
-  if (!TRAINING_REQUEST_ROLES.includes(req.user.role)) {
-    return res.status(403).json({ error: 'Not authorized to restore training requests' });
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin only' });
   }
   try {
     const { rows: [rec] } = await pool.query(

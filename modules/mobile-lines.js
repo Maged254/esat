@@ -16,7 +16,7 @@
 const OPERATORS = ['safaricom', 'airtel'];
 const LINE_STATUSES = ['available', 'assigned', 'terminated'];
 
-module.exports = function mobileLinesModule({ express, pool, auth, inScope, getProjectFilter, getClientFilter, sendError }) {
+module.exports = function mobileLinesModule({ express, pool, auth, inScope, getProjectFilter, getClientFilter, sendError, sendMail, mailWrap }) {
   const router = express.Router();
 
   // ── Schema ────────────────────────────────────────────────
@@ -485,6 +485,7 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
 
   router.get('/', auth, CAN_VIEW, async (req, res) => {
     try {
+      await releaseLinesForExitedEmployees(); // keeps the register honest about who still holds what
       const params = [];
       const where = await registerWhere(req, params);
       if (where === null) return res.json({ rows: [], total: 0, page: 1, pageSize: 25 });
@@ -794,6 +795,255 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
     }
   });
 
+  // ── Assignment ────────────────────────────────────────────
+  // Available lines are HR's working screen. A supervisor or project director
+  // must never see them: an unassigned line has no project, so it is out of their
+  // scope by construction -- but the endpoint refuses them outright as well,
+  // because "not visible in the register" is not the same as "not reachable".
+  router.get('/available/list', auth, HR_ADMIN, async (req, res) => {
+    try {
+      await releaseLinesForExitedEmployees(); // a line freed by an exit belongs here immediately
+      const params = [];
+      let w = ` WHERE l.status = 'available'`;
+      if (req.query.operator) { params.push(req.query.operator.split(',')); w += ` AND l.operator = ANY($${params.length})`; }
+      if (req.query.search) { params.push(`%${req.query.search}%`); w += ` AND l.mobile_number ILIKE $${params.length}`; }
+      const { rows } = await pool.query(`
+        SELECT l.id, l.mobile_number, l.operator, l.available_since, l.cug_enabled, l.roaming_enabled,
+               l.monthly_price_snapshot, p.package_name, c.credit_limit,
+               prev.employee_name_snapshot AS previous_employee,
+               prev.released_at AS previous_released_at, prev.release_reason AS previous_release_reason
+          FROM mobile_lines l
+          LEFT JOIN telecom_packages p ON p.id = l.current_package_id
+          LEFT JOIN telecom_credit_limits c ON c.id = l.current_credit_limit_id
+          LEFT JOIN LATERAL (
+            SELECT employee_name_snapshot, released_at, release_reason
+              FROM mobile_line_assignments a
+             WHERE a.mobile_line_id = l.id AND a.released_at IS NOT NULL
+             ORDER BY a.released_at DESC LIMIT 1) prev ON TRUE
+          ${w}
+         ORDER BY l.available_since DESC NULLS LAST, l.mobile_number`, params);
+      res.json(rows);
+    } catch (e) { sendError(res, e); }
+  });
+
+  // Assign a line to an employee. Everything here is one transaction: the line,
+  // its holder and the history row are a single fact, and a half-applied
+  // assignment is exactly what the one-line-per-employee rule exists to prevent.
+  router.post('/:id/assign', auth, HR_ADMIN, async (req, res) => {
+    const { employee_id } = req.body;
+    if (!employee_id) return res.status(400).json({ error: 'Select an employee' });
+    const db = await pool.connect();
+    try {
+      await db.query('BEGIN');
+      const { rows: [line] } = await db.query(
+        `SELECT * FROM mobile_lines WHERE id = $1 FOR UPDATE`, [req.params.id]);
+      if (!line) { await db.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+      if (line.status === 'terminated') { await db.query('ROLLBACK'); return res.status(400).json({ error: 'This line is terminated and cannot be assigned' }); }
+      if (line.status === 'assigned') { await db.query('ROLLBACK'); return res.status(400).json({ error: 'This line is already assigned — release it first' }); }
+
+      const { rows: [emp] } = await db.query(
+        `SELECT id, full_name, employee_number, national_id, project, client, employment_status
+           FROM employees WHERE id = $1`, [employee_id]);
+      if (!emp) { await db.query('ROLLBACK'); return res.status(404).json({ error: 'Employee not found' }); }
+      if (emp.employment_status !== 'active') { await db.query('ROLLBACK'); return res.status(400).json({ error: `${emp.full_name} is not an active employee` }); }
+
+      const { rows: held } = await db.query(
+        `SELECT mobile_number FROM mobile_lines WHERE current_employee_id = $1 AND status = 'assigned'`, [employee_id]);
+      if (held.length) {
+        await db.query('ROLLBACK');
+        return res.status(400).json({ error: `${emp.full_name} already holds ${held[0].mobile_number}. An employee can only have one company line.` });
+      }
+
+      await db.query(
+        `UPDATE mobile_lines SET status='assigned', current_employee_id=$1,
+           current_assignment_date=NOW(), available_since=NULL, updated_at=NOW() WHERE id=$2`,
+        [employee_id, req.params.id]);
+      await db.query(
+        `INSERT INTO mobile_line_assignments (mobile_line_id, mobile_number_snapshot, employee_id,
+           employee_number_snapshot, employee_name_snapshot, national_id_snapshot,
+           project_snapshot, client_snapshot, assigned_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [line.id, line.mobile_number, emp.id, emp.employee_number, emp.full_name,
+         emp.national_id, emp.project, emp.client, req.user.id]);
+      await db.query('COMMIT');
+      await logEvent({ entityType: 'line', entityId: line.id, action: 'assigned', from: line.status, to: 'assigned',
+        user: req.user, detail: `${line.mobile_number} → ${emp.full_name}${emp.project ? ` (${emp.project})` : ''}` });
+      const { rows: [fresh] } = await pool.query(`${LINE_SELECT} WHERE l.id = $1`, [line.id]);
+      res.json(fresh);
+    } catch (e) {
+      await db.query('ROLLBACK').catch(() => {});
+      if (e.code === '23505') return res.status(400).json({ error: 'That employee already holds a company line' });
+      sendError(res, e);
+    } finally { db.release(); }
+  });
+
+  // Release a line by hand. The configuration is deliberately left alone: the
+  // number keeps its package, credit limit, CUG and roaming so it can be handed
+  // to the next person as-is -- which is also why an idle line keeps costing money.
+  const releaseLine = async (db, line, { reason, user }) => {
+    await db.query(
+      `UPDATE mobile_line_assignments SET released_at = NOW(), released_by = $1, release_reason = $2
+        WHERE mobile_line_id = $3 AND released_at IS NULL`,
+      [user?.id || null, reason, line.id]);
+    await db.query(
+      `UPDATE mobile_lines SET status='available', current_employee_id=NULL,
+         current_assignment_date=NULL, available_since=NOW(), updated_at=NOW() WHERE id=$1`,
+      [line.id]);
+  };
+
+  const RELEASE_REASONS = ['reassignment', 'administrative_correction', 'line_terminated', 'employee_exit'];
+
+  router.post('/:id/release', auth, HR_ADMIN, async (req, res) => {
+    const reason = req.body?.release_reason;
+    if (!RELEASE_REASONS.includes(reason)) {
+      return res.status(400).json({ error: 'Choose why the line is being released' });
+    }
+    const db = await pool.connect();
+    try {
+      await db.query('BEGIN');
+      const { rows: [line] } = await db.query(
+        `SELECT l.*, e.full_name FROM mobile_lines l LEFT JOIN employees e ON e.id = l.current_employee_id
+          WHERE l.id = $1 FOR UPDATE OF l`, [req.params.id]);
+      if (!line) { await db.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+      if (line.status !== 'assigned') { await db.query('ROLLBACK'); return res.status(400).json({ error: 'This line is not assigned to anyone' }); }
+      await releaseLine(db, line, { reason, user: req.user });
+      await db.query('COMMIT');
+      await logEvent({ entityType: 'line', entityId: line.id, action: 'released', from: 'assigned', to: 'available',
+        user: req.user, detail: `${line.mobile_number} released from ${line.full_name || 'unknown'} — ${reason.replace(/_/g, ' ')}` });
+      const { rows: [fresh] } = await pool.query(`${LINE_SELECT} WHERE l.id = $1`, [line.id]);
+      res.json(fresh);
+    } catch (e) {
+      await db.query('ROLLBACK').catch(() => {});
+      sendError(res, e);
+    } finally { db.release(); }
+  });
+
+  // Terminate: the number is gone for good. Admin only, and final -- a terminated
+  // line can never be assigned again, which is why it releases its holder first.
+  router.post('/:id/terminate', auth, ADMIN, async (req, res) => {
+    const reason = req.body?.reason;
+    if (!reason || !reason.trim()) return res.status(400).json({ error: 'A reason is required to terminate a line' });
+    const db = await pool.connect();
+    try {
+      await db.query('BEGIN');
+      const { rows: [line] } = await db.query(
+        `SELECT l.*, e.full_name FROM mobile_lines l LEFT JOIN employees e ON e.id = l.current_employee_id
+          WHERE l.id = $1 FOR UPDATE OF l`, [req.params.id]);
+      if (!line) { await db.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
+      if (line.status === 'terminated') { await db.query('ROLLBACK'); return res.status(400).json({ error: 'This line is already terminated' }); }
+      if (line.status === 'assigned') await releaseLine(db, line, { reason: 'line_terminated', user: req.user });
+      await db.query(
+        `UPDATE mobile_lines SET status='terminated', current_employee_id=NULL, current_assignment_date=NULL,
+           available_since=NULL, terminated_at=NOW(), terminated_by=$1, updated_at=NOW() WHERE id=$2`,
+        [req.user.id, line.id]);
+      await db.query('COMMIT');
+      await logEvent({ entityType: 'line', entityId: line.id, action: 'terminated', from: line.status, to: 'terminated',
+        user: req.user, detail: `${line.mobile_number}${line.full_name ? ` (released from ${line.full_name})` : ''} — "${reason.trim()}"` });
+      res.json({ ok: true });
+    } catch (e) {
+      await db.query('ROLLBACK').catch(() => {});
+      sendError(res, e);
+    } finally { db.release(); }
+  });
+
+  // Delete a line outright. For a row that should never have existed -- a typo, a
+  // test, a duplicate. Refused once the line has any history, because at that
+  // point it is a record of something real and Terminate is the honest answer.
+  router.delete('/:id', auth, ADMIN, async (req, res) => {
+    try {
+      const { rows: [line] } = await pool.query('SELECT * FROM mobile_lines WHERE id=$1', [req.params.id]);
+      if (!line) return res.status(404).json({ error: 'Not found' });
+      const { rows: [{ count }] } = await pool.query(
+        `SELECT (SELECT COUNT(*) FROM mobile_line_assignments WHERE mobile_line_id=$1)
+              + (SELECT COUNT(*) FROM mobile_change_requests WHERE mobile_line_id=$1) AS count`, [req.params.id]);
+      if (Number(count) > 0) {
+        return res.status(400).json({ error: 'This line has history — terminate it instead of deleting it' });
+      }
+      await pool.query('DELETE FROM mobile_lines WHERE id=$1', [req.params.id]);
+      await logEvent({ entityType: 'line', entityId: null, action: 'line_deleted', from: line.status, user: req.user,
+        detail: `${line.operator} ${line.mobile_number} deleted — no history` });
+      res.json({ ok: true });
+    } catch (e) { sendError(res, e); }
+  });
+
+  // ── Employee exit → automatic release ─────────────────────
+  // An employee is exited in more than one place: manually through the employee
+  // screen, and silently by the SharePoint sync's bulk upsert. Hooking a single
+  // endpoint would miss most real exits, so this is a sweep -- it looks at the
+  // state of the world rather than trusting an event, the same approach as the
+  // training expiry sweep. Idempotent, so calling it often is free.
+  const releaseLinesForExitedEmployees = async () => {
+    try {
+      const { rows: due } = await pool.query(`
+        SELECT l.id, l.mobile_number, l.operator, e.full_name, e.employee_number, e.project, e.client
+          FROM mobile_lines l JOIN employees e ON e.id = l.current_employee_id
+         WHERE l.status = 'assigned' AND e.employment_status <> 'active'`);
+      if (!due.length) return [];
+      const db = await pool.connect();
+      try {
+        for (const line of due) {
+          await db.query('BEGIN');
+          await releaseLine(db, line, { reason: 'employee_exit', user: null });
+          await db.query('COMMIT');
+          await logEvent({ entityType: 'line', entityId: line.id, action: 'auto_released', from: 'assigned', to: 'available',
+            user: null, detail: `${line.mobile_number} released automatically — ${line.full_name} exited` });
+        }
+      } catch (e) {
+        await db.query('ROLLBACK').catch(() => {});
+        throw e;
+      } finally { db.release(); }
+      await notifyReleased(due);
+      return due;
+    } catch (e) {
+      console.error('mobile line exit sweep failed:', e.message);
+      return [];
+    }
+  };
+
+  // One email per sweep, not one per line: an exit run that ends twenty contracts
+  // should not produce twenty messages.
+  const notifyReleased = async (lines) => {
+    if (!lines.length || !sendMail) return;
+    try {
+      const rows = lines.map(l => `
+        <tr>
+          <td style="padding:6px 10px;border:1px solid #ddd;">${l.mobile_number}</td>
+          <td style="padding:6px 10px;border:1px solid #ddd;">${l.operator === 'safaricom' ? 'Safaricom' : 'Airtel'}</td>
+          <td style="padding:6px 10px;border:1px solid #ddd;">${l.full_name || '—'}</td>
+          <td style="padding:6px 10px;border:1px solid #ddd;">${l.project || '—'}</td>
+        </tr>`).join('');
+      await sendMail({
+        subject: `OneHub — ${lines.length} Mobile Line${lines.length > 1 ? 's' : ''} Released`,
+        html: mailWrap(`
+          <p>Hello HR Team,</p>
+          <p><strong>${lines.length} company mobile line${lines.length > 1 ? 's have' : ' has'}</strong> been released automatically because the holder is no longer an active employee. ${lines.length > 1 ? 'They are' : 'It is'} now available to assign, with the package, credit limit, CUG and roaming left exactly as ${lines.length > 1 ? 'they were' : 'it was'}.</p>
+          <table style="border-collapse:collapse;font-size:10.5pt;">
+            <tr>
+              <th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">Mobile Number</th>
+              <th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">Operator</th>
+              <th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">Previous Holder</th>
+              <th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">Project</th>
+            </tr>
+            ${rows}
+          </table>
+          <p>Please reassign in OneHub → Mobile Lines → Available Lines.</p>
+        `),
+      });
+    } catch (e) { console.error('mobile line release email failed:', e.message); }
+  };
+
+  router.get('/:id/assignment-history', auth, CAN_VIEW, async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT a.*, u.full_name AS assigned_by_name, ru.full_name AS released_by_name
+           FROM mobile_line_assignments a
+           LEFT JOIN users u ON u.id = a.assigned_by
+           LEFT JOIN users ru ON ru.id = a.released_by
+          WHERE a.mobile_line_id = $1 ORDER BY a.assigned_at DESC`, [req.params.id]);
+      res.json(rows);
+    } catch (e) { sendError(res, e); }
+  });
+
   // ── Audit read ────────────────────────────────────────────
   router.get('/:id/events', auth, CAN_VIEW, async (req, res) => {
     try {
@@ -805,5 +1055,5 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
     } catch (e) { sendError(res, e); }
   });
 
-  return { router, setup, logEvent, normaliseNumber, OPERATORS, LINE_STATUSES };
+  return { router, setup, logEvent, normaliseNumber, releaseLinesForExitedEmployees, OPERATORS, LINE_STATUSES };
 };

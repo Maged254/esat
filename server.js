@@ -957,8 +957,12 @@ const inScope = async (user, project, client) => {
 // rather than importing, so this stays the only place that builds the pool, the
 // auth middleware and the scope helpers. Mounted here, below those definitions;
 // its schema migrates from setupDB above.
+// The mail helpers are defined much further down, so they go in as thunks --
+// evaluated when a mail is actually sent, not when the module is constructed.
 const mobileLines = require('./modules/mobile-lines')({
   express, pool, auth, inScope, getProjectFilter, getClientFilter, sendError,
+  sendMail: (opts) => resend.emails.send({ from: 'OneHub <esat@egypro.app>', to: 'e.maged@outlook.com', ...opts }),
+  mailWrap: (html) => mailWrap(html),
 });
 app.use('/api/mobile-lines', mobileLines.router);
 
@@ -1597,6 +1601,11 @@ app.put('/api/employees/:id/status', auth, async (req, res) => {
     await client.query('COMMIT');
     const { rows } = await pool.query('SELECT * FROM employees WHERE id=$1', [req.params.id]);
     broadcastEmployeesChanged();
+    // Free any company mobile line this person was holding. The sweep also runs
+    // on a schedule and on the Mobile Lines screens, because an exit can arrive
+    // through the SharePoint sync instead of here -- this call just makes the
+    // common case immediate. Deliberately not awaited into the response.
+    if (employment_status === 'exit') mobileLines.releaseLinesForExitedEmployees().catch(() => {});
     res.json(rows[0]);
   } catch(e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: 'Server error' }); }
   finally { client.release(); }
@@ -5262,6 +5271,10 @@ function scheduleDailyDigest() {
   scheduleAt(6, 10, 'Courier distributions digest', sendDailyCourierDistributionDigest); // 9:10am EAT
   scheduleHourly('Casual updates digest', sendHourlyCasualDigest); // top of every hour
   scheduleAt(2,  0, 'Log prune', pruneOldRequestLogs);      // 5:00am EAT
+  // Backstop for the mobile-line exit release. The register and Available Lines
+  // both sweep on load, so this only matters if nobody opens either screen for a
+  // day -- but that is exactly when a released line would go unnoticed.
+  scheduleAt(5, 10, 'Mobile line exit release', mobileLines.releaseLinesForExitedEmployees); // 8:10am EAT
 }
 
 app.post('/api/admin/test-bts-digest', auth, async (req, res) => {

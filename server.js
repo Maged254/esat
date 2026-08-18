@@ -746,6 +746,10 @@ async function setupDB() {
       ON CONFLICT DO NOTHING
     `);
 
+    // Mobile Lines owns its own schema (see modules/mobile-lines.js) but migrates
+    // inside this same boot pass, so a deploy is still one migration step.
+    await mobileLines.setup(client);
+
     console.log("Database setup complete");
   } catch(e) {
     console.error('DB setup error:', e.message);
@@ -948,6 +952,16 @@ const inScope = async (user, project, client) => {
   if (clientFilter !== null && !clientFilter.includes(client)) return false;
   return true;
 };
+// ── Mobile Lines module ────────────────────────────────────
+// The first domain split out of this file. It takes what it needs by injection
+// rather than importing, so this stays the only place that builds the pool, the
+// auth middleware and the scope helpers. Mounted here, below those definitions;
+// its schema migrates from setupDB above.
+const mobileLines = require('./modules/mobile-lines')({
+  express, pool, auth, inScope, getProjectFilter, getClientFilter, sendError,
+});
+app.use('/api/mobile-lines', mobileLines.router);
+
 // Looks up the project/client of the employee or casual behind an id.
 const getPersonScope = async (id) => {
   const { rows } = await pool.query(

@@ -375,6 +375,53 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
     }
   });
 
+  // Delete a catalogue item. Only ever allowed while NOTHING references it -- a
+  // package that has been used is part of the record of what a line carried and
+  // what was asked of the operator, and Retire is the answer for those. So this
+  // is really "undo adding it", for a typo or a duplicate.
+  const catalogueUsage = async (kind, id) => {
+    const col = kind === 'package' ? 'current_package_id' : 'current_credit_limit_id';
+    const { rows: [u] } = await pool.query(`
+      SELECT (SELECT COUNT(*) FROM mobile_lines WHERE ${col} = $1)::int AS lines,
+             (SELECT COUNT(*) FROM mobile_change_request_items
+               WHERE current_value_id = $1 OR original_requested_id = $1 OR approved_id = $1)::int AS requests`, [id]);
+    return u;
+  };
+
+  router.delete('/products/packages/:id', auth, ADMIN, async (req, res) => {
+    try {
+      const { rows: [pkg] } = await pool.query('SELECT * FROM telecom_packages WHERE id=$1', [req.params.id]);
+      if (!pkg) return res.status(404).json({ error: 'Not found' });
+      const u = await catalogueUsage('package', req.params.id);
+      if (u.lines || u.requests) {
+        return res.status(400).json({
+          error: `"${pkg.package_name}" is in use — ${[u.lines && `${u.lines} line${u.lines > 1 ? 's' : ''}`, u.requests && `${u.requests} change request${u.requests > 1 ? 's' : ''}`].filter(Boolean).join(' and ')} reference it. Retire it instead, so those records keep reading correctly.`,
+        });
+      }
+      await pool.query('DELETE FROM telecom_packages WHERE id=$1', [req.params.id]);
+      await logEvent({ entityType: 'package', entityId: null, action: 'catalogue_deleted', user: req.user,
+        detail: `${pkg.operator} package "${pkg.package_name}" deleted — never used` });
+      res.json({ ok: true });
+    } catch (e) { sendError(res, e); }
+  });
+
+  router.delete('/products/credit-limits/:id', auth, ADMIN, async (req, res) => {
+    try {
+      const { rows: [lim] } = await pool.query('SELECT * FROM telecom_credit_limits WHERE id=$1', [req.params.id]);
+      if (!lim) return res.status(404).json({ error: 'Not found' });
+      const u = await catalogueUsage('credit_limit', req.params.id);
+      if (u.lines || u.requests) {
+        return res.status(400).json({
+          error: `That credit limit is in use — ${[u.lines && `${u.lines} line${u.lines > 1 ? 's' : ''}`, u.requests && `${u.requests} change request${u.requests > 1 ? 's' : ''}`].filter(Boolean).join(' and ')} reference it. Retire it instead, so those records keep reading correctly.`,
+        });
+      }
+      await pool.query('DELETE FROM telecom_credit_limits WHERE id=$1', [req.params.id]);
+      await logEvent({ entityType: 'credit_limit', entityId: null, action: 'catalogue_deleted', user: req.user,
+        detail: `${lim.operator} credit limit ${lim.credit_limit} deleted — never used` });
+      res.json({ ok: true });
+    } catch (e) { sendError(res, e); }
+  });
+
   router.get('/products/credit-limits', auth, CAN_VIEW, async (req, res) => {
     try {
       const { operator, include_inactive } = req.query;

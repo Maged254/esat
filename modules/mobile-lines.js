@@ -1319,8 +1319,17 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
       const r = await loadRequest(req.params.id);
       if (!r) return res.status(404).json({ error: 'Not found' });
       if (!(await inScope(req.user, r.project_snapshot, r.client_snapshot))) return res.status(404).json({ error: 'Not found' });
-      if (r.status !== 'pending_approval') {
-        return res.status(400).json({ error: `This request is ${r.status.replace(/_/g, ' ')} and can no longer be cancelled` });
+      // A requester may withdraw only while nobody has acted. An admin may also
+      // pull back an APPROVED request, but only while it is still sitting in the
+      // queue -- once it is in a prepared or sent email the operator has been
+      // told, and unwinding it is a conversation, not a button.
+      const withdrawable = req.user.role === 'admin' ? ['pending_approval', 'approved'] : ['pending_approval'];
+      if (!withdrawable.includes(r.status)) {
+        return res.status(400).json({
+          error: r.status === 'approved'
+            ? 'This request is approved and awaiting its operator email — only an admin can pull it back.'
+            : `This request is ${r.status.replace(/_/g, ' ')} and can no longer be cancelled`,
+        });
       }
       if (req.user.role !== 'admin' && r.requested_by !== req.user.id) {
         return res.status(403).json({ error: 'You can only cancel a request you raised' });
@@ -1328,8 +1337,8 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
       await pool.query(
         `UPDATE mobile_change_requests SET status='cancelled', cancelled_by=$1, cancelled_at=NOW(), updated_at=NOW() WHERE id=$2`,
         [req.user.id, req.params.id]);
-      await logEvent({ entityType: 'request', entityId: r.id, action: 'request_cancelled', from: 'pending_approval', to: 'cancelled',
-        user: req.user, detail: `${r.mobile_number} · ${r.employee_name_snapshot}` });
+      await logEvent({ entityType: 'request', entityId: r.id, action: 'request_cancelled', from: r.status, to: 'cancelled',
+        user: req.user, detail: `${r.mobile_number} · ${r.employee_name_snapshot}${r.status === 'approved' ? ' — pulled back after approval, before any operator email' : ''}` });
       res.json(await loadRequest(req.params.id));
     } catch (e) { sendError(res, e); }
   });
@@ -1429,5 +1438,231 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
     });
   };
 
-  return { router, requests, setup, logEvent, normaliseNumber, releaseLinesForExitedEmployees, OPERATORS, LINE_STATUSES };
+  // ── Operator email ────────────────────────────────────────
+  // Approved requests wait in a queue. An admin gathers them into ONE email per
+  // operator, reads it, and sends it. Nothing is sent automatically, and
+  // Safaricom and Airtel can never share a batch.
+  //
+  // The safety switch: a configuration ships INACTIVE and addressed to the
+  // OneHub owner. Sending is refused while it is inactive, so the first real
+  // message to a telecom operator is a deliberate act, never a side effect of
+  // testing.
+  const batches = express.Router();
+
+  batches.get('/settings', auth, ADMIN, async (req, res) => {
+    try {
+      const { rows } = await pool.query('SELECT * FROM operator_email_settings ORDER BY operator');
+      res.json(rows);
+    } catch (e) { sendError(res, e); }
+  });
+
+  batches.put('/settings/:operator', auth, ADMIN, async (req, res) => {
+    const { to_recipients, cc_recipients, subject_template, body_template, is_active } = req.body;
+    if (!OPERATORS.includes(req.params.operator)) return res.status(400).json({ error: 'Unknown operator' });
+    const emails = String(to_recipients || '').split(/[;,]/).map(s => s.trim()).filter(Boolean);
+    if (is_active && !emails.length) {
+      return res.status(400).json({ error: 'Add at least one recipient before switching this operator live' });
+    }
+    const bad = [...emails, ...String(cc_recipients || '').split(/[;,]/).map(s => s.trim()).filter(Boolean)]
+      .filter(e => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e));
+    if (bad.length) return res.status(400).json({ error: `Not a valid email address: ${bad[0]}` });
+    try {
+      const { rows: [before] } = await pool.query('SELECT * FROM operator_email_settings WHERE operator=$1', [req.params.operator]);
+      const { rows: [s] } = await pool.query(
+        `UPDATE operator_email_settings SET to_recipients=$1, cc_recipients=$2, subject_template=$3,
+           body_template=$4, is_active=COALESCE($5, is_active), updated_by=$6, updated_at=NOW()
+         WHERE operator=$7 RETURNING *`,
+        [to_recipients || '', cc_recipients || '', subject_template || '', body_template || '',
+         is_active === undefined ? null : !!is_active, req.user.id, req.params.operator]);
+      if (before && before.is_active !== s.is_active) {
+        await logEvent({ entityType: 'email_settings', entityId: s.id,
+          action: s.is_active ? 'operator_email_went_live' : 'operator_email_disabled', user: req.user,
+          detail: `${s.operator} → ${s.is_active ? `LIVE, sending to ${s.to_recipients}` : 'inactive'}` });
+      } else {
+        await logEvent({ entityType: 'email_settings', entityId: s.id, action: 'operator_email_settings_updated',
+          user: req.user, detail: `${s.operator} recipients/template updated` });
+      }
+      res.json(s);
+    } catch (e) { sendError(res, e); }
+  });
+
+  // The change table. One row per changed field, so a person appears as many
+  // times as they have changes -- which is what the operator has to action.
+  const renderBatchRows = (rows) => rows.map(r => `
+      <tr>
+        <td style="padding:6px 10px;border:1px solid #ddd;">${r.mobile_number}</td>
+        <td style="padding:6px 10px;border:1px solid #ddd;">${r.employee_name_snapshot || '—'}</td>
+        <td style="padding:6px 10px;border:1px solid #ddd;">${r.project_snapshot || '—'}</td>
+        <td style="padding:6px 10px;border:1px solid #ddd;">${FIELD_LABEL[r.field_name]}</td>
+        <td style="padding:6px 10px;border:1px solid #ddd;">${r.current_value_snapshot ?? '—'}</td>
+        <td style="padding:6px 10px;border:1px solid #ddd;"><strong>${r.approved_value}</strong></td>
+      </tr>`).join('');
+
+  const renderBatchBody = (intro, rows) => mailWrap(`
+      ${intro.split('\n').filter(Boolean).map(p => `<p>${p}</p>`).join('')}
+      <table style="border-collapse:collapse;font-size:10.5pt;">
+        <tr>
+          <th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">Mobile Number</th>
+          <th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">Employee</th>
+          <th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">Project</th>
+          <th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">Item</th>
+          <th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">Current</th>
+          <th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">Requested</th>
+        </tr>
+        ${renderBatchRows(rows)}
+      </table>
+      <p>Kindly confirm once these have been applied.</p>
+    `);
+
+  // Only the items that are genuinely a change reach the operator: an approved
+  // value equal to what the line already has is dropped here as well as at
+  // approval, because an admin edit could have made it a no-op.
+  const batchItems = async (requestIds) => {
+    const { rows } = await pool.query(`
+      SELECT r.id AS request_id, l.mobile_number, r.employee_name_snapshot, r.project_snapshot,
+             i.field_name, i.current_value_snapshot, i.approved_value
+        FROM mobile_change_requests r
+        JOIN mobile_lines l ON l.id = r.mobile_line_id
+        JOIN mobile_change_request_items i ON i.request_id = r.id
+       WHERE r.id = ANY($1::uuid[])
+         AND COALESCE(i.approved_value,'') <> COALESCE(i.current_value_snapshot,'')
+       ORDER BY l.mobile_number, i.field_name`, [requestIds]);
+    return rows;
+  };
+
+  batches.post('/prepare', auth, ADMIN, async (req, res) => {
+    const { operator, request_ids } = req.body;
+    if (!OPERATORS.includes(operator)) return res.status(400).json({ error: 'Choose Safaricom or Airtel' });
+    if (!Array.isArray(request_ids) || !request_ids.length) return res.status(400).json({ error: 'Select at least one approved request' });
+    const db = await pool.connect();
+    try {
+      const { rows: reqs } = await db.query(
+        `SELECT id, status, operator FROM mobile_change_requests WHERE id = ANY($1::uuid[])`, [request_ids]);
+      if (reqs.length !== request_ids.length) return res.status(400).json({ error: 'One of those requests no longer exists' });
+      const wrongStatus = reqs.find(r => r.status !== 'approved');
+      if (wrongStatus) return res.status(400).json({ error: `A selected request is ${wrongStatus.status.replace(/_/g, ' ')}, not awaiting its email` });
+      const wrongOperator = reqs.find(r => r.operator !== operator);
+      if (wrongOperator) return res.status(400).json({ error: 'Safaricom and Airtel changes cannot share one email' });
+
+      const { rows: [settings] } = await db.query('SELECT * FROM operator_email_settings WHERE operator=$1', [operator]);
+      const items = await batchItems(request_ids);
+      if (!items.length) return res.status(400).json({ error: 'None of those requests still contain a change' });
+
+      const subject = `${settings?.subject_template || `OneHub — ${operator} Line Changes`} (${items.length} change${items.length > 1 ? 's' : ''})`;
+      const body = renderBatchBody(settings?.body_template || 'Hello,', items);
+
+      await db.query('BEGIN');
+      const { rows: [batch] } = await db.query(
+        `INSERT INTO telecom_email_batches (operator, recipient_to_snapshot, recipient_cc_snapshot,
+           subject_snapshot, body_snapshot, status, prepared_by)
+         VALUES ($1,$2,$3,$4,$5,'prepared',$6) RETURNING *`,
+        [operator, settings?.to_recipients || '', settings?.cc_recipients || '', subject, body, req.user.id]);
+      for (const id of request_ids) {
+        await db.query('INSERT INTO telecom_email_batch_requests (email_batch_id, change_request_id) VALUES ($1,$2)', [batch.id, id]);
+        await db.query(`UPDATE mobile_change_requests SET status='email_prepared', updated_at=NOW() WHERE id=$1`, [id]);
+      }
+      await db.query('COMMIT');
+      await logEvent({ entityType: 'batch', entityId: batch.id, action: 'email_prepared', to: 'prepared', user: req.user,
+        detail: `${operator} — ${request_ids.length} request(s), ${items.length} change(s)` });
+      res.status(201).json({ ...batch, items, is_active: !!settings?.is_active });
+    } catch (e) {
+      await db.query('ROLLBACK').catch(() => {});
+      sendError(res, e);
+    } finally { db.release(); }
+  });
+
+  batches.get('/', auth, ADMIN, async (req, res) => {
+    try {
+      const { rows } = await pool.query(`
+        SELECT b.*, u.full_name AS prepared_by_name, su.full_name AS sent_by_name,
+               (SELECT COUNT(*)::int FROM telecom_email_batch_requests x WHERE x.email_batch_id = b.id) AS request_count
+          FROM telecom_email_batches b
+          LEFT JOIN users u ON u.id = b.prepared_by
+          LEFT JOIN users su ON su.id = b.sent_by
+         ORDER BY b.prepared_at DESC LIMIT 100`);
+      res.json(rows);
+    } catch (e) { sendError(res, e); }
+  });
+
+  batches.get('/:id', auth, ADMIN, async (req, res) => {
+    try {
+      const { rows: [b] } = await pool.query(`
+        SELECT b.*, u.full_name AS prepared_by_name, su.full_name AS sent_by_name
+          FROM telecom_email_batches b
+          LEFT JOIN users u ON u.id = b.prepared_by
+          LEFT JOIN users su ON su.id = b.sent_by WHERE b.id=$1`, [req.params.id]);
+      if (!b) return res.status(404).json({ error: 'Not found' });
+      const { rows: [settings] } = await pool.query('SELECT is_active FROM operator_email_settings WHERE operator=$1', [b.operator]);
+      const { rows: reqs } = await pool.query(
+        `SELECT r.id, r.status, r.employee_name_snapshot, l.mobile_number
+           FROM telecom_email_batch_requests x
+           JOIN mobile_change_requests r ON r.id = x.change_request_id
+           JOIN mobile_lines l ON l.id = r.mobile_line_id
+          WHERE x.email_batch_id=$1`, [req.params.id]);
+      res.json({ ...b, requests: reqs, is_active: !!settings?.is_active });
+    } catch (e) { sendError(res, e); }
+  });
+
+  batches.post('/:id/send', auth, ADMIN, async (req, res) => {
+    const db = await pool.connect();
+    try {
+      const { rows: [batch] } = await db.query('SELECT * FROM telecom_email_batches WHERE id=$1', [req.params.id]);
+      if (!batch) return res.status(404).json({ error: 'Not found' });
+      if (batch.status !== 'prepared') return res.status(400).json({ error: `This batch is already ${batch.status}` });
+      const { rows: [settings] } = await db.query('SELECT * FROM operator_email_settings WHERE operator=$1', [batch.operator]);
+      // The safety switch. Refusing here rather than in the UI is the point.
+      if (!settings?.is_active) {
+        return res.status(400).json({
+          error: `${batch.operator === 'safaricom' ? 'Safaricom' : 'Airtel'} email is not live yet. Turn it on in Operator Email Settings once the recipients are right — until then nothing is sent.`,
+        });
+      }
+      if (!batch.recipient_to_snapshot) return res.status(400).json({ error: 'This batch has no recipient' });
+
+      await sendMail({
+        to: batch.recipient_to_snapshot.split(/[;,]/).map(s => s.trim()).filter(Boolean),
+        cc: batch.recipient_cc_snapshot ? batch.recipient_cc_snapshot.split(/[;,]/).map(s => s.trim()).filter(Boolean) : undefined,
+        subject: batch.subject_snapshot,
+        html: batch.body_snapshot,
+      });
+
+      await db.query('BEGIN');
+      await db.query(`UPDATE telecom_email_batches SET status='sent', sent_by=$1, sent_at=NOW() WHERE id=$2`, [req.user.id, batch.id]);
+      await db.query(`
+        UPDATE mobile_change_requests SET status='sent_to_operator', updated_at=NOW()
+         WHERE id IN (SELECT change_request_id FROM telecom_email_batch_requests WHERE email_batch_id=$1)`, [batch.id]);
+      await db.query('COMMIT');
+      await logEvent({ entityType: 'batch', entityId: batch.id, action: 'email_sent', from: 'prepared', to: 'sent', user: req.user,
+        detail: `${batch.operator} → ${batch.recipient_to_snapshot}` });
+      res.json({ ok: true });
+    } catch (e) {
+      await db.query('ROLLBACK').catch(() => {});
+      sendError(res, e);
+    } finally { db.release(); }
+  });
+
+  // Changed your mind before sending: the requests go back to the queue rather
+  // than being stranded in "Email Prepared" with nothing able to move them.
+  batches.post('/:id/discard', auth, ADMIN, async (req, res) => {
+    const db = await pool.connect();
+    try {
+      const { rows: [batch] } = await db.query('SELECT * FROM telecom_email_batches WHERE id=$1', [req.params.id]);
+      if (!batch) return res.status(404).json({ error: 'Not found' });
+      if (batch.status !== 'prepared') return res.status(400).json({ error: `This batch is already ${batch.status} and cannot be discarded` });
+      await db.query('BEGIN');
+      await db.query(`UPDATE telecom_email_batches SET status='discarded', discarded_by=$1, discarded_at=NOW() WHERE id=$2`, [req.user.id, batch.id]);
+      await db.query(`
+        UPDATE mobile_change_requests SET status='approved', updated_at=NOW()
+         WHERE status='email_prepared'
+           AND id IN (SELECT change_request_id FROM telecom_email_batch_requests WHERE email_batch_id=$1)`, [batch.id]);
+      await db.query('COMMIT');
+      await logEvent({ entityType: 'batch', entityId: batch.id, action: 'email_discarded', from: 'prepared', to: 'discarded',
+        user: req.user, detail: `${batch.operator} batch discarded — requests returned to the queue` });
+      res.json({ ok: true });
+    } catch (e) {
+      await db.query('ROLLBACK').catch(() => {});
+      sendError(res, e);
+    } finally { db.release(); }
+  });
+
+  return { router, requests, batches, setup, logEvent, normaliseNumber, releaseLinesForExitedEmployees, OPERATORS, LINE_STATUSES };
 };

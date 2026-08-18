@@ -4109,6 +4109,70 @@ app.put('/api/training-records/:id/cancel', auth, async (req, res) => {
   } catch(e) { sendError(res, e); }
 });
 
+// Undo a removal -- the mirror of /cancel, same roles. Removing is easy to do by
+// mistake and used to be permanent (the record could only be resurrected from the
+// database), so a request removed in error comes straight back here: open again,
+// keeping the pending reason and the "Expired on <date>" history it was carrying.
+// It only fails if the person has since picked up another open record for the same
+// course, which the one-open-request index would reject anyway.
+app.put('/api/training-records/:id/restore', auth, async (req, res) => {
+  if (!TRAINING_REQUEST_ROLES.includes(req.user.role)) {
+    return res.status(403).json({ error: 'Not authorized to restore training requests' });
+  }
+  try {
+    const { rows: [rec] } = await pool.query(
+      `SELECT t.status AS current_status, e.project, e.client, e.employment_status
+       FROM training_records t LEFT JOIN employees e ON e.id = t.employee_id
+       WHERE t.id = $1 AND t.is_deleted IS NOT TRUE AND t.employee_id IS NOT NULL`, [req.params.id]
+    );
+    if (!rec) return res.status(404).json({ error: 'Not found' });
+    if (!(await inScope(req.user, rec.project, rec.client))) return res.status(404).json({ error: 'Not found' });
+    if (rec.current_status !== 'cancelled') {
+      return res.status(400).json({ error: `This request is ${rec.current_status}, so there is nothing to restore` });
+    }
+    if (rec.employment_status !== 'active') {
+      return res.status(400).json({ error: 'Cannot restore a request for a non-active employee' });
+    }
+    // Keep whatever reason it was pending on before it was removed; fall back to
+    // the owning team if it never carried one (an old 'requested' record).
+    const { rows: [updated] } = await pool.query(
+      `UPDATE training_records t
+          SET status = 'pending',
+              pending_reason = COALESCE(NULLIF(TRIM(t.pending_reason), ''), ${PENDING_TEAM_REASON_SQL}),
+              cancel_reason = NULL, cancelled_by = NULL, cancelled_at = NULL, updated_at = NOW()
+         FROM employees e
+         LEFT JOIN outsource_entities oe ON LOWER(TRIM(oe.name)) = LOWER(TRIM(e.organization))
+        WHERE e.id = t.employee_id AND t.id = $1
+        RETURNING t.*`, [req.params.id]
+    );
+    res.json(updated);
+  } catch(e) {
+    if (e.code === '23505') {
+      return res.status(400).json({ error: 'This employee already has an open request for this training — resolve that one first.' });
+    }
+    sendError(res, e);
+  }
+});
+
+// Delete a training record outright (admin only, soft delete). This is for rows
+// that should never have existed -- a duplicate, a test, a mis-keyed entry --
+// not for ordinary outcomes, which have their own statuses. A completed record
+// is history (and may hold a certificate), so it can't be deleted here.
+app.delete('/api/training-records/:id', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    const { rows: [rec] } = await pool.query(
+      `SELECT status FROM training_records WHERE id = $1 AND is_deleted IS NOT TRUE`, [req.params.id]
+    );
+    if (!rec) return res.status(404).json({ error: 'Not found' });
+    if (rec.status === 'completed') {
+      return res.status(400).json({ error: 'A completed record is certificate history and cannot be deleted' });
+    }
+    await pool.query('UPDATE training_records SET is_deleted = TRUE, updated_at = NOW() WHERE id = $1', [req.params.id]);
+    res.json({ ok: true });
+  } catch(e) { sendError(res, e); }
+});
+
 // Start
 const PORT = 8080;
 

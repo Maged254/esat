@@ -540,6 +540,28 @@ async function setupDB() {
     await client.query("CREATE INDEX IF NOT EXISTS idx_tr_supersede ON training_records (course_id, employee_id, completed_at) WHERE status='completed' AND is_deleted IS NOT TRUE");
     await client.query("CREATE INDEX IF NOT EXISTS idx_tr_supersede_casual ON training_records (course_id, casual_id, completed_at) WHERE status='completed' AND is_deleted IS NOT TRUE");
 
+    // Append-only history of everything that happens to a training record. The
+    // record itself only ever holds its LATEST state -- recording an outcome or
+    // restoring a removed request overwrites what was there, so without this
+    // there is no way to tell who did what, or that it happened at all. Nothing
+    // updates or deletes rows here; the actor's name is copied in so the history
+    // survives the user being removed, and a NULL actor means the system did it
+    // (the expiry sweep).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS training_record_events (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        training_record_id UUID NOT NULL REFERENCES training_records(id) ON DELETE CASCADE,
+        action VARCHAR(30) NOT NULL,
+        from_status VARCHAR(30),
+        to_status VARCHAR(30),
+        detail TEXT,
+        changed_by UUID REFERENCES users(id),
+        changed_by_name TEXT,
+        changed_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    await client.query('CREATE INDEX IF NOT EXISTS idx_tre_record ON training_record_events (training_record_id, changed_at)');
+
     // Seed the initial course types carried over from ETMS -- but ONLY on a
     // brand-new (empty) table. Re-seeding on every boot would resurrect courses
     // the admin has since deleted/renamed, so it must not run once the table
@@ -3589,6 +3611,21 @@ const PENDING_TEAM_REASON_SQL = `CASE
         WHEN e.resource_type = 'outsource' AND oe.type = 'services' THEN 'Pending Operation Dept.'
         ELSE 'Pending HR Dept.' END`;
 
+// Append one line to a training record's history. `user` is the acting req.user,
+// or null for the system (the expiry sweep). Logging must never be the reason an
+// action fails, so a broken insert is reported and swallowed -- a missing history
+// line is a smaller problem than a refused update.
+const logTrainingEvent = async ({ recordId, action, from, to, detail, user }) => {
+  try {
+    await pool.query(
+      `INSERT INTO training_record_events
+         (training_record_id, action, from_status, to_status, detail, changed_by, changed_by_name)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [recordId, action, from || null, to || null, detail || null, user?.id || null, user ? (user.name || null) : 'System']
+    );
+  } catch (e) { console.error('training event log failed:', e.message); }
+};
+
 // When a certificate expires, a renewal has to happen -- so we auto-open a
 // `pending` record for it, which then flows through the normal Update process
 // (scheduled / completed) like any other request. It opens as Pending (not
@@ -3615,7 +3652,7 @@ const ensureRenewalRequests = async (courseId) => {
   let courseClause = '';
   if (courseId) { params.push(courseId); courseClause = ` AND t.course_id = $${params.length}`; }
   try {
-    await pool.query(`
+    const { rows: opened } = await pool.query(`
       INSERT INTO training_records (employee_id, course_id, status, pending_reason, requested_at, prior_expiry_date, created_at, updated_at)
       SELECT t.employee_id, t.course_id, 'pending', ${PENDING_TEAM_REASON_SQL}, NOW(), t.expiry_date, NOW(), NOW()
       FROM training_records t
@@ -3639,7 +3676,14 @@ const ensureRenewalRequests = async (courseId) => {
              AND d.is_deleted IS NOT TRUE
              AND d.status IN ('cancelled','not_eligible')
              AND d.prior_expiry_date = t.expiry_date)
+      RETURNING id, prior_expiry_date, pending_reason
     `, params);
+    for (const r of opened) {
+      await logTrainingEvent({
+        recordId: r.id, action: 'opened', to: 'pending', user: null,
+        detail: `Renewal opened automatically — certificate expired ${r.prior_expiry_date.toISOString().slice(0, 10)} (${r.pending_reason})`,
+      });
+    }
   } catch (e) {
     if (e.code !== '23505') throw e; // unique index caught a race -- already exists
   }
@@ -3922,6 +3966,19 @@ app.post('/api/training-records/:id/renew', auth, async (req, res) => {
        completed_at, (rec.no_expiry ? null : rec.validity_months), cost, partnership || null,
        rec.project || null, rec.client || null, rec.organization || null]
     );
+    // A renewal is a NEW record, so its history starts here -- and the certificate
+    // it supersedes gets a line too, since that is where anyone looking at the old
+    // one would go to find out what happened to it.
+    await logTrainingEvent({
+      recordId: rows[0].id, action: 'renewed', to: 'completed', user: req.user,
+      detail: `Renewed from the certificate completed ${rec.completed_at ? rec.completed_at.toISOString().slice(0, 10) : '—'}`
+            + `, new completion ${completed_at}`
+            + (rows[0].expiry_date ? `, expires ${rows[0].expiry_date.toISOString().slice(0, 10)}` : ' (no expiry)'),
+    });
+    await logTrainingEvent({
+      recordId: rec.id, action: 'superseded', from: 'completed', to: 'completed', user: req.user,
+      detail: `Renewed — replaced by the certificate completed ${completed_at}`,
+    });
     res.status(201).json(rows[0]);
   } catch(e) { sendError(res, e); }
 });
@@ -3989,6 +4046,14 @@ app.put('/api/training-records/:id/update', auth, async (req, res) => {
          rec.project || null, rec.client || null, rec.organization || null,
          req.user.id, req.params.id]
       );
+      // Recording an outcome overwrites the previous one, so note whether this was
+      // the first record or a correction to an existing certificate.
+      await logTrainingEvent({
+        recordId: req.params.id, action: 'completed', from: rec.current_status, to: 'completed', user: req.user,
+        detail: `${rec.current_status === 'completed' ? 'Corrected' : 'Recorded'} as completed ${completed_at}`
+              + (rows[0].expiry_date ? `, expires ${rows[0].expiry_date.toISOString().slice(0, 10)}` : ' (no expiry)')
+              + (partnership ? ` · ${partnership}` : ''),
+      });
       return res.json(rows[0]);
     }
 
@@ -3999,6 +4064,10 @@ app.put('/api/training-records/:id/update', auth, async (req, res) => {
         `UPDATE training_records SET status='pending', pending_reason=$1, recorded_by=$2, recorded_at=NOW(), updated_at=NOW() WHERE id=$3 RETURNING *`,
         [pending_reason.trim(), req.user.id, req.params.id]
       );
+      await logTrainingEvent({
+        recordId: req.params.id, action: 'pending', from: rec.current_status, to: 'pending', user: req.user,
+        detail: pending_reason.trim(),
+      });
       return res.json(rows[0]);
     }
 
@@ -4009,6 +4078,10 @@ app.put('/api/training-records/:id/update', auth, async (req, res) => {
         `UPDATE training_records SET status='scheduled', scheduled_date=$1, recorded_by=$2, recorded_at=NOW(), updated_at=NOW() WHERE id=$3 RETURNING *`,
         [scheduled_date, req.user.id, req.params.id]
       );
+      await logTrainingEvent({
+        recordId: req.params.id, action: 'scheduled', from: rec.current_status, to: 'scheduled', user: req.user,
+        detail: `Scheduled for ${scheduled_date}`,
+      });
       return res.json(rows[0]);
     }
 
@@ -4019,6 +4092,10 @@ app.put('/api/training-records/:id/update', auth, async (req, res) => {
       `UPDATE training_records SET status='not_eligible', not_eligible_reason=$1, recorded_by=$2, recorded_at=NOW(), updated_at=NOW() WHERE id=$3 RETURNING *`,
       [not_eligible_reason.trim(), req.user.id, req.params.id]
     );
+    await logTrainingEvent({
+      recordId: req.params.id, action: 'not_eligible', from: rec.current_status, to: 'not_eligible', user: req.user,
+      detail: not_eligible_reason.trim(),
+    });
     return res.json(rows[0]);
   } catch(e) {
     if (e.code === '23505') return res.status(400).json({ error: 'This employee already has an open request for this training — resolve that one first.' });
@@ -4071,6 +4148,10 @@ app.post('/api/training-requests', auth, async (req, res) => {
        RETURNING *`,
       [employee_id, course_id, req.user.id]
     );
+    await logTrainingEvent({
+      recordId: rec.id, action: 'opened', to: 'pending', user: req.user,
+      detail: `Requested${rec.prior_expiry_date ? ` — renewal, certificate expired ${rec.prior_expiry_date.toISOString().slice(0, 10)}` : ''} (${rec.pending_reason})`,
+    });
     res.json(rec);
   } catch(e) {
     // 23505 = the partial unique index: an open request already exists.
@@ -4105,6 +4186,10 @@ app.put('/api/training-records/:id/cancel', auth, async (req, res) => {
        WHERE id=$3 RETURNING *`,
       [cancel_reason.trim(), req.user.id, req.params.id]
     );
+    await logTrainingEvent({
+      recordId: req.params.id, action: 'removed', from: rec.current_status, to: 'cancelled', user: req.user,
+      detail: cancel_reason.trim(),
+    });
     res.json(updated);
   } catch(e) { sendError(res, e); }
 });
@@ -4125,9 +4210,14 @@ app.put('/api/training-records/:id/restore', auth, async (req, res) => {
     return res.status(403).json({ error: 'Admin only' });
   }
   try {
+    // The removal details are about to be cleared off the record, so read them
+    // first -- the history line is the only place they will survive.
     const { rows: [rec] } = await pool.query(
-      `SELECT t.status AS current_status, e.project, e.client, e.employment_status
-       FROM training_records t LEFT JOIN employees e ON e.id = t.employee_id
+      `SELECT t.status AS current_status, t.cancel_reason, t.cancelled_at, cu.full_name AS cancelled_by_name,
+              e.project, e.client, e.employment_status
+       FROM training_records t
+       LEFT JOIN employees e ON e.id = t.employee_id
+       LEFT JOIN users cu ON cu.id = t.cancelled_by
        WHERE t.id = $1 AND t.is_deleted IS NOT TRUE AND t.employee_id IS NOT NULL`, [req.params.id]
     );
     if (!rec) return res.status(404).json({ error: 'Not found' });
@@ -4150,6 +4240,12 @@ app.put('/api/training-records/:id/restore', auth, async (req, res) => {
         WHERE e.id = t.employee_id AND t.id = $1
         RETURNING t.*`, [req.params.id]
     );
+    await logTrainingEvent({
+      recordId: req.params.id, action: 'restored', from: 'cancelled', to: 'pending', user: req.user,
+      detail: `Undid the removal by ${rec.cancelled_by_name || 'unknown'}`
+            + (rec.cancelled_at ? ` on ${rec.cancelled_at.toISOString().slice(0, 10)}` : '')
+            + (rec.cancel_reason ? ` — "${rec.cancel_reason}"` : ''),
+    });
     res.json(updated);
   } catch(e) {
     if (e.code === '23505') {
@@ -4174,7 +4270,30 @@ app.delete('/api/training-records/:id', auth, async (req, res) => {
       return res.status(400).json({ error: 'A completed record is certificate history and cannot be deleted' });
     }
     await pool.query('UPDATE training_records SET is_deleted = TRUE, updated_at = NOW() WHERE id = $1', [req.params.id]);
+    await logTrainingEvent({
+      recordId: req.params.id, action: 'deleted', from: rec.status, to: 'deleted', user: req.user,
+      detail: 'Record deleted',
+    });
     res.json({ ok: true });
+  } catch(e) { sendError(res, e); }
+});
+
+// A training record's history, oldest first. Same visibility rule as the record
+// itself -- out of scope reads as "not found". Records created before this log
+// existed simply have no events; the record's own fields are still the state.
+app.get('/api/training-records/:id/events', auth, async (req, res) => {
+  try {
+    const { rows: [rec] } = await pool.query(
+      `SELECT e.project, e.client FROM training_records t
+       LEFT JOIN employees e ON e.id = t.employee_id WHERE t.id = $1`, [req.params.id]
+    );
+    if (!rec) return res.status(404).json({ error: 'Not found' });
+    if (!(await inScope(req.user, rec.project, rec.client))) return res.status(404).json({ error: 'Not found' });
+    const { rows } = await pool.query(
+      `SELECT action, from_status, to_status, detail, changed_by_name, changed_at
+         FROM training_record_events WHERE training_record_id = $1 ORDER BY changed_at, id`, [req.params.id]
+    );
+    res.json(rows);
   } catch(e) { sendError(res, e); }
 });
 

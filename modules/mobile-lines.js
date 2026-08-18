@@ -1055,5 +1055,332 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
     } catch (e) { sendError(res, e); }
   });
 
-  return { router, setup, logEvent, normaliseNumber, releaseLinesForExitedEmployees, OPERATORS, LINE_STATUSES };
+  // ── Change requests ───────────────────────────────────────
+  // Mounted separately at /api/mobile-line-change-requests.
+  //
+  // The flow starts from the EMPLOYEE, never from the line inventory: a
+  // supervisor picks their person, OneHub finds the line, and the form shows
+  // Current → Requested. That ordering is the reason the Projects side never
+  // needs to see which numbers are spare.
+  //
+  // Nothing in this section touches a line's current configuration. Approving
+  // authorises us to ask the operator; it does not change what the operator is
+  // providing. Only Phase 5's implementation confirmation may do that.
+  const requests = express.Router();
+
+  const REQUESTER_ROLES = ['admin', 'supervisor', 'project_director'];
+  const CAN_REQUEST = (req, res, next) =>
+    REQUESTER_ROLES.includes(req.user.role) ? next() : res.status(403).json({ error: 'Not authorized to request mobile line changes' });
+
+  const FIELDS = ['package', 'credit_limit', 'cug', 'roaming'];
+  const FIELD_LABEL = { package: 'Package', credit_limit: 'Credit Limit', cug: 'CUG', roaming: 'Roaming' };
+  const yesNo = (v) => v ? 'Yes' : 'No';
+
+  // Everything the request form needs for one employee, in a single call: the
+  // line, what it currently carries, and only that operator's active catalogue.
+  requests.get('/context/:employeeId', auth, CAN_REQUEST, async (req, res) => {
+    try {
+      const { rows: [emp] } = await pool.query(
+        `SELECT id, full_name, employee_number, national_id, project, client, employment_status
+           FROM employees WHERE id = $1`, [req.params.employeeId]);
+      if (!emp) return res.status(404).json({ error: 'Not found' });
+      if (!(await inScope(req.user, emp.project, emp.client))) return res.status(404).json({ error: 'Not found' });
+
+      const { rows: [line] } = await pool.query(`${LINE_SELECT} WHERE l.current_employee_id = $1 AND l.status = 'assigned'`, [emp.id]);
+      if (!line) {
+        return res.json({ employee: emp, line: null, reason: `${emp.full_name} has no company mobile line, so there is nothing to change.` });
+      }
+      const [pkgs, limits, open] = await Promise.all([
+        pool.query(`SELECT id, package_name, monthly_price FROM telecom_packages WHERE operator=$1 AND is_active ORDER BY package_name`, [line.operator]),
+        pool.query(`SELECT id, credit_limit FROM telecom_credit_limits WHERE operator=$1 AND is_active ORDER BY credit_limit`, [line.operator]),
+        pool.query(`SELECT id, status FROM mobile_change_requests WHERE mobile_line_id=$1
+                     AND status IN ('pending_approval','approved','email_prepared','sent_to_operator','partially_implemented')`, [line.id]),
+      ]);
+      res.json({
+        employee: emp, line,
+        packages: pkgs.rows, credit_limits: limits.rows,
+        open_request: open.rows[0] || null,
+      });
+    } catch (e) { sendError(res, e); }
+  });
+
+  requests.post('/', auth, CAN_REQUEST, async (req, res) => {
+    const { employee_id, package_id, credit_limit_id, cug, roaming } = req.body;
+    if (!employee_id) return res.status(400).json({ error: 'Select an employee' });
+    const db = await pool.connect();
+    try {
+      const { rows: [emp] } = await db.query(
+        `SELECT id, full_name, project, client, employment_status FROM employees WHERE id=$1`, [employee_id]);
+      if (!emp) return res.status(404).json({ error: 'Not found' });
+      if (!(await inScope(req.user, emp.project, emp.client))) return res.status(404).json({ error: 'Not found' });
+      if (emp.employment_status !== 'active') return res.status(400).json({ error: `${emp.full_name} is not an active employee` });
+
+      const { rows: [line] } = await db.query(
+        `SELECT l.*, p.package_name, c.credit_limit FROM mobile_lines l
+           LEFT JOIN telecom_packages p ON p.id = l.current_package_id
+           LEFT JOIN telecom_credit_limits c ON c.id = l.current_credit_limit_id
+          WHERE l.current_employee_id = $1 AND l.status = 'assigned'`, [employee_id]);
+      if (!line) return res.status(400).json({ error: `${emp.full_name} has no company mobile line` });
+
+      // Build only the items that actually DIFFER. An unchanged field is shown in
+      // the UI for context but is not a change, and must never reach the operator.
+      const items = [];
+      if (package_id !== undefined && package_id !== null && package_id !== '' && package_id !== line.current_package_id) {
+        const { rows: [p] } = await db.query(
+          `SELECT id, package_name FROM telecom_packages WHERE id=$1 AND operator=$2 AND is_active`, [package_id, line.operator]);
+        if (!p) return res.status(400).json({ error: 'That package is not available for this operator' });
+        items.push({ field: 'package', cur: line.package_name, curId: line.current_package_id, val: p.package_name, valId: p.id });
+      }
+      if (credit_limit_id !== undefined && credit_limit_id !== null && credit_limit_id !== '' && credit_limit_id !== line.current_credit_limit_id) {
+        const { rows: [c] } = await db.query(
+          `SELECT id, credit_limit FROM telecom_credit_limits WHERE id=$1 AND operator=$2 AND is_active`, [credit_limit_id, line.operator]);
+        if (!c) return res.status(400).json({ error: 'That credit limit is not available for this operator' });
+        items.push({ field: 'credit_limit', cur: line.credit_limit == null ? null : String(line.credit_limit), curId: line.current_credit_limit_id, val: String(c.credit_limit), valId: c.id });
+      }
+      if (cug !== undefined && cug !== null && !!cug !== line.cug_enabled) {
+        items.push({ field: 'cug', cur: yesNo(line.cug_enabled), curId: null, val: yesNo(!!cug), valId: null });
+      }
+      if (roaming !== undefined && roaming !== null && !!roaming !== line.roaming_enabled) {
+        items.push({ field: 'roaming', cur: yesNo(line.roaming_enabled), curId: null, val: yesNo(!!roaming), valId: null });
+      }
+      if (!items.length) {
+        return res.status(400).json({ error: 'Nothing has changed — pick at least one value that differs from what the line has now' });
+      }
+
+      await db.query('BEGIN');
+      const { rows: [reqRow] } = await db.query(
+        `INSERT INTO mobile_change_requests (mobile_line_id, employee_id, operator, project_snapshot,
+           client_snapshot, employee_name_snapshot, status, requested_by)
+         VALUES ($1,$2,$3,$4,$5,$6,'pending_approval',$7) RETURNING *`,
+        [line.id, emp.id, line.operator, emp.project, emp.client, emp.full_name, req.user.id]);
+      for (const it of items) {
+        await db.query(
+          `INSERT INTO mobile_change_request_items (request_id, field_name, current_value_snapshot,
+             current_value_id, original_requested_value, original_requested_id, approved_value, approved_id)
+           VALUES ($1,$2,$3,$4,$5,$6,$5,$6)`,
+          [reqRow.id, it.field, it.cur, it.curId, it.val, it.valId]);
+      }
+      await db.query('COMMIT');
+      await logEvent({ entityType: 'request', entityId: reqRow.id, action: 'request_submitted', to: 'pending_approval',
+        user: req.user, detail: `${line.mobile_number} · ${emp.full_name} — ${items.map(i => `${FIELD_LABEL[i.field]} ${i.cur ?? 'Not set'} → ${i.val}`).join('; ')}` });
+      res.status(201).json({ ...reqRow, items });
+    } catch (e) {
+      await db.query('ROLLBACK').catch(() => {});
+      if (e.code === '23505') {
+        return res.status(400).json({ error: 'This line already has a change request in progress — resolve that one first.' });
+      }
+      sendError(res, e);
+    } finally { db.release(); }
+  });
+
+  const REQUEST_SELECT = `
+    SELECT r.*, l.mobile_number, l.status AS line_status,
+           u.full_name AS requested_by_name, au.full_name AS approved_by_name,
+           ru.full_name AS rejected_by_name, cu.full_name AS cancelled_by_name,
+           (SELECT json_agg(json_build_object(
+              'id', i.id, 'field_name', i.field_name,
+              'current_value_snapshot', i.current_value_snapshot,
+              'original_requested_value', i.original_requested_value,
+              'approved_value', i.approved_value,
+              'implementation_status', i.implementation_status,
+              'implemented_value', i.implemented_value,
+              'not_implemented_reason', i.not_implemented_reason) ORDER BY i.field_name)
+              FROM mobile_change_request_items i WHERE i.request_id = r.id) AS items
+      FROM mobile_change_requests r
+      JOIN mobile_lines l ON l.id = r.mobile_line_id
+      LEFT JOIN users u ON u.id = r.requested_by
+      LEFT JOIN users au ON au.id = r.approved_by
+      LEFT JOIN users ru ON ru.id = r.rejected_by
+      LEFT JOIN users cu ON cu.id = r.cancelled_by`;
+
+  requests.get('/', auth, CAN_VIEW, async (req, res) => {
+    try {
+      const { status, operator, project, client, search, requested_by } = req.query;
+      const params = [];
+      let w = ' WHERE 1=1';
+      if (status) { params.push(status.split(',')); w += ` AND r.status = ANY($${params.length})`; }
+      if (operator) { params.push(operator.split(',')); w += ` AND r.operator = ANY($${params.length})`; }
+      if (project) { params.push(project.split(',')); w += ` AND r.project_snapshot = ANY($${params.length})`; }
+      if (client) { params.push(client.split(',')); w += ` AND r.client_snapshot = ANY($${params.length})`; }
+      if (requested_by) { params.push(requested_by); w += ` AND r.requested_by = $${params.length}`; }
+      if (search) {
+        params.push(`%${search}%`);
+        w += ` AND (l.mobile_number ILIKE $${params.length} OR r.employee_name_snapshot ILIKE $${params.length})`;
+      }
+      // Same scope rule as everything else: your own projects and clients.
+      if (!['admin', 'hr'].includes(req.user.role)) {
+        const projects = await getProjectFilter(req.user);
+        const clients = await getClientFilter(req.user);
+        if (projects !== null) {
+          if (projects.length === 0) return res.json({ rows: [], total: 0 });
+          params.push(projects); w += ` AND r.project_snapshot = ANY($${params.length})`;
+        }
+        if (clients !== null) {
+          if (clients.length === 0) return res.json({ rows: [], total: 0 });
+          params.push(clients); w += ` AND r.client_snapshot = ANY($${params.length})`;
+        }
+      }
+      const { rows } = await pool.query(`${REQUEST_SELECT} ${w} ORDER BY r.requested_at DESC LIMIT 300`, params);
+      res.json({ rows, total: rows.length });
+    } catch (e) { sendError(res, e); }
+  });
+
+  // Counts for the nav badge and the queue headings.
+  requests.get('/stats', auth, CAN_VIEW, async (req, res) => {
+    try {
+      const params = [];
+      let w = ' WHERE 1=1';
+      if (!['admin', 'hr'].includes(req.user.role)) {
+        const projects = await getProjectFilter(req.user);
+        if (projects !== null) {
+          if (projects.length === 0) return res.json({});
+          params.push(projects); w += ` AND r.project_snapshot = ANY($${params.length})`;
+        }
+      }
+      const { rows: [s] } = await pool.query(`
+        SELECT COUNT(*) FILTER (WHERE r.status='pending_approval')::int AS pending_approval,
+               COUNT(*) FILTER (WHERE r.status='approved')::int AS awaiting_email,
+               COUNT(*) FILTER (WHERE r.status='sent_to_operator')::int AS awaiting_operator,
+               COUNT(*) FILTER (WHERE r.status='partially_implemented')::int AS partially_implemented,
+               COUNT(*)::int AS total
+          FROM mobile_change_requests r ${w}`, params);
+      res.json(s);
+    } catch (e) { sendError(res, e); }
+  });
+
+  const loadRequest = async (id) => {
+    const { rows: [r] } = await pool.query(`${REQUEST_SELECT} WHERE r.id = $1`, [id]);
+    return r;
+  };
+
+  requests.get('/:id', auth, CAN_VIEW, async (req, res) => {
+    try {
+      const r = await loadRequest(req.params.id);
+      if (!r) return res.status(404).json({ error: 'Not found' });
+      if (!['admin', 'hr'].includes(req.user.role) && !(await inScope(req.user, r.project_snapshot, r.client_snapshot))) {
+        return res.status(404).json({ error: 'Not found' });
+      }
+      res.json(r);
+    } catch (e) { sendError(res, e); }
+  });
+
+  // A requester can withdraw their own request, but only while nobody has acted
+  // on it. Once approved it is on its way to the operator and only an admin can
+  // stop it.
+  requests.post('/:id/cancel', auth, CAN_REQUEST, async (req, res) => {
+    try {
+      const r = await loadRequest(req.params.id);
+      if (!r) return res.status(404).json({ error: 'Not found' });
+      if (!(await inScope(req.user, r.project_snapshot, r.client_snapshot))) return res.status(404).json({ error: 'Not found' });
+      if (r.status !== 'pending_approval') {
+        return res.status(400).json({ error: `This request is ${r.status.replace(/_/g, ' ')} and can no longer be cancelled` });
+      }
+      if (req.user.role !== 'admin' && r.requested_by !== req.user.id) {
+        return res.status(403).json({ error: 'You can only cancel a request you raised' });
+      }
+      await pool.query(
+        `UPDATE mobile_change_requests SET status='cancelled', cancelled_by=$1, cancelled_at=NOW(), updated_at=NOW() WHERE id=$2`,
+        [req.user.id, req.params.id]);
+      await logEvent({ entityType: 'request', entityId: r.id, action: 'request_cancelled', from: 'pending_approval', to: 'cancelled',
+        user: req.user, detail: `${r.mobile_number} · ${r.employee_name_snapshot}` });
+      res.json(await loadRequest(req.params.id));
+    } catch (e) { sendError(res, e); }
+  });
+
+  // Approving authorises the ask. It does NOT change the line. An admin may cut a
+  // requested value down before approving -- both numbers are kept, so the
+  // history shows what was asked for as well as what was allowed.
+  requests.post('/:id/approve', auth, ADMIN, async (req, res) => {
+    const overrides = req.body?.items || {}; // { package: id|null, credit_limit: id|null, cug: bool, roaming: bool }
+    const db = await pool.connect();
+    try {
+      const r = await loadRequest(req.params.id);
+      if (!r) return res.status(404).json({ error: 'Not found' });
+      if (r.status !== 'pending_approval') {
+        return res.status(400).json({ error: `This request is ${r.status.replace(/_/g, ' ')} and is no longer awaiting approval` });
+      }
+      const { rows: [line] } = await db.query('SELECT * FROM mobile_lines WHERE id=$1', [r.mobile_line_id]);
+      await db.query('BEGIN');
+      const changed = [];
+      for (const item of (r.items || [])) {
+        if (!(item.field_name in overrides)) continue;
+        const v = overrides[item.field_name];
+        let value = null, id = null;
+        if (item.field_name === 'package') {
+          const { rows: [p] } = await db.query(
+            `SELECT id, package_name FROM telecom_packages WHERE id=$1 AND operator=$2 AND is_active`, [v, line.operator]);
+          if (!p) { await db.query('ROLLBACK'); return res.status(400).json({ error: 'That package is not available for this operator' }); }
+          value = p.package_name; id = p.id;
+        } else if (item.field_name === 'credit_limit') {
+          const { rows: [c] } = await db.query(
+            `SELECT id, credit_limit FROM telecom_credit_limits WHERE id=$1 AND operator=$2 AND is_active`, [v, line.operator]);
+          if (!c) { await db.query('ROLLBACK'); return res.status(400).json({ error: 'That credit limit is not available for this operator' }); }
+          value = String(c.credit_limit); id = c.id;
+        } else {
+          value = yesNo(!!v);
+        }
+        if (value !== item.approved_value) changed.push(`${FIELD_LABEL[item.field_name]} ${item.original_requested_value} → ${value}`);
+        await db.query(`UPDATE mobile_change_request_items SET approved_value=$1, approved_id=$2 WHERE id=$3`,
+          [value, id, item.id]);
+      }
+      // An approved value identical to what the line already has is not a change,
+      // so it must not travel to the operator.
+      const { rows: remaining } = await db.query(
+        `SELECT i.field_name, i.approved_value, i.current_value_snapshot FROM mobile_change_request_items i WHERE i.request_id=$1`, [req.params.id]);
+      const stillChanging = remaining.filter(i => (i.approved_value ?? '') !== (i.current_value_snapshot ?? ''));
+      if (!stillChanging.length) {
+        await db.query('ROLLBACK');
+        return res.status(400).json({ error: 'Every value now matches what the line already has — reject the request instead of approving an empty change.' });
+      }
+      await db.query(
+        `UPDATE mobile_change_requests SET status='approved', approved_by=$1, approved_at=NOW(), updated_at=NOW() WHERE id=$2`,
+        [req.user.id, req.params.id]);
+      await db.query('COMMIT');
+      await logEvent({ entityType: 'request', entityId: r.id, action: changed.length ? 'request_modified_and_approved' : 'request_approved',
+        from: 'pending_approval', to: 'approved', user: req.user,
+        detail: changed.length ? `Approved with changes — ${changed.join('; ')}` : 'Approved as requested' });
+      res.json(await loadRequest(req.params.id));
+    } catch (e) {
+      await db.query('ROLLBACK').catch(() => {});
+      sendError(res, e);
+    } finally { db.release(); }
+  });
+
+  requests.post('/:id/reject', auth, ADMIN, async (req, res) => {
+    const reason = req.body?.rejection_reason;
+    if (!reason || !reason.trim()) return res.status(400).json({ error: 'A reason is required so the requester knows why' });
+    try {
+      const r = await loadRequest(req.params.id);
+      if (!r) return res.status(404).json({ error: 'Not found' });
+      if (r.status !== 'pending_approval') {
+        return res.status(400).json({ error: `This request is ${r.status.replace(/_/g, ' ')} and is no longer awaiting approval` });
+      }
+      await pool.query(
+        `UPDATE mobile_change_requests SET status='rejected', rejected_by=$1, rejected_at=NOW(),
+           rejection_reason=$2, updated_at=NOW() WHERE id=$3`,
+        [req.user.id, reason.trim(), req.params.id]);
+      await logEvent({ entityType: 'request', entityId: r.id, action: 'request_rejected', from: 'pending_approval', to: 'rejected',
+        user: req.user, detail: `${r.mobile_number} · ${r.employee_name_snapshot} — "${reason.trim()}"` });
+      notifyRejected(await loadRequest(req.params.id)).catch(() => {});
+      res.json(await loadRequest(req.params.id));
+    } catch (e) { sendError(res, e); }
+  });
+
+  // The requester has to learn a rejection without watching the screen, and the
+  // reason is the whole point of telling them.
+  const notifyRejected = async (r) => {
+    if (!sendMail) return;
+    const { rows: [u] } = await pool.query('SELECT full_name FROM users WHERE id=$1', [r.requested_by]);
+    await sendMail({
+      subject: `OneHub — Mobile Line Change Rejected (${r.mobile_number})`,
+      html: mailWrap(`
+        <p>Hello ${u?.full_name || 'there'},</p>
+        <p>Your mobile line change request for <strong>${r.employee_name_snapshot}</strong> (${r.mobile_number}) was not approved.</p>
+        <p><strong>Reason:</strong> ${r.rejection_reason}</p>
+        <p>The line is unchanged. You can raise a new request in OneHub → Mobile Lines → Change Requests.</p>
+      `),
+    });
+  };
+
+  return { router, requests, setup, logEvent, normaliseNumber, releaseLinesForExitedEmployees, OPERATORS, LINE_STATUSES };
 };

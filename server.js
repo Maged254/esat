@@ -965,6 +965,7 @@ const mobileLines = require('./modules/mobile-lines')({
   mailWrap: (html) => mailWrap(html),
 });
 app.use('/api/mobile-lines', mobileLines.router);
+app.use('/api/mobile-line-change-requests', mobileLines.requests);
 
 // Looks up the project/client of the employee or casual behind an id.
 const getPersonScope = async (id) => {

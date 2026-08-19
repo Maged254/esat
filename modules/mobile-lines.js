@@ -17,8 +17,14 @@ const OPERATORS = ['safaricom', 'airtel'];
 const LINE_STATUSES = ['available', 'assigned', 'terminated'];
 // CUG is billed per line per month on top of the package. It is a checkbox
 // rather than a catalogue product, so it would otherwise be missing from every
-// cost figure the module reports.
-const CUG_MONTHLY = 300;
+// cost figure the module reports. The rate is admin-editable per operator and
+// lives in telecom_operator_settings; this is only the seed for a fresh install.
+const CUG_MONTHLY_DEFAULT = 300;
+// Cost of one line per month: its package plus CUG at its own operator's rate.
+// Needs `os` (telecom_operator_settings) joined on the line's operator.
+const LINE_COST_SQL = `(COALESCE(l.monthly_price_snapshot,0)
+        + CASE WHEN l.cug_enabled THEN COALESCE(os.cug_monthly_price,0) ELSE 0 END)`;
+const OPERATOR_SETTINGS_JOIN = 'LEFT JOIN telecom_operator_settings os ON os.operator = l.operator';
 
 module.exports = function mobileLinesModule({ express, pool, auth, inScope, getProjectFilter, getClientFilter, sendError, sendMail, mailWrap }) {
   const router = express.Router();
@@ -297,6 +303,22 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
         ('airtel',    'e.maged@outlook.com', '', 'OneHub — Airtel Line Change Request',    'Hello Airtel Team,\n\nKindly action the following changes on the lines below.',    FALSE)
       ON CONFLICT (operator) DO NOTHING`);
 
+    // Telecom charges that are not catalogue products. CUG is a per-line monthly
+    // subscription toggled by a checkbox, so it has nowhere else to live -- and
+    // leaving it in code meant a price change needed a deploy.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS telecom_operator_settings (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        operator VARCHAR(20) NOT NULL UNIQUE CHECK (operator IN ('safaricom','airtel')),
+        cug_monthly_price NUMERIC(12,2) NOT NULL DEFAULT 0,
+        updated_by UUID REFERENCES users(id),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )`);
+    await client.query(`
+      INSERT INTO telecom_operator_settings (operator, cug_monthly_price)
+      VALUES ('safaricom', ${CUG_MONTHLY_DEFAULT}), ('airtel', ${CUG_MONTHLY_DEFAULT})
+      ON CONFLICT (operator) DO NOTHING`);
+
     // Append-only audit. Ships in Phase 1 on purpose -- history cannot be
     // backfilled, so it has to exist before the first action does.
     await client.query(`
@@ -504,6 +526,39 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
     } catch (e) { sendError(res, e); }
   });
 
+  // ── Operator charges ──────────────────────────────────────
+  // What CUG costs per line per month, per operator. Read by anyone who can see
+  // the module (every cost figure depends on it), set by admins only.
+  router.get('/operator-settings', auth, CAN_VIEW, async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT s.*, u.full_name AS updated_by_name FROM telecom_operator_settings s
+           LEFT JOIN users u ON u.id = s.updated_by ORDER BY s.operator`);
+      res.json(rows);
+    } catch (e) { sendError(res, e); }
+  });
+
+  router.patch('/operator-settings/:operator', auth, ADMIN, async (req, res) => {
+    if (!OPERATORS.includes(req.params.operator)) return res.status(400).json({ error: 'Unknown operator' });
+    const price = Number(req.body?.cug_monthly_price);
+    if (req.body?.cug_monthly_price === '' || req.body?.cug_monthly_price == null || isNaN(price) || price < 0) {
+      return res.status(400).json({ error: 'Enter the monthly CUG charge per line as a non-negative number' });
+    }
+    try {
+      const { rows: [before] } = await pool.query('SELECT * FROM telecom_operator_settings WHERE operator=$1', [req.params.operator]);
+      const { rows: [s] } = await pool.query(
+        `INSERT INTO telecom_operator_settings (operator, cug_monthly_price, updated_by, updated_at)
+         VALUES ($1,$2,$3,NOW())
+         ON CONFLICT (operator) DO UPDATE SET cug_monthly_price=$2, updated_by=$3, updated_at=NOW()
+         RETURNING *`, [req.params.operator, price, req.user.id]);
+      // Changing the rate re-prices every CUG line from now on, which is worth a
+      // line in the audit -- it moves reported spend without touching a line.
+      await logEvent({ entityType: 'operator_settings', entityId: s.id, action: 'cug_rate_changed', user: req.user,
+        detail: `${s.operator} CUG ${before ? before.cug_monthly_price : '—'} → ${s.cug_monthly_price} per line per month` });
+      res.json(s);
+    } catch (e) { sendError(res, e); }
+  });
+
   // ── Non-employee holders ──────────────────────────────────
   // Admin-managed, and admin-only throughout: these lines are not attached to a
   // person, so there is no project to scope them by and nobody on the Projects
@@ -685,10 +740,9 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
                COALESCE(SUM(l.monthly_price_snapshot) FILTER (WHERE l.status='available'), 0) AS package_idle,
                COUNT(*) FILTER (WHERE l.status='assigned' AND l.cug_enabled)::int AS cug_assigned,
                COUNT(*) FILTER (WHERE l.status='available' AND l.cug_enabled)::int AS cug_idle,
-               COALESCE(SUM(l.monthly_price_snapshot) FILTER (WHERE l.status='assigned'), 0)
-                 + ${CUG_MONTHLY} * COUNT(*) FILTER (WHERE l.status='assigned' AND l.cug_enabled) AS monthly_assigned,
-               COALESCE(SUM(l.monthly_price_snapshot) FILTER (WHERE l.status='available'), 0)
-                 + ${CUG_MONTHLY} * COUNT(*) FILTER (WHERE l.status='available' AND l.cug_enabled) AS monthly_idle,
+               COALESCE(SUM(os.cug_monthly_price) FILTER (WHERE l.status='assigned' AND l.cug_enabled), 0) AS cug_cost_assigned,
+               COALESCE(SUM(${LINE_COST_SQL}) FILTER (WHERE l.status='assigned'), 0) AS monthly_assigned,
+               COALESCE(SUM(${LINE_COST_SQL}) FILTER (WHERE l.status='available'), 0) AS monthly_idle,
                -- A credit limit is headroom, not spend: it is the most a line
                -- can run up on top of its package. Summed, it turns the monthly
                -- figure into a worst case.
@@ -696,9 +750,9 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
           FROM mobile_lines l
           LEFT JOIN employees e ON e.id = l.current_employee_id
           LEFT JOIN mobile_line_holders h ON h.id = l.current_holder_id
-          LEFT JOIN telecom_credit_limits cl ON cl.id = l.current_credit_limit_id ${where}`, params);
+          LEFT JOIN telecom_credit_limits cl ON cl.id = l.current_credit_limit_id
+          ${OPERATOR_SETTINGS_JOIN} ${where}`, params);
       s.max_assigned = Number(s.monthly_assigned) + Number(s.credit_limit_assigned);
-      s.cug_monthly_rate = CUG_MONTHLY;
       res.json(s);
     } catch (e) { sendError(res, e); }
   });
@@ -716,9 +770,9 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
         LEFT JOIN employees e ON e.id = l.current_employee_id
         LEFT JOIN mobile_line_holders h ON h.id = l.current_holder_id
         LEFT JOIN telecom_packages p ON p.id = l.current_package_id
-        LEFT JOIN telecom_credit_limits cl ON cl.id = l.current_credit_limit_id`;
-      // Monthly cost of a line: its package plus CUG if it is on.
-      const COST = `(COALESCE(l.monthly_price_snapshot,0) + CASE WHEN l.cug_enabled THEN ${CUG_MONTHLY} ELSE 0 END)`;
+        LEFT JOIN telecom_credit_limits cl ON cl.id = l.current_credit_limit_id
+        ${OPERATOR_SETTINGS_JOIN}`;
+      const COST = LINE_COST_SQL;
       // A line belongs to its holder's project when nobody's employee record
       // supplies one -- otherwise every function-held line reports as "(none)".
       const PROJECT = `COALESCE(NULLIF(TRIM(e.project),''), NULLIF(TRIM(h.project),''), '(none)')`;
@@ -752,7 +806,7 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
       ]);
       res.json({
         by_operator: op.rows, by_project: proj.rows, by_package: pkg.rows,
-        workflow: flow.rows[0], cug_monthly_rate: CUG_MONTHLY,
+        workflow: flow.rows[0],
       });
     } catch (e) { sendError(res, e); }
   });

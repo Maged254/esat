@@ -598,6 +598,11 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
            l.current_assignment_date, l.available_since, l.notes, l.updated_at,
            e.id AS employee_id, e.full_name AS employee_name, e.employee_number,
            e.national_id, e.project, e.client, e.department, e.employment_status,
+           -- A line held by a function rather than a person: the register reads
+           -- the holder's own name, project and client, since there is no
+           -- employee record to inherit them from.
+           h.id AS holder_id, h.name AS holder_name,
+           h.project AS holder_project, h.client AS holder_client,
            p.id AS package_id, p.package_name, p.monthly_price AS package_price,
            cl.id AS credit_limit_id, cl.credit_limit,
            (SELECT COUNT(*)::int FROM mobile_change_requests r

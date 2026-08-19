@@ -1644,6 +1644,164 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
     } catch (e) { sendError(res, e); }
   });
 
+  // ── Implementation confirmation ───────────────────────────
+  // The only place in this module that may change what a line currently has.
+  // Everything before it -- request, approval, operator email -- is intent; this
+  // records what the operator ACTUALLY did, item by item.
+  //
+  // Each item is confirmed on its own, so a request where Safaricom applied the
+  // package but not the roaming settles as Partially Implemented with the
+  // roaming still reading its old value. An item the operator will never do is
+  // closed as not implemented WITH A REASON: the line keeps its current value,
+  // and the request can still finish rather than hanging open forever.
+  requests.post('/:id/confirm', auth, ADMIN, async (req, res) => {
+    const decisions = Array.isArray(req.body?.items) ? req.body.items : null;
+    if (!decisions || !decisions.length) return res.status(400).json({ error: 'Nothing to confirm' });
+    const bad = decisions.find(d => !['implemented', 'not_implemented'].includes(d.status));
+    if (bad) return res.status(400).json({ error: 'Each item must be implemented or not implemented' });
+    const noReason = decisions.find(d => d.status === 'not_implemented' && !(d.reason || '').trim());
+    if (noReason) return res.status(400).json({ error: 'Say why an item was not implemented — the line keeps its current value, and the record has to explain that' });
+
+    const db = await pool.connect();
+    try {
+      const r = await loadRequest(req.params.id);
+      if (!r) return res.status(404).json({ error: 'Not found' });
+      if (!['sent_to_operator', 'partially_implemented'].includes(r.status)) {
+        return res.status(400).json({ error: `This request is ${r.status.replace(/_/g, ' ')} — only one sent to the operator can be confirmed` });
+      }
+      const { rows: [line] } = await db.query(
+        `SELECT l.*, p.package_name, c.credit_limit FROM mobile_lines l
+           LEFT JOIN telecom_packages p ON p.id = l.current_package_id
+           LEFT JOIN telecom_credit_limits c ON c.id = l.current_credit_limit_id
+          WHERE l.id = $1`, [r.mobile_line_id]);
+      const { rows: items } = await db.query(
+        `SELECT * FROM mobile_change_request_items WHERE request_id = $1`, [req.params.id]);
+      const { rows: [batch] } = await db.query(
+        `SELECT b.id, b.sent_at, u.full_name AS sent_by_name FROM telecom_email_batch_requests x
+           JOIN telecom_email_batches b ON b.id = x.email_batch_id
+           LEFT JOIN users u ON u.id = b.sent_by
+          WHERE x.change_request_id = $1 AND b.status = 'sent' ORDER BY b.sent_at DESC LIMIT 1`, [req.params.id]);
+
+      await db.query('BEGIN');
+      const applied = [];
+      for (const d of decisions) {
+        const item = items.find(i => i.id === d.id);
+        if (!item) continue;
+        if (item.implementation_status !== 'awaiting') continue; // already settled; never re-apply
+
+        // What the line has RIGHT NOW for this field -- the honest "previous
+        // value", read at confirmation rather than when the request was raised.
+        const currentNow = item.field_name === 'package' ? line.package_name
+          : item.field_name === 'credit_limit' ? (line.credit_limit == null ? null : String(line.credit_limit))
+          : item.field_name === 'cug' ? yesNo(line.cug_enabled) : yesNo(line.roaming_enabled);
+
+        if (d.status === 'implemented') {
+          if (item.field_name === 'package') {
+            const { rows: [pkg] } = await db.query('SELECT monthly_price FROM telecom_packages WHERE id=$1', [item.approved_id]);
+            await db.query(
+              `UPDATE mobile_lines SET current_package_id=$1, monthly_price_snapshot=$2, updated_at=NOW() WHERE id=$3`,
+              [item.approved_id, pkg?.monthly_price ?? null, line.id]);
+            line.package_name = item.approved_value;
+          } else if (item.field_name === 'credit_limit') {
+            await db.query(`UPDATE mobile_lines SET current_credit_limit_id=$1, updated_at=NOW() WHERE id=$2`, [item.approved_id, line.id]);
+            line.credit_limit = item.approved_value;
+          } else {
+            const col = item.field_name === 'cug' ? 'cug_enabled' : 'roaming_enabled';
+            const on = item.approved_value === 'Yes';
+            await db.query(`UPDATE mobile_lines SET ${col}=$1, updated_at=NOW() WHERE id=$2`, [on, line.id]);
+            if (item.field_name === 'cug') line.cug_enabled = on; else line.roaming_enabled = on;
+          }
+        }
+
+        await db.query(
+          `UPDATE mobile_change_request_items
+              SET implementation_status=$1, implemented_value=$2, not_implemented_reason=$3,
+                  implemented_by=$4, implemented_at=NOW()
+            WHERE id=$5`,
+          [d.status, d.status === 'implemented' ? item.approved_value : null,
+           d.status === 'not_implemented' ? d.reason.trim() : null, req.user.id, item.id]);
+
+        // One permanent history row per changed field. This is what makes a
+        // partial implementation readable months later.
+        await db.query(
+          `INSERT INTO mobile_product_change_history
+             (mobile_line_id, mobile_number, operator, employee_id, employee_name_snapshot, project_snapshot,
+              request_id, field_changed, previous_value, originally_requested_value, approved_value,
+              implemented_value, monthly_price_snapshot, implementation_status, not_implemented_reason,
+              requested_by_name, requested_at, approved_by_name, approved_at,
+              email_batch_id, email_sent_by_name, email_sent_at, confirmed_by_name, confirmed_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+                   (SELECT monthly_price_snapshot FROM mobile_lines WHERE id=$1),
+                   $13,$14,$15,$16,$17,$18,$19,$20,$21,$22,NOW())`,
+          [line.id, line.mobile_number, r.operator, r.employee_id, r.employee_name_snapshot, r.project_snapshot,
+           r.id, item.field_name, currentNow, item.original_requested_value, item.approved_value,
+           d.status === 'implemented' ? item.approved_value : null,
+           d.status, d.status === 'not_implemented' ? d.reason.trim() : null,
+           r.requested_by_name, r.requested_at, r.approved_by_name, r.approved_at,
+           batch?.id || null, batch?.sent_by_name || null, batch?.sent_at || null, req.user.name || null]);
+
+        applied.push(`${FIELD_LABEL[item.field_name]} ${d.status === 'implemented' ? `→ ${item.approved_value}` : `not implemented ("${d.reason.trim()}")`}`);
+      }
+
+      // A request is finished once every item has been settled one way or the
+      // other -- including the ones the operator declined.
+      const { rows: [left] } = await db.query(
+        `SELECT COUNT(*) FILTER (WHERE implementation_status='awaiting')::int AS awaiting
+           FROM mobile_change_request_items WHERE request_id=$1`, [req.params.id]);
+      const newStatus = left.awaiting === 0 ? 'implemented' : 'partially_implemented';
+      await db.query(`UPDATE mobile_change_requests SET status=$1, updated_at=NOW() WHERE id=$2`, [newStatus, req.params.id]);
+      await db.query('COMMIT');
+
+      await logEvent({ entityType: 'request', entityId: r.id, action: 'implementation_confirmed', from: r.status, to: newStatus,
+        user: req.user, detail: `${line.mobile_number} — ${applied.join('; ')}` });
+      await logEvent({ entityType: 'line', entityId: line.id, action: 'configuration_changed', user: req.user,
+        detail: `${applied.join('; ')} (confirmed with ${r.operator})` });
+      if (newStatus === 'implemented') notifyImplemented(await loadRequest(req.params.id)).catch(() => {});
+      res.json(await loadRequest(req.params.id));
+    } catch (e) {
+      await db.query('ROLLBACK').catch(() => {});
+      sendError(res, e);
+    } finally { db.release(); }
+  });
+
+  // The person who asked has been waiting on the operator, and has no other way
+  // to find out it landed.
+  const notifyImplemented = async (r) => {
+    if (!sendMail || !r.requested_by) return;
+    const { rows: [u] } = await pool.query('SELECT full_name FROM users WHERE id=$1', [r.requested_by]);
+    const rows = (r.items || []).map(i => `
+      <tr>
+        <td style="padding:6px 10px;border:1px solid #ddd;">${FIELD_LABEL[i.field_name]}</td>
+        <td style="padding:6px 10px;border:1px solid #ddd;">${i.current_value_snapshot ?? '—'}</td>
+        <td style="padding:6px 10px;border:1px solid #ddd;"><strong>${i.implementation_status === 'implemented' ? i.implemented_value : 'Not implemented'}</strong>${i.not_implemented_reason ? ` — ${i.not_implemented_reason}` : ''}</td>
+      </tr>`).join('');
+    await sendMail({
+      subject: `OneHub — Mobile Line Change Implemented (${r.mobile_number})`,
+      html: mailWrap(`
+        <p>Hello ${u?.full_name || 'there'},</p>
+        <p>The change you requested for <strong>${r.employee_name_snapshot}</strong> (${r.mobile_number}) has been confirmed with ${r.operator === 'safaricom' ? 'Safaricom' : 'Airtel'} and is now live on the line.</p>
+        <table style="border-collapse:collapse;font-size:10.5pt;">
+          <tr>
+            <th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">Item</th>
+            <th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">Was</th>
+            <th style="padding:6px 10px;border:1px solid #ddd;text-align:left;">Now</th>
+          </tr>
+          ${rows}
+        </table>
+      `),
+    });
+  };
+
+  // A line's product history: every field that ever changed, with the full
+  // chain from who asked to who confirmed it.
+  router.get('/:id/change-history', auth, CAN_VIEW, async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT * FROM mobile_product_change_history WHERE mobile_line_id=$1 ORDER BY created_at DESC`, [req.params.id]);
+      res.json(rows);
+    } catch (e) { sendError(res, e); }
+  });
+
   // The requester has to learn a rejection without watching the screen, and the
   // reason is the whole point of telling them.
   const notifyRejected = async (r) => {

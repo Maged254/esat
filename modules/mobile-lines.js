@@ -1013,6 +1013,56 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
     } catch (e) { sendError(res, e); }
   });
 
+  // Purge a line AND everything attached to it: assignments, change requests and
+  // their items, and any link into an email batch. This is the deliberate
+  // exception to "history is never deleted" -- for a line that should never have
+  // been in OneHub at all (a test, a wrong number typed and then used for a
+  // while), where Terminate would leave a permanent record of something that was
+  // never real.
+  //
+  // Guarded three ways: admin only, the mobile number has to be typed back to
+  // confirm, and a line somebody is currently holding cannot be purged -- release
+  // it first, so this can never quietly take a live number away from an employee.
+  // The audit row survives, because it is what is left of the line.
+  router.post('/:id/purge', auth, ADMIN, async (req, res) => {
+    const db = await pool.connect();
+    try {
+      const { rows: [line] } = await db.query(
+        `SELECT l.*, e.full_name FROM mobile_lines l LEFT JOIN employees e ON e.id = l.current_employee_id WHERE l.id=$1`,
+        [req.params.id]);
+      if (!line) return res.status(404).json({ error: 'Not found' });
+      if (String(req.body?.confirm_number || '').trim() !== line.mobile_number) {
+        return res.status(400).json({ error: `Type ${line.mobile_number} to confirm you want this line and all of its history destroyed` });
+      }
+      if (line.status === 'assigned') {
+        return res.status(400).json({ error: `${line.full_name || 'Someone'} is currently holding this line — release it first` });
+      }
+      const { rows: [counts] } = await db.query(`
+        SELECT (SELECT COUNT(*) FROM mobile_line_assignments WHERE mobile_line_id=$1)::int AS assignments,
+               (SELECT COUNT(*) FROM mobile_change_requests WHERE mobile_line_id=$1)::int AS requests`, [req.params.id]);
+
+      await db.query('BEGIN');
+      await db.query(`
+        DELETE FROM telecom_email_batch_requests
+         WHERE change_request_id IN (SELECT id FROM mobile_change_requests WHERE mobile_line_id=$1)`, [req.params.id]);
+      await db.query(`
+        DELETE FROM mobile_change_request_items
+         WHERE request_id IN (SELECT id FROM mobile_change_requests WHERE mobile_line_id=$1)`, [req.params.id]);
+      await db.query('DELETE FROM mobile_product_change_history WHERE mobile_line_id=$1', [req.params.id]);
+      await db.query('DELETE FROM mobile_change_requests WHERE mobile_line_id=$1', [req.params.id]);
+      await db.query('DELETE FROM mobile_line_assignments WHERE mobile_line_id=$1', [req.params.id]);
+      await db.query('DELETE FROM mobile_lines WHERE id=$1', [req.params.id]);
+      await db.query('COMMIT');
+
+      await logEvent({ entityType: 'line', entityId: null, action: 'line_purged', from: line.status, user: req.user,
+        detail: `${line.operator} ${line.mobile_number} purged with ${counts.assignments} assignment record(s) and ${counts.requests} change request(s)` });
+      res.json({ ok: true, purged: { mobile_number: line.mobile_number, ...counts } });
+    } catch (e) {
+      await db.query('ROLLBACK').catch(() => {});
+      sendError(res, e);
+    } finally { db.release(); }
+  });
+
   // ── Employee exit → automatic release ─────────────────────
   // An employee is exited in more than one place: manually through the employee
   // screen, and silently by the SharePoint sync's bulk upsert. Hooking a single

@@ -703,6 +703,60 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
     } catch (e) { sendError(res, e); }
   });
 
+  // ── Dashboard ─────────────────────────────────────────────
+  // The reporting layer. Everything is derived from the same scoped WHERE the
+  // register uses, so what the dashboard totals and what the list shows can
+  // never disagree. Cost is always package + CUG, matching the register's card.
+  router.get('/dashboard', auth, CAN_VIEW, async (req, res) => {
+    try {
+      const params = [];
+      const where = await registerWhere(req, params);
+      if (where === null) return res.json({ by_operator: [], by_project: [], by_package: [], workflow: {} });
+      const from = `FROM mobile_lines l
+        LEFT JOIN employees e ON e.id = l.current_employee_id
+        LEFT JOIN mobile_line_holders h ON h.id = l.current_holder_id
+        LEFT JOIN telecom_packages p ON p.id = l.current_package_id
+        LEFT JOIN telecom_credit_limits cl ON cl.id = l.current_credit_limit_id`;
+      // Monthly cost of a line: its package plus CUG if it is on.
+      const COST = `(COALESCE(l.monthly_price_snapshot,0) + CASE WHEN l.cug_enabled THEN ${CUG_MONTHLY} ELSE 0 END)`;
+      // A line belongs to its holder's project when nobody's employee record
+      // supplies one -- otherwise every function-held line reports as "(none)".
+      const PROJECT = `COALESCE(NULLIF(TRIM(e.project),''), NULLIF(TRIM(h.project),''), '(none)')`;
+
+      const [op, proj, pkg, flow] = await Promise.all([
+        pool.query(`SELECT l.operator,
+                      COUNT(*)::int AS lines,
+                      COUNT(*) FILTER (WHERE l.status='assigned')::int AS assigned,
+                      COUNT(*) FILTER (WHERE l.status='available')::int AS available,
+                      COALESCE(SUM(${COST}) FILTER (WHERE l.status<>'terminated'),0) AS monthly,
+                      COALESCE(SUM(cl.credit_limit) FILTER (WHERE l.status='assigned'),0) AS credit_limit
+                    ${from} ${where} GROUP BY l.operator ORDER BY l.operator`, params),
+        pool.query(`SELECT ${PROJECT} AS project,
+                      COUNT(*)::int AS lines,
+                      COALESCE(SUM(${COST}) FILTER (WHERE l.status<>'terminated'),0) AS monthly,
+                      COALESCE(SUM(cl.credit_limit) FILTER (WHERE l.status='assigned'),0) AS credit_limit
+                    ${from} ${where} GROUP BY 1 ORDER BY monthly DESC, lines DESC`, params),
+        pool.query(`SELECT COALESCE(p.package_name,'(not set)') AS package,
+                      COALESCE(p.monthly_price,0) AS price,
+                      COUNT(*)::int AS lines,
+                      COALESCE(SUM(${COST}) FILTER (WHERE l.status<>'terminated'),0) AS monthly
+                    ${from} ${where} GROUP BY 1,2 ORDER BY lines DESC`, params),
+        pool.query(`SELECT
+                      COUNT(*) FILTER (WHERE r.status='pending_approval')::int AS pending_approval,
+                      COUNT(*) FILTER (WHERE r.status='approved')::int AS awaiting_email,
+                      COUNT(*) FILTER (WHERE r.status='email_prepared')::int AS email_prepared,
+                      COUNT(*) FILTER (WHERE r.status='sent_to_operator')::int AS awaiting_operator,
+                      COUNT(*) FILTER (WHERE r.status='partially_implemented')::int AS partially_implemented,
+                      COUNT(*) FILTER (WHERE r.status='implemented' AND r.updated_at > NOW() - INTERVAL '30 days')::int AS implemented_30d
+                    FROM mobile_change_requests r`),
+      ]);
+      res.json({
+        by_operator: op.rows, by_project: proj.rows, by_package: pkg.rows,
+        workflow: flow.rows[0], cug_monthly_rate: CUG_MONTHLY,
+      });
+    } catch (e) { sendError(res, e); }
+  });
+
   router.get('/filter-options', auth, CAN_VIEW, async (req, res) => {
     try {
       const [projects, clients, packages, limits] = await Promise.all([

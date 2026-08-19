@@ -75,14 +75,45 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
         updated_at TIMESTAMPTZ DEFAULT NOW()
       )`);
 
-    // An assigned line must have a holder; an available or terminated one must
-    // not. Without this a release that half-ran would leave a line that is
-    // "available" yet still shows someone's name.
+    // Not every line belongs to a person. Operational numbers are held by a
+    // function -- BTS NOC, Fibre NOC, Zuku NOC -- which outlives whoever answers
+    // it. A holder is an admin-managed record rather than free text, so the same
+    // NOC cannot end up in reporting three times with three spellings.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS mobile_line_holders (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(120) NOT NULL UNIQUE,
+        project TEXT,
+        client TEXT,
+        notes TEXT,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_by UUID REFERENCES users(id),
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        updated_by UUID REFERENCES users(id),
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )`);
+    await client.query('ALTER TABLE mobile_lines ADD COLUMN IF NOT EXISTS current_holder_id UUID REFERENCES mobile_line_holders(id)');
+
+    // An assigned line must have exactly ONE holder -- a person or a function,
+    // never both and never neither -- and an available or terminated line must
+    // have none. Without this a release that half-ran would leave a line that is
+    // "available" yet still shows someone's name. Replaces the employee-only
+    // version of this constraint.
+    await client.query('ALTER TABLE mobile_lines DROP CONSTRAINT IF EXISTS mobile_lines_holder_matches_status');
     await client.query(`DO $$ BEGIN
-      ALTER TABLE mobile_lines ADD CONSTRAINT mobile_lines_holder_matches_status
-        CHECK ((status = 'assigned' AND current_employee_id IS NOT NULL)
-            OR (status <> 'assigned' AND current_employee_id IS NULL));
+      ALTER TABLE mobile_lines ADD CONSTRAINT mobile_lines_one_holder_matches_status
+        CHECK ((status = 'assigned' AND (current_employee_id IS NOT NULL) <> (current_holder_id IS NOT NULL))
+            OR (status <> 'assigned' AND current_employee_id IS NULL AND current_holder_id IS NULL));
     EXCEPTION WHEN duplicate_object THEN NULL; END $$;`);
+
+    // One line per holder, matching the rule employees live under.
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS one_active_line_per_holder
+        ON mobile_lines (current_holder_id)
+        WHERE status = 'assigned' AND current_holder_id IS NOT NULL`);
+    await client.query('ALTER TABLE mobile_line_assignments ADD COLUMN IF NOT EXISTS holder_id UUID REFERENCES mobile_line_holders(id)');
+    await client.query('ALTER TABLE mobile_line_assignments ADD COLUMN IF NOT EXISTS holder_name_snapshot TEXT');
+    await client.query('ALTER TABLE mobile_line_assignments ALTER COLUMN employee_id DROP NOT NULL');
 
     // The one-line-per-employee rule, in the database rather than only the API --
     // the same shape as the one-open-training-request index.
@@ -469,16 +500,87 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
     } catch (e) { sendError(res, e); }
   });
 
+  // ── Non-employee holders ──────────────────────────────────
+  // Admin-managed, and admin-only throughout: these lines are not attached to a
+  // person, so there is no project to scope them by and nobody on the Projects
+  // side has a reason to see them.
+  router.get('/holders', auth, ADMIN, async (req, res) => {
+    try {
+      const { rows } = await pool.query(`
+        SELECT h.*, l.mobile_number AS current_line, l.operator AS current_operator
+          FROM mobile_line_holders h
+          LEFT JOIN mobile_lines l ON l.current_holder_id = h.id AND l.status = 'assigned'
+         ORDER BY h.is_active DESC, h.name`);
+      res.json(rows);
+    } catch (e) { sendError(res, e); }
+  });
+
+  router.post('/holders', auth, ADMIN, async (req, res) => {
+    const { name, project, client, notes } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ error: 'A holder name is required' });
+    try {
+      const { rows: [h] } = await pool.query(
+        `INSERT INTO mobile_line_holders (name, project, client, notes, created_by, updated_by)
+         VALUES ($1,$2,$3,$4,$5,$5) RETURNING *`,
+        [name.trim(), project?.trim() || null, client?.trim() || null, notes?.trim() || null, req.user.id]);
+      await logEvent({ entityType: 'holder', entityId: h.id, action: 'holder_created', user: req.user,
+        detail: `${h.name}${h.project ? ` · ${h.project}` : ''}` });
+      res.status(201).json(h);
+    } catch (e) {
+      if (e.code === '23505') return res.status(400).json({ error: 'A holder with that name already exists' });
+      sendError(res, e);
+    }
+  });
+
+  router.patch('/holders/:id', auth, ADMIN, async (req, res) => {
+    const { name, project, client, notes, is_active } = req.body;
+    try {
+      const { rows: [h] } = await pool.query(
+        `UPDATE mobile_line_holders SET name=COALESCE($1,name), project=$2, client=$3, notes=$4,
+           is_active=COALESCE($5,is_active), updated_by=$6, updated_at=NOW()
+         WHERE id=$7 RETURNING *`,
+        [name?.trim() || null, project?.trim() || null, client?.trim() || null, notes?.trim() || null,
+         is_active === undefined ? null : !!is_active, req.user.id, req.params.id]);
+      if (!h) return res.status(404).json({ error: 'Not found' });
+      await logEvent({ entityType: 'holder', entityId: h.id, action: 'holder_updated', user: req.user,
+        detail: `${h.name}${h.is_active ? '' : ' — retired'}` });
+      res.json(h);
+    } catch (e) {
+      if (e.code === '23505') return res.status(400).json({ error: 'A holder with that name already exists' });
+      sendError(res, e);
+    }
+  });
+
+  router.delete('/holders/:id', auth, ADMIN, async (req, res) => {
+    try {
+      const { rows: [h] } = await pool.query('SELECT * FROM mobile_line_holders WHERE id=$1', [req.params.id]);
+      if (!h) return res.status(404).json({ error: 'Not found' });
+      const { rows: [u] } = await pool.query(`
+        SELECT (SELECT COUNT(*) FROM mobile_lines WHERE current_holder_id=$1)::int AS lines,
+               (SELECT COUNT(*) FROM mobile_line_assignments WHERE holder_id=$1)::int AS history`, [req.params.id]);
+      if (u.lines || u.history) {
+        return res.status(400).json({ error: `${h.name} holds or has held a line — retire it instead, so that history keeps reading correctly.` });
+      }
+      await pool.query('DELETE FROM mobile_line_holders WHERE id=$1', [req.params.id]);
+      await logEvent({ entityType: 'holder', entityId: null, action: 'holder_deleted', user: req.user, detail: `${h.name} deleted — never held a line` });
+      res.json({ ok: true });
+    } catch (e) { sendError(res, e); }
+  });
+
   // ── Lines register ────────────────────────────────────────
   // Scoped exactly like every other person-linked resource: a supervisor or
   // project director sees the lines of people in their own projects/clients.
   // An UNASSIGNED line has no project, so it is only ever visible to HR/Admin --
   // which is also what keeps Available Lines off the Projects side entirely.
   const scopeClause = async (user, params) => {
-    if (['admin', 'hr'].includes(user.role)) return '';
+    if (user.role === 'admin') return '';
+    // A line held by a function (BTS NOC and the like) is admin-only: it has no
+    // project to scope by, and nobody outside admin manages one.
+    let w = ' AND l.current_holder_id IS NULL';
+    if (user.role === 'hr') return w;
     const projects = await getProjectFilter(user);
     const clients = await getClientFilter(user);
-    let w = ' AND e.id IS NOT NULL';
+    w += ' AND e.id IS NOT NULL';
     if (projects !== null) {
       if (projects.length === 0) return null;
       params.push(projects); w += ` AND e.project = ANY($${params.length})`;
@@ -503,6 +605,7 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
                AND r.status IN ('pending_approval','approved','email_prepared','sent_to_operator','partially_implemented')) AS pending_changes
       FROM mobile_lines l
       LEFT JOIN employees e ON e.id = l.current_employee_id
+      LEFT JOIN mobile_line_holders h ON h.id = l.current_holder_id
       LEFT JOIN telecom_packages p ON p.id = l.current_package_id
       LEFT JOIN telecom_credit_limits cl ON cl.id = l.current_credit_limit_id`;
 
@@ -544,7 +647,9 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
          LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, limit, (page - 1) * limit]);
       const { rows: [count] } = await pool.query(
-        `SELECT COUNT(*)::int AS total FROM mobile_lines l LEFT JOIN employees e ON e.id = l.current_employee_id ${where}`, params);
+        `SELECT COUNT(*)::int AS total FROM mobile_lines l
+           LEFT JOIN employees e ON e.id = l.current_employee_id
+           LEFT JOIN mobile_line_holders h ON h.id = l.current_holder_id ${where}`, params);
       res.json({ rows, total: count.total, page, pageSize: limit });
     } catch (e) { sendError(res, e); }
   });
@@ -564,7 +669,9 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
                COUNT(*) FILTER (WHERE l.current_package_id IS NULL OR l.current_credit_limit_id IS NULL)::int AS unconfigured,
                COALESCE(SUM(l.monthly_price_snapshot) FILTER (WHERE l.status='assigned'), 0) AS monthly_assigned,
                COALESCE(SUM(l.monthly_price_snapshot) FILTER (WHERE l.status='available'), 0) AS monthly_idle
-          FROM mobile_lines l LEFT JOIN employees e ON e.id = l.current_employee_id ${where}`, params);
+          FROM mobile_lines l
+          LEFT JOIN employees e ON e.id = l.current_employee_id
+          LEFT JOIN mobile_line_holders h ON h.id = l.current_holder_id ${where}`, params);
       res.json(s);
     } catch (e) { sendError(res, e); }
   });
@@ -591,6 +698,7 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
       const { rows: [line] } = await pool.query(`${LINE_SELECT} WHERE l.id = $1`, [req.params.id]);
       if (!line) return res.status(404).json({ error: 'Not found' });
       // An unassigned line has no project to scope against, so only HR/Admin see it.
+      if (line.holder_id && req.user.role !== 'admin') return res.status(404).json({ error: 'Not found' });
       if (!['admin', 'hr'].includes(req.user.role)) {
         if (!line.employee_id) return res.status(404).json({ error: 'Not found' });
         if (!(await inScope(req.user, line.project, line.client))) return res.status(404).json({ error: 'Not found' });
@@ -863,7 +971,7 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
           LEFT JOIN telecom_packages p ON p.id = l.current_package_id
           LEFT JOIN telecom_credit_limits c ON c.id = l.current_credit_limit_id
           LEFT JOIN LATERAL (
-            SELECT employee_name_snapshot, released_at, release_reason
+            SELECT COALESCE(employee_name_snapshot, holder_name_snapshot) AS employee_name_snapshot, released_at, release_reason
               FROM mobile_line_assignments a
              WHERE a.mobile_line_id = l.id AND a.released_at IS NOT NULL
              ORDER BY a.released_at DESC LIMIT 1) prev ON TRUE
@@ -877,8 +985,12 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
   // its holder and the history row are a single fact, and a half-applied
   // assignment is exactly what the one-line-per-employee rule exists to prevent.
   router.post('/:id/assign', auth, HR_ADMIN, async (req, res) => {
-    const { employee_id } = req.body;
-    if (!employee_id) return res.status(400).json({ error: 'Select an employee' });
+    const { employee_id, holder_id } = req.body;
+    if (!employee_id && !holder_id) return res.status(400).json({ error: 'Select an employee or a holder' });
+    if (employee_id && holder_id) return res.status(400).json({ error: 'A line goes to one holder — a person or a function, not both' });
+    // Holder lines are admin-only by decision: they have no project, so there is
+    // no scope to reason about and HR does not manage them.
+    if (holder_id && req.user.role !== 'admin') return res.status(403).json({ error: 'Only an admin can assign a line to a non-employee holder' });
     const db = await pool.connect();
     try {
       await db.query('BEGIN');
@@ -887,6 +999,33 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
       if (!line) { await db.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
       if (line.status === 'terminated') { await db.query('ROLLBACK'); return res.status(400).json({ error: 'This line is terminated and cannot be assigned' }); }
       if (line.status === 'assigned') { await db.query('ROLLBACK'); return res.status(400).json({ error: 'This line is already assigned — release it first' }); }
+
+      // A function rather than a person: one line each, same as an employee.
+      if (holder_id) {
+        const { rows: [h] } = await db.query('SELECT * FROM mobile_line_holders WHERE id=$1', [holder_id]);
+        if (!h) { await db.query('ROLLBACK'); return res.status(404).json({ error: 'Holder not found' }); }
+        if (!h.is_active) { await db.query('ROLLBACK'); return res.status(400).json({ error: `${h.name} is retired` }); }
+        const { rows: held } = await db.query(
+          `SELECT mobile_number FROM mobile_lines WHERE current_holder_id=$1 AND status='assigned'`, [holder_id]);
+        if (held.length) {
+          await db.query('ROLLBACK');
+          return res.status(400).json({ error: `${h.name} already holds ${held[0].mobile_number}. Each holder can only have one line.` });
+        }
+        await db.query(
+          `UPDATE mobile_lines SET status='assigned', current_holder_id=$1, current_employee_id=NULL,
+             current_assignment_date=NOW(), available_since=NULL, updated_at=NOW() WHERE id=$2`,
+          [holder_id, req.params.id]);
+        await db.query(
+          `INSERT INTO mobile_line_assignments (mobile_line_id, mobile_number_snapshot, holder_id,
+             holder_name_snapshot, project_snapshot, client_snapshot, assigned_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+          [line.id, line.mobile_number, h.id, h.name, h.project, h.client, req.user.id]);
+        await db.query('COMMIT');
+        await logEvent({ entityType: 'line', entityId: line.id, action: 'assigned', from: line.status, to: 'assigned',
+          user: req.user, detail: `${line.mobile_number} → ${h.name} (holder)` });
+        const { rows: [fresh] } = await pool.query(`${LINE_SELECT} WHERE l.id = $1`, [line.id]);
+        return res.json(fresh);
+      }
 
       const { rows: [emp] } = await db.query(
         `SELECT id, full_name, employee_number, national_id, project, client, employment_status
@@ -933,7 +1072,7 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
         WHERE mobile_line_id = $3 AND released_at IS NULL`,
       [user?.id || null, reason, line.id]);
     await db.query(
-      `UPDATE mobile_lines SET status='available', current_employee_id=NULL,
+      `UPDATE mobile_lines SET status='available', current_employee_id=NULL, current_holder_id=NULL,
          current_assignment_date=NULL, available_since=NOW(), updated_at=NOW() WHERE id=$1`,
       [line.id]);
   };
@@ -980,8 +1119,8 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
       if (line.status === 'terminated') { await db.query('ROLLBACK'); return res.status(400).json({ error: 'This line is already terminated' }); }
       if (line.status === 'assigned') await releaseLine(db, line, { reason: 'line_terminated', user: req.user });
       await db.query(
-        `UPDATE mobile_lines SET status='terminated', current_employee_id=NULL, current_assignment_date=NULL,
-           available_since=NULL, terminated_at=NOW(), terminated_by=$1, updated_at=NOW() WHERE id=$2`,
+        `UPDATE mobile_lines SET status='terminated', current_employee_id=NULL, current_holder_id=NULL,
+           current_assignment_date=NULL, available_since=NULL, terminated_at=NOW(), terminated_by=$1, updated_at=NOW() WHERE id=$2`,
         [req.user.id, line.id]);
       await db.query('COMMIT');
       await logEvent({ entityType: 'line', entityId: line.id, action: 'terminated', from: line.status, to: 'terminated',

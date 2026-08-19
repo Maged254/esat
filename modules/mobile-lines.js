@@ -614,12 +614,14 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
     let w = ' WHERE 1=1';
     if (search) {
       params.push(`%${search}%`);
-      w += ` AND (l.mobile_number ILIKE $${params.length} OR e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length} OR e.national_id ILIKE $${params.length})`;
+      w += ` AND (l.mobile_number ILIKE $${params.length} OR e.full_name ILIKE $${params.length}
+                  OR e.employee_number ILIKE $${params.length} OR e.national_id ILIKE $${params.length}
+                  OR h.name ILIKE $${params.length})`;
     }
     if (operator) { params.push(operator.split(',')); w += ` AND l.operator = ANY($${params.length})`; }
     if (status) { params.push(status.split(',')); w += ` AND l.status = ANY($${params.length})`; }
-    if (project) { params.push(project.split(',')); w += ` AND e.project = ANY($${params.length})`; }
-    if (client) { params.push(client.split(',')); w += ` AND e.client = ANY($${params.length})`; }
+    if (project) { params.push(project.split(',')); w += ` AND (e.project = ANY($${params.length}) OR h.project = ANY($${params.length}))`; }
+    if (client) { params.push(client.split(',')); w += ` AND (e.client = ANY($${params.length}) OR h.client = ANY($${params.length}))`; }
     if (package_id) { params.push(package_id); w += ` AND l.current_package_id = $${params.length}`; }
     if (credit_limit_id) { params.push(credit_limit_id); w += ` AND l.current_credit_limit_id = $${params.length}`; }
     if (cug === 'yes') w += ' AND l.cug_enabled = TRUE';
@@ -679,8 +681,14 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
   router.get('/filter-options', auth, CAN_VIEW, async (req, res) => {
     try {
       const [projects, clients, packages, limits] = await Promise.all([
-        pool.query(`SELECT DISTINCT e.project FROM mobile_lines l JOIN employees e ON e.id=l.current_employee_id WHERE NULLIF(TRIM(e.project),'') IS NOT NULL ORDER BY 1`),
-        pool.query(`SELECT DISTINCT e.client FROM mobile_lines l JOIN employees e ON e.id=l.current_employee_id WHERE NULLIF(TRIM(e.client),'') IS NOT NULL ORDER BY 1`),
+        pool.query(`SELECT DISTINCT p AS project FROM (
+                      SELECT e.project AS p FROM mobile_lines l JOIN employees e ON e.id=l.current_employee_id
+                      UNION SELECT h.project FROM mobile_lines l JOIN mobile_line_holders h ON h.id=l.current_holder_id
+                    ) x WHERE NULLIF(TRIM(p),'') IS NOT NULL ORDER BY 1`),
+        pool.query(`SELECT DISTINCT c AS client FROM (
+                      SELECT e.client AS c FROM mobile_lines l JOIN employees e ON e.id=l.current_employee_id
+                      UNION SELECT h.client FROM mobile_lines l JOIN mobile_line_holders h ON h.id=l.current_holder_id
+                    ) x WHERE NULLIF(TRIM(c),'') IS NOT NULL ORDER BY 1`),
         pool.query(`SELECT id, operator, package_name FROM telecom_packages ORDER BY operator, package_name`),
         pool.query(`SELECT id, operator, credit_limit FROM telecom_credit_limits ORDER BY operator, credit_limit`),
       ]);

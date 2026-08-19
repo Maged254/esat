@@ -776,6 +776,7 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
       // A line belongs to its holder's project when nobody's employee record
       // supplies one -- otherwise every function-held line reports as "(none)".
       const PROJECT = `COALESCE(NULLIF(TRIM(e.project),''), NULLIF(TRIM(h.project),''), '(none)')`;
+      const CLIENT = `COALESCE(NULLIF(TRIM(e.client),''), NULLIF(TRIM(h.client),''))`;
 
       const [op, proj, pkg, flow] = await Promise.all([
         pool.query(`SELECT l.operator,
@@ -786,6 +787,10 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
                       COALESCE(SUM(cl.credit_limit) FILTER (WHERE l.status='assigned'),0) AS credit_limit
                     ${from} ${where} GROUP BY l.operator ORDER BY l.operator`, params),
         pool.query(`SELECT ${PROJECT} AS project,
+                      -- A project usually serves one client; where a project's
+                      -- lines span several, say so rather than picking one.
+                      CASE WHEN COUNT(DISTINCT ${CLIENT}) = 1 THEN MAX(${CLIENT})
+                           WHEN COUNT(DISTINCT ${CLIENT}) > 1 THEN 'Multiple' END AS client,
                       COUNT(*)::int AS lines,
                       COALESCE(SUM(${COST}) FILTER (WHERE l.status<>'terminated'),0) AS monthly,
                       COALESCE(SUM(cl.credit_limit) FILTER (WHERE l.status='assigned'),0) AS credit_limit

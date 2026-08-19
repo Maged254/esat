@@ -15,6 +15,10 @@
 
 const OPERATORS = ['safaricom', 'airtel'];
 const LINE_STATUSES = ['available', 'assigned', 'terminated'];
+// CUG is billed per line per month on top of the package. It is a checkbox
+// rather than a catalogue product, so it would otherwise be missing from every
+// cost figure the module reports.
+const CUG_MONTHLY = 300;
 
 module.exports = function mobileLinesModule({ express, pool, auth, inScope, getProjectFilter, getClientFilter, sendError, sendMail, mailWrap }) {
   const router = express.Router();
@@ -674,11 +678,27 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
                COUNT(*) FILTER (WHERE l.operator='safaricom')::int AS safaricom,
                COUNT(*) FILTER (WHERE l.operator='airtel')::int AS airtel,
                COUNT(*) FILTER (WHERE l.current_package_id IS NULL OR l.current_credit_limit_id IS NULL)::int AS unconfigured,
-               COALESCE(SUM(l.monthly_price_snapshot) FILTER (WHERE l.status='assigned'), 0) AS monthly_assigned,
-               COALESCE(SUM(l.monthly_price_snapshot) FILTER (WHERE l.status='available'), 0) AS monthly_idle
+               -- What a line costs every month is its package PLUS its CUG
+               -- subscription, which is charged per line and is easy to forget
+               -- because it is a checkbox rather than a product.
+               COALESCE(SUM(l.monthly_price_snapshot) FILTER (WHERE l.status='assigned'), 0) AS package_assigned,
+               COALESCE(SUM(l.monthly_price_snapshot) FILTER (WHERE l.status='available'), 0) AS package_idle,
+               COUNT(*) FILTER (WHERE l.status='assigned' AND l.cug_enabled)::int AS cug_assigned,
+               COUNT(*) FILTER (WHERE l.status='available' AND l.cug_enabled)::int AS cug_idle,
+               COALESCE(SUM(l.monthly_price_snapshot) FILTER (WHERE l.status='assigned'), 0)
+                 + ${CUG_MONTHLY} * COUNT(*) FILTER (WHERE l.status='assigned' AND l.cug_enabled) AS monthly_assigned,
+               COALESCE(SUM(l.monthly_price_snapshot) FILTER (WHERE l.status='available'), 0)
+                 + ${CUG_MONTHLY} * COUNT(*) FILTER (WHERE l.status='available' AND l.cug_enabled) AS monthly_idle,
+               -- A credit limit is headroom, not spend: it is the most a line
+               -- can run up on top of its package. Summed, it turns the monthly
+               -- figure into a worst case.
+               COALESCE(SUM(cl.credit_limit) FILTER (WHERE l.status='assigned'), 0) AS credit_limit_assigned
           FROM mobile_lines l
           LEFT JOIN employees e ON e.id = l.current_employee_id
-          LEFT JOIN mobile_line_holders h ON h.id = l.current_holder_id ${where}`, params);
+          LEFT JOIN mobile_line_holders h ON h.id = l.current_holder_id
+          LEFT JOIN telecom_credit_limits cl ON cl.id = l.current_credit_limit_id ${where}`, params);
+      s.max_assigned = Number(s.monthly_assigned) + Number(s.credit_limit_assigned);
+      s.cug_monthly_rate = CUG_MONTHLY;
       res.json(s);
     } catch (e) { sendError(res, e); }
   });

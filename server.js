@@ -281,6 +281,25 @@ async function setupDB() {
     // status -- both stages end as 'canceled' -- and the rejector's role is a
     // poor proxy, since roles change and an admin can reject at either gate.
     await client.query('ALTER TABLE ncr_items ADD COLUMN IF NOT EXISTS rejected_stage VARCHAR(10)');
+    // Deleting an audit closes every NCR it raised. That was recorded on the
+    // audit but never on the items, so they showed as cancelled by nobody for no
+    // reason -- the audit itself always knew.
+    await client.query('ALTER TABLE ncr_items ADD COLUMN IF NOT EXISTS cancelled_by UUID REFERENCES users(id)');
+    await client.query('ALTER TABLE ncr_items ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ');
+    await client.query('ALTER TABLE ncr_items ADD COLUMN IF NOT EXISTS cancel_reason TEXT');
+    await client.query(`
+      UPDATE ncr_items n
+         SET cancelled_by = a.deleted_by,
+             cancelled_at = a.deleted_at,
+             cancel_reason = 'Audit deleted' || COALESCE(' — ' || NULLIF(TRIM(a.delete_reason),''), '')
+        FROM audit_items ai
+        JOIN audits a ON a.id = ai.audit_id
+       WHERE ai.id = n.audit_item_id
+         AND a.is_deleted IS TRUE
+         AND n.status = 'canceled'
+         AND n.reject_reason IS NULL
+         AND n.cancelled_at IS NULL
+    `);
     // Backfill the rejections made before the column existed. Safety approval
     // stamps date_purchase_requested on the linked PPE request and a later
     // rejection never clears it, so its presence means the item had already
@@ -2227,9 +2246,13 @@ app.delete('/api/audits/:id', auth, async (req, res) => {
        )`,
       [req.params.id]
     );
+    // Carry the deletion onto the items it closes, so they explain themselves
+    // instead of reading as anonymous cancellations.
     await client.query(
-      `UPDATE ncr_items SET status='canceled' WHERE audit_item_id IN (SELECT id FROM audit_items WHERE audit_id=$1)`,
-      [req.params.id]
+      `UPDATE ncr_items SET status='canceled', cancelled_by=$2, cancelled_at=NOW(),
+         cancel_reason=$3, updated_at=NOW()
+        WHERE audit_item_id IN (SELECT id FROM audit_items WHERE audit_id=$1)`,
+      [req.params.id, req.user.id, 'Audit deleted — ' + delete_reason.trim()]
     );
     await client.query('COMMIT');
     res.json({ message: 'Deleted' });
@@ -2556,6 +2579,7 @@ app.get('/api/ncr', auth, async (req, res) => {
         (n.casual_id IS NOT NULL) as is_casual,
         p.name as ppe_name,p.category,ppe_needs_pda(p.id, COALESCE(e.project, c.project)) as needs_pda,u.full_name as audited_by_name,
         n.reject_reason, n.rejected_at, n.rejected_stage, ru.full_name as rejected_by_name,
+        n.cancel_reason, n.cancelled_at, cu.full_name as cancelled_by_name,
         COALESCE(ai.quantity,1) as quantity,
         (SELECT MAX(pr.date_distributed) FROM ppe_requests pr
          WHERE pr.ppe_item_id=n.ppe_item_id AND pr.date_distributed IS NOT NULL
@@ -2568,6 +2592,7 @@ app.get('/api/ncr', auth, async (req, res) => {
       JOIN ppe_items p ON p.id=n.ppe_item_id
       -- who rejected it, so the list can say more than "Rejected"
       LEFT JOIN users ru ON ru.id=n.rejected_by
+      LEFT JOIN users cu ON cu.id=n.cancelled_by
       LEFT JOIN audit_items ai ON ai.id=n.audit_item_id
       LEFT JOIN audits a ON a.id=ai.audit_id
       LEFT JOIN users u ON u.id=a.audited_by WHERE 1=1`;

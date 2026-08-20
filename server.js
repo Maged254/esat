@@ -1833,15 +1833,21 @@ app.get('/api/employee-change-log', auth, async (req, res) => {
     const limit = Math.min(Math.max(parseInt(pageSize) || 50, 1), 200);
     const pageNum = Math.max(parseInt(page) || 1, 1);
     const offset = (pageNum - 1) * limit;
-    let q = `SELECT id, employee_id, employee_name, national_id, employee_number, action, reason, changes,
-                    changed_by_name, changed_at, COUNT(*) OVER() as full_count
-             FROM employee_change_log WHERE 1=1`;
+    // The log keeps a name/ID snapshot but no organization, so it is read from
+    // the employee record. That is their CURRENT organization rather than the one
+    // they had at the time -- the log has no history of it to offer.
+    let q = `SELECT l.id, l.employee_id, l.employee_name, l.national_id, l.employee_number,
+                    l.action, l.reason, l.changes, l.changed_by_name, l.changed_at,
+                    e.organization, COUNT(*) OVER() as full_count
+             FROM employee_change_log l
+             LEFT JOIN employees e ON e.id = l.employee_id
+             WHERE 1=1`;
     const params = [];
-    if (from) { params.push(from); q += ` AND changed_at >= $${params.length}::date`; }
-    if (to) { params.push(to); q += ` AND changed_at < ($${params.length}::date + INTERVAL '1 day')`; }
-    if (action) { params.push(action); q += ` AND action = $${params.length}`; }
-    if (search) { params.push(`%${search}%`); q += ` AND (employee_name ILIKE $${params.length} OR national_id ILIKE $${params.length} OR employee_number ILIKE $${params.length})`; }
-    q += ` ORDER BY changed_at DESC`;
+    if (from) { params.push(from); q += ` AND l.changed_at >= $${params.length}::date`; }
+    if (to) { params.push(to); q += ` AND l.changed_at < ($${params.length}::date + INTERVAL '1 day')`; }
+    if (action) { params.push(action); q += ` AND l.action = $${params.length}`; }
+    if (search) { params.push(`%${search}%`); q += ` AND (l.employee_name ILIKE $${params.length} OR l.national_id ILIKE $${params.length} OR l.employee_number ILIKE $${params.length} OR e.organization ILIKE $${params.length})`; }
+    q += ` ORDER BY l.changed_at DESC`;
     params.push(limit); q += ` LIMIT $${params.length}`;
     params.push(offset); q += ` OFFSET $${params.length}`;
     const { rows } = await pool.query(q, params);

@@ -1033,8 +1033,29 @@ app.post('/api/auth/login', async (req, res) => {
 
 // Me
 app.get('/api/auth/me', auth, async (req, res) => {
-  const { rows } = await pool.query('SELECT id,full_name,email,role,profile_picture,project_access,page_access,client_access,must_reset_password FROM users WHERE id=$1', [req.user.id]);
-  res.json(rows[0]);
+  const { rows } = await pool.query('SELECT id,full_name,email,role,profile_picture,project_access,page_access,client_access,hr_task_access,outsource_access,must_reset_password FROM users WHERE id=$1', [req.user.id]);
+  const u = rows[0];
+  if (!u) return res.status(401).json({ error: 'Session no longer valid, please sign in again' });
+  // A token carries the role and access rights it was issued with, but this
+  // endpoint answers from the database -- so after an admin changes someone's
+  // role, the app renders what they NOW are while every write is still judged
+  // against what they WERE. The result is buttons that silently do nothing
+  // (a promoted EHS manager could see Approve and get 403 from it).
+  //
+  // Rather than let the two drift, treat a mismatch as an expired session: the
+  // client logs out on a 401 here, and the next login mints a correct token.
+  // The sync account is exempt -- its long-lived token is pasted into a Power
+  // Automate flow and must not be invalidated from here.
+  const sameList = (a, b) => JSON.stringify([...(a || [])].sort()) === JSON.stringify([...(b || [])].sort());
+  const stale = u.role !== req.user.role
+    || !sameList(u.project_access, req.user.project_access)
+    || !sameList(u.client_access, req.user.client_access)
+    || !sameList(u.hr_task_access, req.user.hr_task_access)
+    || !sameList(u.outsource_access, req.user.outsource_access);
+  if (stale && !req.user.sync) {
+    return res.status(401).json({ error: 'Your role or access has changed — please sign in again' });
+  }
+  res.json(u);
 });
 
 // Cheap session-validity check (no DB hit) — polled periodically so a backend

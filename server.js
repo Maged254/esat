@@ -277,6 +277,21 @@ async function setupDB() {
     await client.query('ALTER TABLE ncr_items ADD COLUMN IF NOT EXISTS reject_reason TEXT');
     await client.query('ALTER TABLE ncr_items ADD COLUMN IF NOT EXISTS rejected_by UUID REFERENCES users(id)');
     await client.query('ALTER TABLE ncr_items ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMPTZ');
+    // Which gate the item was turned back at. Not derivable from the stored
+    // status -- both stages end as 'canceled' -- and the rejector's role is a
+    // poor proxy, since roles change and an admin can reject at either gate.
+    await client.query('ALTER TABLE ncr_items ADD COLUMN IF NOT EXISTS rejected_stage VARCHAR(10)');
+    // Backfill the rejections made before the column existed. Safety approval
+    // stamps date_purchase_requested on the linked PPE request and a later
+    // rejection never clears it, so its presence means the item had already
+    // passed Safety and was therefore turned back at PM.
+    await client.query(`
+      UPDATE ncr_items n SET rejected_stage = CASE
+          WHEN EXISTS (SELECT 1 FROM ppe_requests pr
+                        WHERE pr.ncr_item_id = n.id AND pr.date_purchase_requested IS NOT NULL) THEN 'pm'
+          ELSE 'safety' END
+       WHERE n.status = 'canceled' AND n.reject_reason IS NOT NULL AND n.rejected_stage IS NULL
+    `);
 
     // Ensure location_id column exists on audits
     await client.query('ALTER TABLE audits ADD COLUMN IF NOT EXISTS location_id INTEGER REFERENCES locations(id)');
@@ -2540,7 +2555,7 @@ app.get('/api/ncr', auth, async (req, res) => {
         COALESCE(e.organization, c.organization) as organization,
         (n.casual_id IS NOT NULL) as is_casual,
         p.name as ppe_name,p.category,ppe_needs_pda(p.id, COALESCE(e.project, c.project)) as needs_pda,u.full_name as audited_by_name,
-        n.reject_reason, n.rejected_at, ru.full_name as rejected_by_name,
+        n.reject_reason, n.rejected_at, n.rejected_stage, ru.full_name as rejected_by_name,
         COALESCE(ai.quantity,1) as quantity,
         (SELECT MAX(pr.date_distributed) FROM ppe_requests pr
          WHERE pr.ppe_item_id=n.ppe_item_id AND pr.date_distributed IS NOT NULL
@@ -2705,9 +2720,13 @@ app.put('/api/ncr/:id/status', auth, async (req, res) => {
           : req.user.role === 'project_director' ? 'PM can only reject Pending PM items.'
           : 'This item is not at a stage that can be rejected.' });
       }
+      // isFlagged / isPendingPm above already decided which gate this is, so
+      // store it rather than leaving it to be inferred later.
+      const stage = isFlagged ? 'safety' : 'pm';
       const { rows: [rej] } = await client.query(
-        `UPDATE ncr_items SET status='canceled', reject_reason=$1, rejected_by=$2, rejected_at=NOW(), resolved_at=NULL, updated_at=NOW() WHERE id=$3 RETURNING *`,
-        [reason, req.user.id, req.params.id]
+        `UPDATE ncr_items SET status='canceled', reject_reason=$1, rejected_by=$2, rejected_at=NOW(),
+           rejected_stage=$3, resolved_at=NULL, updated_at=NOW() WHERE id=$4 RETURNING *`,
+        [reason, req.user.id, stage, req.params.id]
       );
       await client.query(`UPDATE ppe_requests SET status='canceled', updated_at=NOW() WHERE ncr_item_id=$1`, [req.params.id]);
       await client.query('COMMIT');

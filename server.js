@@ -2539,7 +2539,9 @@ app.get('/api/ncr', auth, async (req, res) => {
         COALESCE(e.client, c.client) as client,
         COALESCE(e.organization, c.organization) as organization,
         (n.casual_id IS NOT NULL) as is_casual,
-        p.name as ppe_name,p.category,ppe_needs_pda(p.id, COALESCE(e.project, c.project)) as needs_pda,u.full_name as audited_by_name,n.reject_reason,COALESCE(ai.quantity,1) as quantity,
+        p.name as ppe_name,p.category,ppe_needs_pda(p.id, COALESCE(e.project, c.project)) as needs_pda,u.full_name as audited_by_name,
+        n.reject_reason, n.rejected_at, ru.full_name as rejected_by_name,
+        COALESCE(ai.quantity,1) as quantity,
         (SELECT MAX(pr.date_distributed) FROM ppe_requests pr
          WHERE pr.ppe_item_id=n.ppe_item_id AND pr.date_distributed IS NOT NULL
            AND ((n.employee_id IS NOT NULL AND pr.employee_id=n.employee_id) OR (n.casual_id IS NOT NULL AND pr.casual_id=n.casual_id))
@@ -2549,6 +2551,8 @@ app.get('/api/ncr', auth, async (req, res) => {
       LEFT JOIN employees e ON e.id=n.employee_id
       LEFT JOIN casuals c ON c.id=n.casual_id
       JOIN ppe_items p ON p.id=n.ppe_item_id
+      -- who rejected it, so the list can say more than "Rejected"
+      LEFT JOIN users ru ON ru.id=n.rejected_by
       LEFT JOIN audit_items ai ON ai.id=n.audit_item_id
       LEFT JOIN audits a ON a.id=ai.audit_id
       LEFT JOIN users u ON u.id=a.audited_by WHERE 1=1`;

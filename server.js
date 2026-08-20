@@ -1518,6 +1518,46 @@ app.get('/api/employees/overdue', auth, async (req, res) => {
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
+// Every PPE/Tool allocation in one call: one row per employee-and-item, so it
+// can be exported and pivoted. Only the per-employee view existed, which is no
+// use for "what is everyone allocated" without 800 round trips.
+//
+// Employees with nothing allocated are included with a blank item -- an export
+// that silently drops them would read as though everyone has PPE assigned.
+app.get('/api/employees/ppe-allocations', auth, async (req, res) => {
+  if (!['admin','hr','ehs_manager','ehs_officer','supervisor','fleet','project_director'].includes(req.user.role)) {
+    return res.status(403).json({ error: 'Not authorized' });
+  }
+  try {
+    const params = [];
+    let w = ` WHERE e.employment_status = $1`;
+    params.push(req.query.employment_status || 'active');
+    const projects = await getProjectFilter(req.user);
+    if (projects !== null) {
+      if (projects.length === 0) return res.json([]);
+      params.push(projects); w += ` AND e.project = ANY($${params.length})`;
+    }
+    const clients = await getClientFilter(req.user);
+    if (clients !== null) {
+      if (clients.length === 0) return res.json([]);
+      params.push(clients); w += ` AND e.client = ANY($${params.length})`;
+    }
+    const { rows } = await pool.query(`
+      SELECT e.full_name AS employee_name, e.employee_number, e.national_id, e.job_title,
+             e.department, e.project, e.client, e.organization, e.resource_type, e.employment_status,
+             p.name AS ppe_item, p.category,
+             (SELECT MAX(pr.date_distributed) FROM ppe_requests pr
+               WHERE pr.employee_id = e.id AND pr.ppe_item_id = p.id AND pr.date_distributed IS NOT NULL
+             ) AS last_distributed
+        FROM employees e
+        LEFT JOIN employee_ppe_assignments epa ON epa.employee_id = e.id
+        LEFT JOIN ppe_items p ON p.id = epa.ppe_item_id AND p.is_active = TRUE
+        ${w}
+       ORDER BY e.full_name, p.sort_order NULLS LAST, p.name`, params);
+    res.json(rows);
+  } catch (e) { sendError(res, e); }
+});
+
 app.get('/api/employees/:id', auth, async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM employees WHERE id=$1', [req.params.id]);
   if (!rows[0]) return res.status(404).json({ error: 'Not found' });

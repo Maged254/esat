@@ -1500,6 +1500,9 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
   lineRequests.post('/', auth, HR_ADMIN, async (req, res) => {
     const { employee_id, reason } = req.body;
     if (!employee_id) return res.status(400).json({ error: 'Choose the employee who needs a line' });
+    // The reason is what an admin reads when deciding whether to hand over one
+    // of a small number of free lines, so it is required rather than optional.
+    if (!reason || !reason.trim()) return res.status(400).json({ error: 'Say why they need a line' });
     try {
       const { rows: [emp] } = await pool.query(
         'SELECT id, full_name, project, client, employment_status FROM employees WHERE id=$1', [employee_id]);
@@ -1512,7 +1515,7 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
       const { rows: [r] } = await pool.query(
         `INSERT INTO mobile_line_requests (employee_id, employee_name_snapshot, project_snapshot, client_snapshot, reason, requested_by)
          VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-        [emp.id, emp.full_name, emp.project, emp.client, (reason || '').trim() || null, req.user.id]);
+        [emp.id, emp.full_name, emp.project, emp.client, reason.trim(), req.user.id]);
       await logEvent({ entityType: 'line_request', entityId: r.id, action: 'line_requested', to: 'pending', user: req.user,
         detail: `${emp.full_name}${emp.project ? ` (${emp.project})` : ''}${r.reason ? ` — "${r.reason}"` : ''}` });
       res.status(201).json(r);

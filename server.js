@@ -999,8 +999,14 @@ const mobileLines = require('./modules/mobile-lines')({
   mailWrap: (html) => mailWrap(html),
 });
 app.use('/api/mobile-lines', mobileLines.router);
-app.use('/api/mobile-line-change-requests', mobileLines.requests);
-app.use('/api/mobile-line-email-batches', mobileLines.batches);
+app.use('/api/mobile-line-requests', mobileLines.lineRequests);
+// The product-change workflow (change requests, operator email batches,
+// implementation confirmation) is retired: product changes are now made
+// directly on the line by an admin, which is audited as a correction. The
+// routers are left unmounted rather than deleted so the code is there if the
+// approval chain is ever wanted back.
+// app.use('/api/mobile-line-change-requests', mobileLines.requests);
+// app.use('/api/mobile-line-email-batches', mobileLines.batches);
 
 // Looks up the project/client of the employee or casual behind an id.
 const getPersonScope = async (id) => {

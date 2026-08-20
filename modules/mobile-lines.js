@@ -319,6 +319,33 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
       VALUES ('safaricom', ${CUG_MONTHLY_DEFAULT}), ('airtel', ${CUG_MONTHLY_DEFAULT})
       ON CONFLICT (operator) DO NOTHING`);
 
+    // Someone needs a company line. HR or an admin raises it against the
+    // employee; an admin fulfils it by handing over a free number, which closes
+    // the request. Deliberately not a product-change workflow -- it asks for a
+    // line, it does not ask an operator for anything.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS mobile_line_requests (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        employee_id UUID NOT NULL REFERENCES employees(id),
+        employee_name_snapshot TEXT,
+        project_snapshot TEXT,
+        client_snapshot TEXT,
+        reason TEXT,
+        status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','fulfilled','cancelled')),
+        requested_by UUID REFERENCES users(id),
+        requested_at TIMESTAMPTZ DEFAULT NOW(),
+        mobile_line_id UUID REFERENCES mobile_lines(id),
+        fulfilled_by UUID REFERENCES users(id),
+        fulfilled_at TIMESTAMPTZ,
+        cancelled_by UUID REFERENCES users(id),
+        cancelled_at TIMESTAMPTZ,
+        cancel_reason TEXT
+      )`);
+    // One open request per person, for the same reason a person holds one line.
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS one_open_line_request_per_employee
+        ON mobile_line_requests (employee_id) WHERE status = 'pending'`);
+
     // Append-only audit. Ships in Phase 1 on purpose -- history cannot be
     // backfilled, so it has to exist before the first action does.
     await client.query(`
@@ -800,14 +827,11 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
                       COUNT(*)::int AS lines,
                       COALESCE(SUM(${COST}) FILTER (WHERE l.status<>'terminated'),0) AS monthly
                     ${from} ${where} GROUP BY 1,2 ORDER BY lines DESC`, params),
+        // What is outstanding is now simply: who is waiting for a line.
         pool.query(`SELECT
-                      COUNT(*) FILTER (WHERE r.status='pending_approval')::int AS pending_approval,
-                      COUNT(*) FILTER (WHERE r.status='approved')::int AS awaiting_email,
-                      COUNT(*) FILTER (WHERE r.status='email_prepared')::int AS email_prepared,
-                      COUNT(*) FILTER (WHERE r.status='sent_to_operator')::int AS awaiting_operator,
-                      COUNT(*) FILTER (WHERE r.status='partially_implemented')::int AS partially_implemented,
-                      COUNT(*) FILTER (WHERE r.status='implemented' AND r.updated_at > NOW() - INTERVAL '30 days')::int AS implemented_30d
-                    FROM mobile_change_requests r`),
+                      COUNT(*) FILTER (WHERE r.status='pending')::int AS pending_line_requests,
+                      COUNT(*) FILTER (WHERE r.status='fulfilled' AND r.fulfilled_at > NOW() - INTERVAL '30 days')::int AS fulfilled_30d
+                    FROM mobile_line_requests r`),
       ]);
       res.json({
         by_operator: op.rows, by_project: proj.rows, by_package: pkg.rows,
@@ -1197,6 +1221,10 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
         [line.id, line.mobile_number, emp.id, emp.employee_number, emp.full_name,
          emp.national_id, emp.project, emp.client, req.user.id]);
+      // If someone had asked for a line for this person, that ask is now met.
+      await db.query(
+        `UPDATE mobile_line_requests SET status='fulfilled', mobile_line_id=$1, fulfilled_by=$2, fulfilled_at=NOW()
+          WHERE employee_id=$3 AND status='pending'`, [line.id, req.user.id, emp.id]);
       await db.query('COMMIT');
       await logEvent({ entityType: 'line', entityId: line.id, action: 'assigned', from: line.status, to: 'assigned',
         user: req.user, detail: `${line.mobile_number} → ${emp.full_name}${emp.project ? ` (${emp.project})` : ''}` });
@@ -1435,6 +1463,130 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
         [req.params.id]);
       res.json(rows);
     } catch (e) { sendError(res, e); }
+  });
+
+  // ── Requests for a new line ───────────────────────────────
+  // Raised by HR or an admin against an employee who needs a number, and closed
+  // when one is actually handed over. Assigning a line through Available Lines
+  // closes any open request for that person too, so the queue cannot fill with
+  // requests that were quietly satisfied elsewhere.
+  const lineRequests = express.Router();
+
+  lineRequests.get('/', auth, HR_ADMIN, async (req, res) => {
+    try {
+      const params = [];
+      let w = ' WHERE 1=1';
+      if (req.query.status) { params.push(req.query.status.split(',')); w += ` AND r.status = ANY($${params.length})`; }
+      if (req.query.search) { params.push(`%${req.query.search}%`); w += ` AND r.employee_name_snapshot ILIKE $${params.length}`; }
+      const { rows } = await pool.query(`
+        SELECT r.*, l.mobile_number, l.operator,
+               u.full_name AS requested_by_name, f.full_name AS fulfilled_by_name, c.full_name AS cancelled_by_name,
+               e.employee_number, e.national_id, e.job_title, e.employment_status
+          FROM mobile_line_requests r
+          LEFT JOIN mobile_lines l ON l.id = r.mobile_line_id
+          LEFT JOIN users u ON u.id = r.requested_by
+          LEFT JOIN users f ON f.id = r.fulfilled_by
+          LEFT JOIN users c ON c.id = r.cancelled_by
+          LEFT JOIN employees e ON e.id = r.employee_id
+          ${w} ORDER BY r.requested_at DESC LIMIT 300`, params);
+      const { rows: [s2] } = await pool.query(
+        `SELECT COUNT(*) FILTER (WHERE status='pending')::int AS pending,
+                COUNT(*) FILTER (WHERE status='fulfilled')::int AS fulfilled,
+                COUNT(*)::int AS total FROM mobile_line_requests`);
+      res.json({ rows, stats: s2 });
+    } catch (e) { sendError(res, e); }
+  });
+
+  lineRequests.post('/', auth, HR_ADMIN, async (req, res) => {
+    const { employee_id, reason } = req.body;
+    if (!employee_id) return res.status(400).json({ error: 'Choose the employee who needs a line' });
+    try {
+      const { rows: [emp] } = await pool.query(
+        'SELECT id, full_name, project, client, employment_status FROM employees WHERE id=$1', [employee_id]);
+      if (!emp) return res.status(404).json({ error: 'Not found' });
+      if (emp.employment_status !== 'active') return res.status(400).json({ error: `${emp.full_name} is not an active employee` });
+      const { rows: held } = await pool.query(
+        `SELECT mobile_number FROM mobile_lines WHERE current_employee_id=$1 AND status='assigned'`, [employee_id]);
+      if (held.length) return res.status(400).json({ error: `${emp.full_name} already holds ${held[0].mobile_number}` });
+
+      const { rows: [r] } = await pool.query(
+        `INSERT INTO mobile_line_requests (employee_id, employee_name_snapshot, project_snapshot, client_snapshot, reason, requested_by)
+         VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+        [emp.id, emp.full_name, emp.project, emp.client, (reason || '').trim() || null, req.user.id]);
+      await logEvent({ entityType: 'line_request', entityId: r.id, action: 'line_requested', to: 'pending', user: req.user,
+        detail: `${emp.full_name}${emp.project ? ` (${emp.project})` : ''}${r.reason ? ` — "${r.reason}"` : ''}` });
+      res.status(201).json(r);
+    } catch (e) {
+      if (e.code === '23505') return res.status(400).json({ error: 'There is already an open line request for that employee' });
+      sendError(res, e);
+    }
+  });
+
+  lineRequests.post('/:id/cancel', auth, HR_ADMIN, async (req, res) => {
+    try {
+      const { rows: [r] } = await pool.query('SELECT * FROM mobile_line_requests WHERE id=$1', [req.params.id]);
+      if (!r) return res.status(404).json({ error: 'Not found' });
+      if (r.status !== 'pending') return res.status(400).json({ error: `This request is already ${r.status}` });
+      if (req.user.role !== 'admin' && r.requested_by !== req.user.id) {
+        return res.status(403).json({ error: 'You can only cancel a request you raised' });
+      }
+      await pool.query(
+        `UPDATE mobile_line_requests SET status='cancelled', cancelled_by=$1, cancelled_at=NOW(), cancel_reason=$2 WHERE id=$3`,
+        [req.user.id, (req.body?.reason || '').trim() || null, req.params.id]);
+      await logEvent({ entityType: 'line_request', entityId: r.id, action: 'line_request_cancelled', from: 'pending', to: 'cancelled',
+        user: req.user, detail: r.employee_name_snapshot });
+      res.json({ ok: true });
+    } catch (e) { sendError(res, e); }
+  });
+
+  // Fulfil = hand over a specific free number. Same transaction and the same
+  // rules as a normal assignment, so a request can never create a state that
+  // Available Lines would have refused.
+  lineRequests.post('/:id/fulfil', auth, HR_ADMIN, async (req, res) => {
+    const { mobile_line_id } = req.body;
+    if (!mobile_line_id) return res.status(400).json({ error: 'Choose the number to hand over' });
+    const db = await pool.connect();
+    try {
+      const { rows: [r] } = await db.query('SELECT * FROM mobile_line_requests WHERE id=$1', [req.params.id]);
+      if (!r) return res.status(404).json({ error: 'Not found' });
+      if (r.status !== 'pending') return res.status(400).json({ error: `This request is already ${r.status}` });
+
+      await db.query('BEGIN');
+      const { rows: [line] } = await db.query('SELECT * FROM mobile_lines WHERE id=$1 FOR UPDATE', [mobile_line_id]);
+      if (!line) { await db.query('ROLLBACK'); return res.status(404).json({ error: 'Line not found' }); }
+      if (line.status !== 'available') { await db.query('ROLLBACK'); return res.status(400).json({ error: `${line.mobile_number} is ${line.status}, not available` }); }
+      const { rows: [emp] } = await db.query(
+        'SELECT id, full_name, employee_number, national_id, project, client, employment_status FROM employees WHERE id=$1', [r.employee_id]);
+      if (!emp || emp.employment_status !== 'active') {
+        await db.query('ROLLBACK');
+        return res.status(400).json({ error: `${r.employee_name_snapshot} is no longer an active employee` });
+      }
+      const { rows: held } = await db.query(
+        `SELECT mobile_number FROM mobile_lines WHERE current_employee_id=$1 AND status='assigned'`, [emp.id]);
+      if (held.length) { await db.query('ROLLBACK'); return res.status(400).json({ error: `${emp.full_name} already holds ${held[0].mobile_number}` }); }
+
+      await db.query(
+        `UPDATE mobile_lines SET status='assigned', current_employee_id=$1, current_holder_id=NULL,
+           current_assignment_date=NOW(), available_since=NULL, updated_at=NOW() WHERE id=$2`, [emp.id, line.id]);
+      await db.query(
+        `INSERT INTO mobile_line_assignments (mobile_line_id, mobile_number_snapshot, employee_id,
+           employee_number_snapshot, employee_name_snapshot, national_id_snapshot, project_snapshot, client_snapshot, assigned_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [line.id, line.mobile_number, emp.id, emp.employee_number, emp.full_name, emp.national_id, emp.project, emp.client, req.user.id]);
+      await db.query(
+        `UPDATE mobile_line_requests SET status='fulfilled', mobile_line_id=$1, fulfilled_by=$2, fulfilled_at=NOW() WHERE id=$3`,
+        [line.id, req.user.id, req.params.id]);
+      await db.query('COMMIT');
+      await logEvent({ entityType: 'line_request', entityId: r.id, action: 'line_request_fulfilled', from: 'pending', to: 'fulfilled',
+        user: req.user, detail: `${line.mobile_number} → ${emp.full_name}` });
+      await logEvent({ entityType: 'line', entityId: line.id, action: 'assigned', from: 'available', to: 'assigned',
+        user: req.user, detail: `${line.mobile_number} → ${emp.full_name} (fulfilling a line request)` });
+      res.json({ ok: true, mobile_number: line.mobile_number });
+    } catch (e) {
+      await db.query('ROLLBACK').catch(() => {});
+      if (e.code === '23505') return res.status(400).json({ error: 'That employee already holds a line' });
+      sendError(res, e);
+    } finally { db.release(); }
   });
 
   // ── Change requests ───────────────────────────────────────
@@ -2157,5 +2309,5 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
     } finally { db.release(); }
   });
 
-  return { router, requests, batches, setup, logEvent, normaliseNumber, releaseLinesForExitedEmployees, OPERATORS, LINE_STATUSES };
+  return { router, requests, batches, lineRequests, setup, logEvent, normaliseNumber, releaseLinesForExitedEmployees, OPERATORS, LINE_STATUSES };
 };

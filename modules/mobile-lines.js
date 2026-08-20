@@ -331,6 +331,11 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
         project_snapshot TEXT,
         client_snapshot TEXT,
         reason TEXT,
+        -- What they are asking for, not just that they are asking. Choosing a
+        -- package fixes the operator too, since packages belong to one.
+        requested_operator VARCHAR(20) CHECK (requested_operator IN ('safaricom','airtel')),
+        requested_package_id UUID REFERENCES telecom_packages(id),
+        requested_cug BOOLEAN NOT NULL DEFAULT FALSE,
         status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','fulfilled','cancelled')),
         requested_by UUID REFERENCES users(id),
         requested_at TIMESTAMPTZ DEFAULT NOW(),
@@ -342,6 +347,9 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
         cancel_reason TEXT
       )`);
     // One open request per person, for the same reason a person holds one line.
+    await client.query('ALTER TABLE mobile_line_requests ADD COLUMN IF NOT EXISTS requested_operator VARCHAR(20)');
+    await client.query('ALTER TABLE mobile_line_requests ADD COLUMN IF NOT EXISTS requested_package_id UUID REFERENCES telecom_packages(id)');
+    await client.query('ALTER TABLE mobile_line_requests ADD COLUMN IF NOT EXISTS requested_cug BOOLEAN NOT NULL DEFAULT FALSE');
     await client.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS one_open_line_request_per_employee
         ON mobile_line_requests (employee_id) WHERE status = 'pending'`);
@@ -1480,10 +1488,12 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
       if (req.query.search) { params.push(`%${req.query.search}%`); w += ` AND r.employee_name_snapshot ILIKE $${params.length}`; }
       const { rows } = await pool.query(`
         SELECT r.*, l.mobile_number, l.operator,
+               pk.package_name AS requested_package, pk.monthly_price AS requested_price,
                u.full_name AS requested_by_name, f.full_name AS fulfilled_by_name, c.full_name AS cancelled_by_name,
                e.employee_number, e.national_id, e.job_title, e.employment_status
           FROM mobile_line_requests r
           LEFT JOIN mobile_lines l ON l.id = r.mobile_line_id
+          LEFT JOIN telecom_packages pk ON pk.id = r.requested_package_id
           LEFT JOIN users u ON u.id = r.requested_by
           LEFT JOIN users f ON f.id = r.fulfilled_by
           LEFT JOIN users c ON c.id = r.cancelled_by
@@ -1498,8 +1508,10 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
   });
 
   lineRequests.post('/', auth, HR_ADMIN, async (req, res) => {
-    const { employee_id, reason } = req.body;
+    const { employee_id, reason, operator, package_id, cug } = req.body;
     if (!employee_id) return res.status(400).json({ error: 'Choose the employee who needs a line' });
+    if (!OPERATORS.includes(operator)) return res.status(400).json({ error: 'Choose Safaricom or Airtel' });
+    if (!package_id) return res.status(400).json({ error: 'Choose the package they need' });
     // The reason is what an admin reads when deciding whether to hand over one
     // of a small number of free lines, so it is required rather than optional.
     if (!reason || !reason.trim()) return res.status(400).json({ error: 'Say why they need a line' });
@@ -1511,13 +1523,21 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
       const { rows: held } = await pool.query(
         `SELECT mobile_number FROM mobile_lines WHERE current_employee_id=$1 AND status='assigned'`, [employee_id]);
       if (held.length) return res.status(400).json({ error: `${emp.full_name} already holds ${held[0].mobile_number}` });
+      const { rows: [pkg] } = await pool.query(
+        'SELECT id, package_name, operator FROM telecom_packages WHERE id=$1 AND is_active', [package_id]);
+      if (!pkg) return res.status(400).json({ error: 'That package is not available' });
+      // The two are chosen separately on the form, so they have to agree here.
+      if (pkg.operator !== operator) {
+        return res.status(400).json({ error: `${pkg.package_name} is a ${pkg.operator === 'safaricom' ? 'Safaricom' : 'Airtel'} package` });
+      }
 
       const { rows: [r] } = await pool.query(
-        `INSERT INTO mobile_line_requests (employee_id, employee_name_snapshot, project_snapshot, client_snapshot, reason, requested_by)
-         VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-        [emp.id, emp.full_name, emp.project, emp.client, reason.trim(), req.user.id]);
+        `INSERT INTO mobile_line_requests (employee_id, employee_name_snapshot, project_snapshot, client_snapshot,
+           reason, requested_operator, requested_package_id, requested_cug, requested_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+        [emp.id, emp.full_name, emp.project, emp.client, reason.trim(), operator, pkg.id, !!cug, req.user.id]);
       await logEvent({ entityType: 'line_request', entityId: r.id, action: 'line_requested', to: 'pending', user: req.user,
-        detail: `${emp.full_name}${emp.project ? ` (${emp.project})` : ''}${r.reason ? ` — "${r.reason}"` : ''}` });
+        detail: `${emp.full_name}${emp.project ? ` (${emp.project})` : ''} · ${pkg.operator} ${pkg.package_name}${cug ? ' + CUG' : ''} — "${r.reason}"` });
       res.status(201).json(r);
     } catch (e) {
       if (e.code === '23505') return res.status(400).json({ error: 'There is already an open line request for that employee' });
@@ -1558,6 +1578,18 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
       const { rows: [line] } = await db.query('SELECT * FROM mobile_lines WHERE id=$1 FOR UPDATE', [mobile_line_id]);
       if (!line) { await db.query('ROLLBACK'); return res.status(404).json({ error: 'Line not found' }); }
       if (line.status !== 'available') { await db.query('ROLLBACK'); return res.status(400).json({ error: `${line.mobile_number} is ${line.status}, not available` }); }
+      // A package belongs to one operator, so the number handed over has to be
+      // on that network -- otherwise the thing they asked for cannot be put on it.
+      const { rows: [want] } = await db.query(
+        'SELECT id, package_name, operator, monthly_price FROM telecom_packages WHERE id=$1', [r.requested_package_id]);
+      if (r.requested_operator && r.requested_operator !== line.operator) {
+        await db.query('ROLLBACK');
+        return res.status(400).json({ error: `This request asks for ${r.requested_operator === 'safaricom' ? 'Safaricom' : 'Airtel'}, but ${line.mobile_number} is ${line.operator === 'safaricom' ? 'Safaricom' : 'Airtel'}` });
+      }
+      if (want && want.operator !== line.operator) {
+        await db.query('ROLLBACK');
+        return res.status(400).json({ error: `${line.mobile_number} is ${line.operator === 'safaricom' ? 'Safaricom' : 'Airtel'}, but ${want.package_name} is a ${want.operator === 'safaricom' ? 'Safaricom' : 'Airtel'} package` });
+      }
       const { rows: [emp] } = await db.query(
         'SELECT id, full_name, employee_number, national_id, project, client, employment_status FROM employees WHERE id=$1', [r.employee_id]);
       if (!emp || emp.employment_status !== 'active') {
@@ -1568,9 +1600,18 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
         `SELECT mobile_number FROM mobile_lines WHERE current_employee_id=$1 AND status='assigned'`, [emp.id]);
       if (held.length) { await db.query('ROLLBACK'); return res.status(400).json({ error: `${emp.full_name} already holds ${held[0].mobile_number}` }); }
 
+      // Hand it over configured as asked: the request named a package and said
+      // whether CUG was needed, and that is the whole point of naming them.
+      const changes = [];
+      if (want && want.id !== line.current_package_id) changes.push(`package → ${want.package_name}`);
+      if (r.requested_cug !== line.cug_enabled) changes.push(`CUG → ${r.requested_cug ? 'Yes' : 'No'}`);
       await db.query(
         `UPDATE mobile_lines SET status='assigned', current_employee_id=$1, current_holder_id=NULL,
-           current_assignment_date=NOW(), available_since=NULL, updated_at=NOW() WHERE id=$2`, [emp.id, line.id]);
+           current_package_id=COALESCE($4, current_package_id),
+           monthly_price_snapshot=COALESCE($5, monthly_price_snapshot),
+           cug_enabled=$6,
+           current_assignment_date=NOW(), available_since=NULL, updated_at=NOW() WHERE id=$2`,
+        [emp.id, line.id, null, want ? want.id : null, want ? want.monthly_price : null, !!r.requested_cug]);
       await db.query(
         `INSERT INTO mobile_line_assignments (mobile_line_id, mobile_number_snapshot, employee_id,
            employee_number_snapshot, employee_name_snapshot, national_id_snapshot, project_snapshot, client_snapshot, assigned_by)
@@ -1583,7 +1624,7 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
       await logEvent({ entityType: 'line_request', entityId: r.id, action: 'line_request_fulfilled', from: 'pending', to: 'fulfilled',
         user: req.user, detail: `${line.mobile_number} → ${emp.full_name}` });
       await logEvent({ entityType: 'line', entityId: line.id, action: 'assigned', from: 'available', to: 'assigned',
-        user: req.user, detail: `${line.mobile_number} → ${emp.full_name} (fulfilling a line request)` });
+        user: req.user, detail: `${line.mobile_number} → ${emp.full_name} (fulfilling a line request)${changes.length ? ' · ' + changes.join(', ') : ''}` });
       res.json({ ok: true, mobile_number: line.mobile_number });
     } catch (e) {
       await db.query('ROLLBACK').catch(() => {});

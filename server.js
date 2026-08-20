@@ -1525,9 +1525,9 @@ app.get('/api/employees/overdue', auth, async (req, res) => {
 // Employees with nothing allocated are included with a blank item -- an export
 // that silently drops them would read as though everyone has PPE assigned.
 app.get('/api/employees/ppe-allocations', auth, async (req, res) => {
-  if (!['admin','hr','ehs_manager','ehs_officer','supervisor','fleet','project_director'].includes(req.user.role)) {
-    return res.status(403).json({ error: 'Not authorized' });
-  }
+  // Admin only. This is every employee's full PPE picture in one download, a
+  // wider view than the page it is reached from, so it is gated more tightly.
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   try {
     const params = [];
     let w = ` WHERE e.employment_status = $1`;

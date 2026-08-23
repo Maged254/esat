@@ -1912,9 +1912,10 @@ app.get('/api/employee-change-log', auth, async (req, res) => {
 });
 
 // PPE allocation history: one row per item added or removed, newest first.
-// Same audience as the assignment screen itself.
+// Admin only -- it is a record of what everyone was issued and who changed it,
+// wider than the assignment screen it comes from.
 app.get('/api/ppe-assignment-log', auth, async (req, res) => {
-  if (!['admin','ehs_manager','hr'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   try {
     const { from, to, action, search, employee_id, page, pageSize } = req.query;
     const limit = Math.min(Math.max(parseInt(pageSize) || 50, 1), 200);

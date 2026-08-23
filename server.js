@@ -4529,6 +4529,56 @@ app.delete('/api/training-records/:id', auth, async (req, res) => {
 // A training record's history, oldest first. Same visibility rule as the record
 // itself -- out of scope reads as "not found". Records created before this log
 // existed simply have no events; the record's own fields are still the state.
+// Training history across every record: who asked for what, what was recorded
+// against it, what was renewed, cancelled or restored. Admin only -- it is the
+// whole training picture, wider than the screens the events come from.
+//
+// Declared before /training-records/:id/events so the static path wins.
+app.get('/api/training-record-events', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    const { from, to, action, search, page, pageSize } = req.query;
+    const limit = Math.min(Math.max(parseInt(pageSize) || 50, 1), 200);
+    const pageNum = Math.max(parseInt(page) || 1, 1);
+    const params = [];
+    let w = ' WHERE 1=1';
+    if (from) { params.push(from); w += ` AND ev.changed_at >= $${params.length}::date`; }
+    if (to) { params.push(to); w += ` AND ev.changed_at < ($${params.length}::date + INTERVAL '1 day')`; }
+    if (action) { params.push(action.split(',')); w += ` AND ev.action = ANY($${params.length})`; }
+    if (search) {
+      params.push(`%${search}%`);
+      w += ` AND (e.full_name ILIKE $${params.length} OR e.national_id ILIKE $${params.length}
+                  OR c.name ILIKE $${params.length} OR ev.detail ILIKE $${params.length})`;
+    }
+    const projects = await getProjectFilter(req.user);
+    if (projects !== null) {
+      if (projects.length === 0) return res.json({ rows: [], total: 0, page: 1, pageSize: limit });
+      params.push(projects); w += ` AND e.project = ANY($${params.length})`;
+    }
+    const clients = await getClientFilter(req.user);
+    if (clients !== null) {
+      if (clients.length === 0) return res.json({ rows: [], total: 0, page: 1, pageSize: limit });
+      params.push(clients); w += ` AND e.client = ANY($${params.length})`;
+    }
+    const { rows } = await pool.query(`
+      SELECT ev.id, ev.action, ev.from_status, ev.to_status, ev.detail,
+             ev.changed_by_name, ev.changed_at, ev.training_record_id,
+             e.full_name AS employee_name, e.national_id, e.organization, e.project, e.client,
+             c.name AS course_name,
+             COUNT(*) OVER() AS full_count
+        FROM training_record_events ev
+        LEFT JOIN training_records t ON t.id = ev.training_record_id
+        LEFT JOIN employees e ON e.id = t.employee_id
+        LEFT JOIN training_courses c ON c.id = t.course_id
+        ${w}
+       ORDER BY ev.changed_at DESC
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limit, (pageNum - 1) * limit]);
+    const total = rows.length ? parseInt(rows[0].full_count) : 0;
+    res.json({ rows: rows.map(({ full_count, ...r }) => r), total, page: pageNum, pageSize: limit });
+  } catch (e) { sendError(res, e); }
+});
+
 app.get('/api/training-records/:id/events', auth, async (req, res) => {
   try {
     const { rows: [rec] } = await pool.query(

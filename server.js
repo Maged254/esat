@@ -165,6 +165,23 @@ async function setupDB() {
         UNIQUE(employee_id, ppe_item_id)
       );
       
+      CREATE TABLE IF NOT EXISTS ppe_assignment_log (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        employee_id UUID REFERENCES employees(id) ON DELETE SET NULL,
+        casual_id UUID REFERENCES casuals(id) ON DELETE SET NULL,
+        person_name TEXT,
+        national_id TEXT,
+        organization TEXT,
+        project TEXT,
+        client TEXT,
+        ppe_item_id UUID REFERENCES ppe_items(id) ON DELETE SET NULL,
+        ppe_item_name TEXT,
+        action VARCHAR(10) NOT NULL CHECK (action IN ('added','removed')),
+        changed_by UUID REFERENCES users(id),
+        changed_by_name TEXT,
+        changed_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
       CREATE TABLE IF NOT EXISTS locations (
         id SERIAL PRIMARY KEY,
         name VARCHAR(100) NOT NULL UNIQUE,
@@ -211,6 +228,8 @@ async function setupDB() {
     `);
     await client.query('CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at DESC)');
     await client.query('CREATE INDEX IF NOT EXISTS idx_request_logs_user_id ON request_logs(user_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_ppe_assignment_log_at ON ppe_assignment_log(changed_at DESC)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_ppe_assignment_log_person ON ppe_assignment_log(employee_id, casual_id)');
 
     // Foreign-key / frequently-filtered columns had no indexes at all — every
     // join or WHERE on these was a full table scan.
@@ -1596,6 +1615,38 @@ app.get('/api/employees/:id/ppe-assignments', auth, async (req, res) => {
 });
 
 
+// PPE allocation is saved by replacing the whole set, so a change is only
+// visible as the difference between what was there and what is now. Work that
+// out and record one row per item added or removed -- otherwise the fact that
+// someone's harness was taken off them leaves no trace at all.
+const logPpeAssignmentDiff = async (client, { employeeId, casualId, beforeIds, afterIds, user }) => {
+  const before = new Set(beforeIds);
+  const after = new Set(afterIds);
+  const added = [...after].filter(id => !before.has(id));
+  const removed = [...before].filter(id => !after.has(id));
+  if (!added.length && !removed.length) return;
+  const { rows: [p] } = await client.query(
+    employeeId
+      ? 'SELECT full_name, national_id, organization, project, client FROM employees WHERE id=$1'
+      : 'SELECT full_name, national_id, organization, project, client FROM casuals WHERE id=$1',
+    [employeeId || casualId]
+  );
+  const ids = [...added, ...removed];
+  const { rows: items } = await client.query('SELECT id, name FROM ppe_items WHERE id = ANY($1::uuid[])', [ids]);
+  const nameOf = Object.fromEntries(items.map(i => [i.id, i.name]));
+  for (const [list, action] of [[added, 'added'], [removed, 'removed']]) {
+    for (const id of list) {
+      await client.query(
+        `INSERT INTO ppe_assignment_log (employee_id, casual_id, person_name, national_id, organization,
+           project, client, ppe_item_id, ppe_item_name, action, changed_by, changed_by_name)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [employeeId || null, casualId || null, p?.full_name || null, p?.national_id || null, p?.organization || null,
+         p?.project || null, p?.client || null, id, nameOf[id] || null, action, user.id, user.name || null]
+      );
+    }
+  }
+};
+
 app.put('/api/employees/:id/ppe-assignments', auth, async (req, res) => {
   if (!['admin','ehs_manager'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
   const employeeId = req.params.id;
@@ -1607,12 +1658,16 @@ app.put('/api/employees/:id/ppe-assignments', auth, async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const { rows: had } = await client.query('SELECT ppe_item_id FROM employee_ppe_assignments WHERE employee_id=$1', [employeeId]);
     await client.query('DELETE FROM employee_ppe_assignments WHERE employee_id=$1', [employeeId]);
     if (ppe_item_ids && ppe_item_ids.length > 0) {
       for (const ppeId of ppe_item_ids) {
         await client.query('INSERT INTO employee_ppe_assignments (employee_id, ppe_item_id) VALUES ($1,$2)', [employeeId, ppeId]);
       }
     }
+    await logPpeAssignmentDiff(client, {
+      employeeId, beforeIds: had.map(r => r.ppe_item_id), afterIds: ppe_item_ids || [], user: req.user,
+    });
     await client.query('UPDATE employees SET ppe_last_edited_by=$1, ppe_last_edited_at=NOW() WHERE id=$2', [req.user.id, employeeId]);
     await client.query('COMMIT');
     broadcastEmployeesChanged();
@@ -1856,6 +1911,47 @@ app.get('/api/employee-change-log', auth, async (req, res) => {
   } catch (e) { sendError(res, e); }
 });
 
+// PPE allocation history: one row per item added or removed, newest first.
+// Same audience as the assignment screen itself.
+app.get('/api/ppe-assignment-log', auth, async (req, res) => {
+  if (!['admin','ehs_manager','hr'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
+  try {
+    const { from, to, action, search, employee_id, page, pageSize } = req.query;
+    const limit = Math.min(Math.max(parseInt(pageSize) || 50, 1), 200);
+    const pageNum = Math.max(parseInt(page) || 1, 1);
+    const params = [];
+    let w = ' WHERE 1=1';
+    if (from) { params.push(from); w += ` AND l.changed_at >= $${params.length}::date`; }
+    if (to) { params.push(to); w += ` AND l.changed_at < ($${params.length}::date + INTERVAL '1 day')`; }
+    if (action) { params.push(action); w += ` AND l.action = $${params.length}`; }
+    if (employee_id) { params.push(employee_id); w += ` AND (l.employee_id = $${params.length} OR l.casual_id = $${params.length})`; }
+    if (search) {
+      params.push(`%${search}%`);
+      w += ` AND (l.person_name ILIKE $${params.length} OR l.national_id ILIKE $${params.length}
+                  OR l.ppe_item_name ILIKE $${params.length} OR l.organization ILIKE $${params.length})`;
+    }
+    // Scoped like every other person-linked list.
+    const projects = await getProjectFilter(req.user);
+    if (projects !== null) {
+      if (projects.length === 0) return res.json({ rows: [], total: 0, page: 1, pageSize: limit });
+      params.push(projects); w += ` AND l.project = ANY($${params.length})`;
+    }
+    const clients = await getClientFilter(req.user);
+    if (clients !== null) {
+      if (clients.length === 0) return res.json({ rows: [], total: 0, page: 1, pageSize: limit });
+      params.push(clients); w += ` AND l.client = ANY($${params.length})`;
+    }
+    const { rows } = await pool.query(`
+      SELECT l.*, (l.casual_id IS NOT NULL) AS is_casual, COUNT(*) OVER() AS full_count
+        FROM ppe_assignment_log l ${w}
+       ORDER BY l.changed_at DESC
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limit, (pageNum - 1) * limit]);
+    const total = rows.length ? parseInt(rows[0].full_count) : 0;
+    res.json({ rows: rows.map(({ full_count, ...r }) => r), total, page: pageNum, pageSize: limit });
+  } catch (e) { sendError(res, e); }
+});
+
 // Hard-delete a single change-history record (admin only) — for correcting an
 // erroneous entry. The log is otherwise append-only.
 app.delete('/api/employee-change-log/:id', auth, async (req, res) => {
@@ -2092,12 +2188,17 @@ app.put('/api/casuals/:id/ppe-assignments', auth, async (req, res) => {
   const client_db = await pool.connect();
   try {
     await client_db.query('BEGIN');
+    const { rows: had } = await client_db.query('SELECT ppe_item_id FROM casual_ppe_assignments WHERE casual_id=$1', [casualId]);
     await client_db.query('DELETE FROM casual_ppe_assignments WHERE casual_id=$1', [casualId]);
     if (ppe_item_ids && ppe_item_ids.length > 0) {
       for (const ppeId of ppe_item_ids) {
         await client_db.query('INSERT INTO casual_ppe_assignments (casual_id, ppe_item_id) VALUES ($1,$2)', [casualId, ppeId]);
       }
     }
+    // Casuals are issued PPE the same way, so they are logged the same way.
+    await logPpeAssignmentDiff(client_db, {
+      casualId, beforeIds: had.map(r => r.ppe_item_id), afterIds: ppe_item_ids || [], user: req.user,
+    });
     await client_db.query('UPDATE casuals SET ppe_last_edited_by=$1, ppe_last_edited_at=NOW() WHERE id=$2', [req.user.id, casualId]);
     await client_db.query('COMMIT');
     res.json({ success: true });

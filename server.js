@@ -3849,6 +3849,25 @@ const GRP_EXPIRING_SQL = `e.employment_status <> 'exit' AND ${CURRENT_CERT_SQL} 
 const GRP_OUTSTANDING_SQL = `e.employment_status <> 'exit' AND t.status IN ('requested','scheduled','pending','not_eligible')`;
 const GROUP_SQL = { valid: GRP_VALID_SQL, expiring: GRP_EXPIRING_SQL, outstanding: GRP_OUTSTANDING_SQL, archived: GRP_ARCHIVED_SQL };
 
+// The Tracker's Current Status filter is multi-select, and its entries mix whole
+// groups with sub-buckets of a group. A group + a status/expiry param cannot
+// express "Scheduled OR Expired", so the selection travels as its own `buckets`
+// param and each entry becomes a self-contained predicate that is OR'd with the
+// rest. One entry means exactly what the old single-select group meant.
+const BUCKET_SQL = {
+  valid: GRP_VALID_SQL,
+  expiring: GRP_EXPIRING_SQL,
+  outstanding: GRP_OUTSTANDING_SQL,
+  'outstanding:scheduled': `${GRP_OUTSTANDING_SQL} AND t.status = 'scheduled'`,
+  'outstanding:pending': `${GRP_OUTSTANDING_SQL} AND t.status = 'pending'`,
+  'outstanding:not_eligible': `${GRP_OUTSTANDING_SQL} AND t.status = 'not_eligible'`,
+  archived: GRP_ARCHIVED_SQL,
+  'archived:expired': `${GRP_ARCHIVED_SQL} AND ${EXPIRED_CERT_SQL}`,
+  'archived:superseded': `${GRP_ARCHIVED_SQL} AND t.status = 'completed' AND ${SUPERSEDED_SQL}`,
+  'archived:cancelled': `${GRP_ARCHIVED_SQL} AND t.status = 'cancelled'`,
+  'archived:exited': `e.employment_status = 'exit'`,
+};
+
 // Who owns chasing a training, derived from the resource's own classification:
 // in-house (incl. interns) -> HR; outsource vehicle supplier -> Fleet; outsource
 // services -> Operation. Correlates on `e` (employees) + `oe` (outsource_entities),
@@ -3898,7 +3917,10 @@ const logTrainingEvent = async ({ recordId, action, from, to, detail, user }) =>
 const ensureRenewalRequests = async (courseId) => {
   const params = [];
   let courseClause = '';
-  if (courseId) { params.push(courseId); courseClause = ` AND t.course_id = $${params.length}`; }
+  // The Tracker's course filter is multi-select, so this can arrive as a
+  // comma-separated list; a single id is just a list of one.
+  const courseIds = String(courseId || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (courseIds.length) { params.push(courseIds); courseClause = ` AND t.course_id = ANY($${params.length}::uuid[])`; }
   try {
     const { rows: opened } = await pool.query(`
       INSERT INTO training_records (employee_id, course_id, status, pending_reason, requested_at, prior_expiry_date, created_at, updated_at)
@@ -3939,17 +3961,21 @@ const ensureRenewalRequests = async (courseId) => {
 
 // Shared WHERE builder so /tracker and /stats always filter identically.
 const trainingTrackerWhere = async (req, params) => {
-  const { status, search, national_id, job_title, course_id, resource_type, department, organization, expiry, employment_status, hide_expired_cert, new_only, group, pending_reason } = req.query;
+  const { status, search, national_id, job_title, course_id, resource_type, department, organization, expiry, employment_status, hide_expired_cert, new_only, group, pending_reason, buckets } = req.query;
   const projectsCsv = req.query.projects ? req.query.projects.split(',').filter(Boolean) : [];
   const clientsCsv = req.query.clients ? req.query.clients.split(',').filter(Boolean) : [];
+  // Course, department and pending reason are multi-select on the Tracker and
+  // single-valued everywhere else, so each arrives as a comma-separated list of
+  // one or more values and is matched with ANY.
+  const csv = (v) => String(v || '').split(',').map(s => s.trim()).filter(Boolean);
   let w = ` WHERE t.is_deleted IS NOT TRUE AND t.employee_id IS NOT NULL`;
   if (status) { params.push(status.split(',')); w += ` AND t.status = ANY($${params.length})`; }
   if (employment_status) { params.push(employment_status); w += ` AND e.employment_status = $${params.length}`; }
   if (search) { params.push(`%${search}%`); w += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length})`; }
   if (national_id) { params.push(`%${national_id}%`); w += ` AND e.national_id ILIKE $${params.length}`; }
   if (job_title) { params.push(`%${job_title}%`); w += ` AND e.job_title ILIKE $${params.length}`; }
-  if (course_id) { params.push(course_id); w += ` AND t.course_id = $${params.length}`; }
-  if (department) { params.push(department); w += ` AND e.department = $${params.length}`; }
+  if (course_id) { params.push(csv(course_id)); w += ` AND t.course_id = ANY($${params.length}::uuid[])`; }
+  if (department) { params.push(csv(department)); w += ` AND e.department = ANY($${params.length})`; }
   if (organization) { params.push(organization); w += ` AND e.organization = $${params.length}`; }
   // Same intern/inhouse disjointness as the employees list.
   if (resource_type === 'intern') { w += ` AND e.job_title ILIKE '%intern%'`; }
@@ -3958,7 +3984,7 @@ const trainingTrackerWhere = async (req, params) => {
   if (projectsCsv.length) { params.push(projectsCsv); w += ` AND e.project = ANY($${params.length})`; }
   if (clientsCsv.length) { params.push(clientsCsv); w += ` AND e.client = ANY($${params.length})`; }
   // Only pending records carry a reason, so this also narrows to Pending.
-  if (pending_reason) { params.push(pending_reason); w += ` AND t.pending_reason = $${params.length}`; }
+  if (pending_reason) { params.push(csv(pending_reason)); w += ` AND t.pending_reason = ANY($${params.length})`; }
   // Expiry buckets apply only to completed records that carry an expiry date.
   // A renewed (superseded) certificate is history, so it lands in none of them.
   // 'expired' = the expired CERTIFICATE (the Tracker's compliance view).
@@ -3977,6 +4003,10 @@ const trainingTrackerWhere = async (req, params) => {
   if (new_only) { w += ` AND t.prior_expiry_date IS NULL`; }
   // Certificate-lifecycle group (Update page). One bucket per record.
   if (GROUP_SQL[group]) { w += ` AND (${GROUP_SQL[group]})`; }
+  // Multi-select Current Status (Tracker). Unknown entries are ignored rather
+  // than failing the query; an all-unknown list leaves the rows unrestricted.
+  const bucketSql = csv(buckets).map(b => BUCKET_SQL[b]).filter(Boolean);
+  if (bucketSql.length) { w += ` AND (${bucketSql.map(s => `(${s})`).join(' OR ')})`; }
   // Project/client scope -- returns null (no restriction) or an allow-list.
   const projects = await getProjectFilter(req.user);
   if (projects !== null) {
@@ -4037,7 +4067,7 @@ app.get('/api/training-records/stats', auth, async (req, res) => {
     await ensureRenewalRequests(req.query.course_id); // keep counts in step with the list
     // Stats ignore the status/expiry filters (they ARE the buckets) but keep the
     // people-filters, so counts always match the list the user is looking at.
-    const statReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined, hide_expired_cert: undefined, new_only: undefined, group: undefined } };
+    const statReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined, hide_expired_cert: undefined, new_only: undefined, group: undefined, buckets: undefined } };
     const params = [];
     const built = await trainingTrackerWhere(statReq, params);
     if (built.blocked) return res.json({ total:0, requested:0, scheduled:0, pending:0, completed:0, open:0, expiring:0, expired:0, renewal_due:0, superseded:0, grp_valid:0, grp_outstanding:0, grp_expiring:0, grp_archived:0 });
@@ -4072,7 +4102,7 @@ app.get('/api/training-records/stats', auth, async (req, res) => {
 app.get('/api/training-records/expiry-summary', auth, async (req, res) => {
   try {
     await ensureRenewalRequests(); // Update page mount → sweep every course
-    const sumReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined, course_id: undefined, hide_expired_cert: undefined, new_only: undefined, group: undefined } };
+    const sumReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined, course_id: undefined, hide_expired_cert: undefined, new_only: undefined, group: undefined, buckets: undefined } };
     const params = [];
     const built = await trainingTrackerWhere(sumReq, params);
     if (built.blocked) return res.json([]);
@@ -4107,7 +4137,7 @@ app.get('/api/training-records/dashboard', auth, async (req, res) => {
     // pending_reason is honoured here (unlike the other narrowing params) so the
     // dashboard's Pending Reason filter scopes the whole view to that reason —
     // valid/expiring then read 0 and the charts show the pending breakdown for it.
-    const dashReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined, group: undefined, hide_expired_cert: undefined, new_only: undefined } };
+    const dashReq = { user: req.user, query: { ...req.query, status: undefined, expiry: undefined, group: undefined, buckets: undefined, hide_expired_cert: undefined, new_only: undefined } };
     const params = [];
     const built = await trainingTrackerWhere(dashReq, params);
     if (built.blocked) return res.json({ kpis: { requested: 0, valid: 0, expiring: 0, expired: 0, total: 0 }, pending_reasons: [], by_course: [], by_project: [] });

@@ -799,8 +799,12 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
   router.get('/dashboard', auth, CAN_VIEW, async (req, res) => {
     try {
       const params = [];
-      const where = await registerWhere(req, params);
-      if (where === null) return res.json({ by_operator: [], by_project: [], by_package: [], workflow: {} });
+      const built = await registerWhere(req, params);
+      if (built === null) return res.json({ by_operator: [], by_project: [], by_package: [], workflow: {} });
+      // A terminated line is history: it has no holder, no cost and no project,
+      // so it only ever padded the line counts and added a "(not set)" package
+      // row worth nothing. The register still lists it; the charts do not.
+      const where = `${built} AND l.status <> 'terminated'`;
       const from = `FROM mobile_lines l
         LEFT JOIN employees e ON e.id = l.current_employee_id
         LEFT JOIN mobile_line_holders h ON h.id = l.current_holder_id
@@ -818,7 +822,7 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
                       COUNT(*)::int AS lines,
                       COUNT(*) FILTER (WHERE l.status='assigned')::int AS assigned,
                       COUNT(*) FILTER (WHERE l.status='available')::int AS available,
-                      COALESCE(SUM(${COST}) FILTER (WHERE l.status<>'terminated'),0) AS monthly,
+                      COALESCE(SUM(${COST}),0) AS monthly,
                       COALESCE(SUM(cl.credit_limit) FILTER (WHERE l.status='assigned'),0) AS credit_limit
                     ${from} ${where} GROUP BY l.operator ORDER BY l.operator`, params),
         pool.query(`SELECT ${PROJECT} AS project,
@@ -827,13 +831,13 @@ module.exports = function mobileLinesModule({ express, pool, auth, inScope, getP
                       CASE WHEN COUNT(DISTINCT ${CLIENT}) = 1 THEN MAX(${CLIENT})
                            WHEN COUNT(DISTINCT ${CLIENT}) > 1 THEN 'Multiple' END AS client,
                       COUNT(*)::int AS lines,
-                      COALESCE(SUM(${COST}) FILTER (WHERE l.status<>'terminated'),0) AS monthly,
+                      COALESCE(SUM(${COST}),0) AS monthly,
                       COALESCE(SUM(cl.credit_limit) FILTER (WHERE l.status='assigned'),0) AS credit_limit
                     ${from} ${where} GROUP BY 1 ORDER BY monthly DESC, lines DESC`, params),
         pool.query(`SELECT COALESCE(p.package_name,'(not set)') AS package,
                       COALESCE(p.monthly_price,0) AS price,
                       COUNT(*)::int AS lines,
-                      COALESCE(SUM(${COST}) FILTER (WHERE l.status<>'terminated'),0) AS monthly
+                      COALESCE(SUM(${COST}),0) AS monthly
                     ${from} ${where} GROUP BY 1,2 ORDER BY lines DESC`, params),
         // What is outstanding is now simply: who is waiting for a line.
         pool.query(`SELECT

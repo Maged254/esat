@@ -5,6 +5,7 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const compression = require('compression');
+const ExcelJS = require('exceljs');
 
 const app = express();
 app.set('trust proxy', true); // so req.ip reflects the real client IP behind Render's proxy
@@ -4826,6 +4827,12 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 // message a person would type. `inner` is the body HTML (<p>/<ul> etc.).
 const FONT = "'Century Gothic', CenturyGothic, 'Apple Gothic', AppleGothic, 'URW Gothic', 'Avant Garde', sans-serif";
 const mailWrap = (inner) => `<div style="font-family: ${FONT}; font-size: 11pt; font-weight: 400; line-height: 1.6; color: #222; max-width: 640px;">${inner}</div>`;
+// The two project families. Defined once: the same split drives the courier
+// digests, the daily BTS/Fibre digests and the weekly Operations digests, and
+// three separate copies is how they quietly stop agreeing.
+const BTS_PROJECTS   = ['Active MS', 'BTS - MS', 'BTS - MS - MK', 'BTS - MS - NE', 'BTS - Rollout', 'Fuel', 'Workshop', 'TI'];
+const FIBRE_PROJECTS = ['FTTX Rollout', 'Fibre Home', 'Fibre MS', 'Fibre Rollout'];
+
 const MAIL_SIGNOFF = `<p style="margin-top: 16px;">Thanks,<br/>Maged Ezzat</p>`;
 // "N days" with the number in red when it's been waiting (> 0 days), as before.
 const redDays = (n) => `<span style="color:${n > 0 ? '#e53e3e' : 'inherit'};font-weight:600">${n} day${n !== 1 ? 's' : ''}</span>`;
@@ -4946,7 +4953,7 @@ async function sendDailyPMDigest() {
 
 async function sendDailyBTSDigest() {
   try {
-    const btsProjects = ['Active MS', 'BTS - MS', 'BTS - MS - MK', 'BTS - MS - NE', 'BTS - Rollout', 'Fuel', 'TI', 'Workshop'];
+    const btsProjects = BTS_PROJECTS;
     const { rows: pending } = await pool.query(`
       SELECT COUNT(*) as count, MAX(CURRENT_DATE - date_available::date) as oldest_days
       FROM ppe_requests r
@@ -5329,8 +5336,8 @@ async function sendDailyNewCertificatesDigest() {
 // yesterday's Africa/Nairobi window). Covers employees and casuals; none → no email.
 // Projects covered by each courier-distribution digest. Items on other projects appear
 // in neither email.
-const COURIER_BTS_PROJECTS   = ['Active MS', 'BTS - MS', 'BTS - MS - MK', 'BTS - MS - NE', 'BTS - Rollout', 'Fuel', 'Workshop', 'TI'];
-const COURIER_FIBRE_PROJECTS = ['FTTX Rollout', 'Fibre Home', 'Fibre MS', 'Fibre Rollout'];
+const COURIER_BTS_PROJECTS   = BTS_PROJECTS;
+const COURIER_FIBRE_PROJECTS = FIBRE_PROJECTS;
 
 // One courier-distribution digest for a named project group (e.g. "BTS" / "Fibre"):
 // PPE/Tool items distributed by courier yesterday whose person's project is in `projects`.
@@ -5562,6 +5569,191 @@ async function pruneOldRequestLogs() {
   } catch(e) { console.error('Log prune error:', e.message); }
 }
 
+
+// ── Weekly Operations training digest ───────────────────────────────────────
+// Everything still sitting with the Operations department. The four reasons are
+// listed explicitly rather than matched on the word "Operation": the reason list
+// is admin-editable, and a LIKE would silently start (or stop) including a
+// newly worded reason without anyone noticing.
+const OPS_PENDING_REASONS = [
+  'Pending Operation Dept.',
+  'Pending Operation Dept. - TBT online',
+  'Pending Operation Dept. - TBT Practical',
+  'Temporarily Suspended - Operations Dept.',
+];
+
+// A bar chart made of table cells -- the only kind that survives Outlook, which
+// renders mail through Word and supports neither flexbox nor background images.
+// Widths are pixels, not percentages, for the same reason.
+const BAR_TRACK_PX = 300;
+function renderBarChart(title, rows) {
+  if (!rows.length) return '';
+  const max = Math.max(...rows.map(r => r.count));
+  const bars = rows.map(r => {
+    const fill = Math.max(24, Math.round(BAR_TRACK_PX * r.count / max));
+    return `
+    <tr>
+      <td style="padding:5px 10px 5px 0;font-family:${FONT};font-size:10pt;color:#0f2a4a;vertical-align:middle;width:170px;">
+        ${escapeHtml(r.label)}
+        ${r.sub ? `<div style="color:#9ca3af;font-size:8.5pt;">${escapeHtml(r.sub)}</div>` : ''}
+      </td>
+      <td style="padding:5px 0;vertical-align:middle;">
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;">
+          <tr>
+            <td width="${fill}" bgcolor="#e5484d" style="width:${fill}px;height:22px;border-radius:5px;color:#ffffff;font-family:${FONT};font-size:9.5pt;font-weight:700;text-align:center;">${r.count}</td>
+            <td width="${BAR_TRACK_PX - fill}" bgcolor="#f1f5f9" style="width:${BAR_TRACK_PX - fill}px;height:22px;border-radius:5px;">&nbsp;</td>
+          </tr>
+        </table>
+      </td>
+    </tr>`;
+  }).join('');
+  return `
+    <div style="border:1px solid #e5e7eb;border-radius:10px;padding:14px 16px;margin:16px 0;">
+      <div style="font-family:${FONT};font-size:11pt;font-weight:700;color:#0f2a4a;margin-bottom:10px;">${escapeHtml(title)}</div>
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;width:100%;">${bars}</table>
+    </div>`;
+}
+
+// The expired-certificate attachment. Same project family as the email, active
+// employees only, and it says whether a renewal is already open -- an expired
+// certificate with a renewal in flight needs chasing differently from one with
+// nothing behind it.
+async function buildExpiredCertsWorkbook(projects) {
+  const { rows } = await pool.query(`
+    SELECT e.full_name, e.national_id, e.job_title,
+           COALESCE(NULLIF(TRIM(e.project),''), '(none)') AS project,
+           NULLIF(TRIM(e.client),'') AS client, e.organization,
+           c.name AS course, t.completed_at, t.expiry_date,
+           (CURRENT_DATE - t.expiry_date) AS days_expired,
+           r.status AS renewal_status, r.pending_reason AS renewal_reason
+      FROM training_records t
+      JOIN training_courses c ON c.id = t.course_id
+      JOIN employees e ON e.id = t.employee_id
+      -- The renewal an expired certificate has already opened. JOIN, not LEFT
+      -- JOIN: the sheet lists only certificates whose renewal is sitting with
+      -- Operations, matching the charts above it.
+      JOIN LATERAL (
+        SELECT status, pending_reason FROM training_records o
+         WHERE o.employee_id = t.employee_id AND o.course_id = t.course_id
+           AND o.is_deleted IS NOT TRUE
+           AND o.status IN ('requested','scheduled','pending')
+           AND o.pending_reason = ANY($2)
+         ORDER BY o.requested_at DESC LIMIT 1
+      ) r ON TRUE
+     WHERE t.is_deleted IS NOT TRUE
+       AND e.employment_status = 'active'
+       AND ${EXPIRED_CERT_SQL}
+       AND TRIM(e.project) = ANY($1)
+     ORDER BY days_expired DESC, e.full_name`, [projects, OPS_PENDING_REASONS]);
+
+  if (rows.length === 0) return null;
+
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Expired Certificates');
+  ws.columns = [
+    { header: 'Employee', key: 'full_name', width: 28 },
+    { header: 'National ID', key: 'national_id', width: 14 },
+    { header: 'Job Title', key: 'job_title', width: 24 },
+    { header: 'Project', key: 'project', width: 16 },
+    { header: 'Client', key: 'client', width: 14 },
+    { header: 'Organization', key: 'organization', width: 24 },
+    { header: 'Training Type', key: 'course', width: 30 },
+    { header: 'Expired On', key: 'expiry', width: 12 },
+    { header: 'Days Expired', key: 'days_expired', width: 13 },
+    { header: 'Renewal Raised', key: 'renewal', width: 34 },
+  ];
+  const d = (v) => v ? new Date(v).toLocaleDateString('en-GB') : '';
+  rows.forEach(r => ws.addRow({
+    ...r,
+    expiry: d(r.expiry_date),
+    days_expired: Number(r.days_expired) || 0,
+    renewal: r.renewal_status ? (r.renewal_reason || titleCaseWord(r.renewal_status)) : 'No renewal open',
+  }));
+  const head = ws.getRow(1);
+  head.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+  head.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0F2A4A' } };
+  head.height = 20;
+  ws.views = [{ state: 'frozen', ySplit: 1 }];
+  ws.autoFilter = { from: 'A1', to: { row: 1, column: ws.columns.length } };
+
+  const buffer = await wb.xlsx.writeBuffer();
+  return { count: rows.length, buffer: Buffer.from(buffer) };
+}
+
+const titleCaseWord = (s) => String(s || '').replace(/_/g, ' ').replace(/\b\w/g, m => m.toUpperCase());
+
+// One family per email. Charts only -- the per-person detail lives in the
+// Trainings Tracker, and Operations needs to see where the backlog sits, not
+// read 90 names in a mail client.
+async function sendOperationsTrainingDigest(label, projects) {
+  try {
+    const { rows } = await pool.query(`
+      SELECT COALESCE(NULLIF(TRIM(e.project),''), '(none)') AS project,
+             NULLIF(TRIM(e.client),'') AS client,
+             c.name AS course,
+             (CURRENT_DATE - t.requested_at::date) AS waiting_days
+        FROM training_records t
+        JOIN training_courses c ON c.id = t.course_id
+        JOIN employees e ON e.id = t.employee_id
+       WHERE t.is_deleted IS NOT TRUE
+         AND t.status IN ('requested','scheduled','pending')
+         AND e.employment_status = 'active'
+         AND t.pending_reason = ANY($1)
+         AND TRIM(e.project) = ANY($2)`, [OPS_PENDING_REASONS, projects]);
+
+    if (rows.length === 0) return;
+    const oldest = Math.max(...rows.map(r => r.waiting_days || 0));
+
+    // Expired certificates ride along as a spreadsheet. Deliberately a wider net
+    // than the email body: the charts are what Operations is holding up, the
+    // attachment is every certificate that has already lapsed in this family.
+    const expired = await buildExpiredCertsWorkbook(projects);
+    const stamp = new Date().toISOString().slice(0, 10);
+
+    const tally = (key, subKey) => {
+      const m = new Map();
+      rows.forEach(r => {
+        const k = r[key] || '—';
+        if (!m.has(k)) m.set(k, { label: k, sub: subKey ? (r[subKey] || null) : null, count: 0 });
+        m.get(k).count += 1;
+      });
+      return [...m.values()].sort((a, b) => b.count - a.count);
+    };
+
+    await resend.emails.send({
+      from: 'OneHub <esat@egypro.app>',
+      to: 'e.maged@outlook.com',
+      subject: `OneHub Weekly — ${label}: ${rows.length} Training${rows.length > 1 ? 's' : ''} Pending with Operations`,
+      attachments: expired ? [{
+        filename: `OneHub-Expired-Certificates-${label}-${stamp}.xlsx`,
+        content: expired.buffer,
+      }] : undefined,
+      html: mailWrap(`
+          <p>Hello Team,</p>
+          <p>${label} has <strong>${rows.length} training record${rows.length > 1 ? 's' : ''}</strong> waiting on the Operations department. The oldest has been waiting ${redDays(oldest)}.</p>
+          ${renderBarChart('Pending per Training Type', tally('course'))}
+          ${renderBarChart('Pending per Project', tally('project', 'client'))}
+          ${expired
+            ? `<p style="margin-top:18px;"><strong>${expired.count} certificate${expired.count > 1 ? 's have' : ' has'} already expired</strong> and ${expired.count > 1 ? 'are' : 'is'} waiting on Operations — the list is attached as a spreadsheet, longest expired first.</p>`
+            : `<p style="margin-top:18px;color:#1d9e75;">No expired certificates waiting on Operations in ${escapeHtml(label)}.</p>`}
+          <p style="margin-top:14px;color:#6b7280;font-size:10pt;">The names behind the charts are in the Trainings Tracker — filter by All Pending and the Operations pending reasons.</p>
+          ${MAIL_SIGNOFF}
+        `)
+    });
+    console.log(`Operations training digest (${label}) sent — ${rows.length} pending, ${expired ? expired.count : 0} expired attached`);
+  } catch(e) {
+    console.error(`Operations training digest (${label}) error:`, e.message);
+  }
+}
+
+async function sendWeeklyOperationsTrainingDigests() {
+  // Data Centre Rollout, Fleet and Multiple belong to neither family, so nobody
+  // on them appears in either email. Deliberate as of 2026-09-08 — a third
+  // digest for them is planned, along with one for the non-Operations reasons.
+  await sendOperationsTrainingDigest('BTS', BTS_PROJECTS);
+  await sendOperationsTrainingDigest('Fibre', FIBRE_PROJECTS);
+}
+
 function scheduleDailyDigest() {
   scheduleAt(5, 30, 'Fibre digest', sendDailyFibreDigest);  // 8:30am EAT
   scheduleAt(5, 35, 'BTS digest', sendDailyBTSDigest);      // 8:35am EAT
@@ -5569,6 +5761,7 @@ function scheduleDailyDigest() {
   scheduleAt(5, 45, 'EHS digest', sendDailyEHSDigest);      // 8:45am EAT
   scheduleAt(6,  0, 'SCM digest', sendDailySCMDigest);      // 9:00am EAT
   scheduleWeekly(1, 6, 15, 'Overdue digest', sendDailyOverdueDigest); // Mondays 9:15am EAT
+  scheduleWeekly(1, 6, 20, 'Operations training digests', sendWeeklyOperationsTrainingDigests); // Mondays 9:20am EAT
   scheduleAt(5, 15, 'Employee changes digest', sendDailyEmployeeChangesDigest); // 8:15am EAT
   scheduleAt(5, 20, 'Fleet drivers changes digest', sendDailyFleetDriverChangesDigest); // 8:20am EAT
   scheduleAt(5, 25, 'Outsourced services changes digest', sendDailyOutsourceServicesChangesDigest); // 8:25am EAT
@@ -5581,6 +5774,14 @@ function scheduleDailyDigest() {
   // day -- but that is exactly when a released line would go unnoticed.
   scheduleAt(5, 10, 'Mobile line exit release', mobileLines.releaseLinesForExitedEmployees); // 8:10am EAT
 }
+
+app.post('/api/admin/test-ops-training-digest', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+  try {
+    await sendWeeklyOperationsTrainingDigests();
+    res.json({ success: true });
+  } catch(e) { sendError(res, e); }
+});
 
 app.post('/api/admin/test-bts-digest', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });

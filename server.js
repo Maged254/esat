@@ -5575,6 +5575,14 @@ async function pruneOldRequestLogs() {
 // listed explicitly rather than matched on the word "Operation": the reason list
 // is admin-editable, and a LIKE would silently start (or stop) including a
 // newly worded reason without anyone noticing.
+// Outsourced vehicle suppliers are out of scope for the Operations digests --
+// their drivers are not Operations' training backlog. Written once and used by
+// both the email body and its attachment, so the two counts cannot diverge.
+const NOT_VEHICLE_SUPPLIER_SQL = `NOT EXISTS (
+  SELECT 1 FROM outsource_entities oe
+   WHERE LOWER(TRIM(oe.name)) = LOWER(TRIM(e.organization))
+     AND oe.type = 'vehicle_supplier')`;
+
 const OPS_PENDING_REASONS = [
   'Pending Operation Dept.',
   'Pending Operation Dept. - TBT online',
@@ -5635,6 +5643,7 @@ async function buildOpsPendingWorkbook(projects) {
        AND e.employment_status = 'active'
        AND t.pending_reason = ANY($2)
        AND TRIM(e.project) = ANY($1)
+       AND ${NOT_VEHICLE_SUPPLIER_SQL}
      ORDER BY waiting_days DESC NULLS LAST, e.full_name`, [projects, OPS_PENDING_REASONS]);
 
   if (rows.length === 0) return null;
@@ -5692,7 +5701,8 @@ async function sendOperationsTrainingDigest(label, projects, greeting) {
          AND t.status IN ('requested','scheduled','pending')
          AND e.employment_status = 'active'
          AND t.pending_reason = ANY($1)
-         AND TRIM(e.project) = ANY($2)`, [OPS_PENDING_REASONS, projects]);
+         AND TRIM(e.project) = ANY($2)
+         AND ${NOT_VEHICLE_SUPPLIER_SQL}`, [OPS_PENDING_REASONS, projects]);
 
     if (rows.length === 0) return;
 

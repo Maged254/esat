@@ -5685,7 +5685,7 @@ const titleCaseWord = (s) => String(s || '').replace(/_/g, ' ').replace(/\b\w/g,
 // One family per email. Charts only -- the per-person detail lives in the
 // Trainings Tracker, and Operations needs to see where the backlog sits, not
 // read 90 names in a mail client.
-async function sendOperationsTrainingDigest(label, projects) {
+async function sendOperationsTrainingDigest(label, projects, greeting) {
   try {
     const { rows } = await pool.query(`
       SELECT COALESCE(NULLIF(TRIM(e.project),''), '(none)') AS project,
@@ -5729,13 +5729,13 @@ async function sendOperationsTrainingDigest(label, projects) {
         content: expired.buffer,
       }] : undefined,
       html: mailWrap(`
-          <p>Hello Team,</p>
+          <p>Hello ${escapeHtml(greeting)},</p>
           <p>${label} has <strong>${rows.length} training record${rows.length > 1 ? 's' : ''}</strong> waiting on the Operations department. The oldest has been waiting ${redDays(oldest)}.</p>
           ${renderBarChart('Pending per Training Type', tally('course'))}
           ${renderBarChart('Pending per Project', tally('project', 'client'))}
           ${expired
-            ? `<p style="margin-top:18px;"><strong>${expired.count} certificate${expired.count > 1 ? 's have' : ' has'} already expired</strong> and ${expired.count > 1 ? 'are' : 'is'} waiting on Operations — the list is attached as a spreadsheet, longest expired first.</p>`
-            : `<p style="margin-top:18px;color:#1d9e75;">No expired certificates waiting on Operations in ${escapeHtml(label)}.</p>`}
+            ? `<p style="margin-top:18px;">Of these, <strong>${expired.count}</strong> ${expired.count > 1 ? 'are renewals of certificates that have' : 'is a renewal of a certificate that has'} <strong>already expired</strong> — attached as a spreadsheet, longest expired first. The remaining ${rows.length - expired.count} ${rows.length - expired.count === 1 ? 'is a first-time training' : 'are first-time trainings'} for people who do not yet hold the certificate.</p>`
+            : `<p style="margin-top:18px;color:#1d9e75;">None of these are renewals of an expired certificate — all ${rows.length} are first-time trainings.</p>`}
           <p style="margin-top:14px;color:#6b7280;font-size:10pt;">The names behind the charts are in the Trainings Tracker — filter by All Pending and the Operations pending reasons.</p>
           ${MAIL_SIGNOFF}
         `)
@@ -5750,8 +5750,8 @@ async function sendWeeklyOperationsTrainingDigests() {
   // Data Centre Rollout, Fleet and Multiple belong to neither family, so nobody
   // on them appears in either email. Deliberate as of 2026-09-08 — a third
   // digest for them is planned, along with one for the non-Operations reasons.
-  await sendOperationsTrainingDigest('BTS', BTS_PROJECTS);
-  await sendOperationsTrainingDigest('Fibre', FIBRE_PROJECTS);
+  await sendOperationsTrainingDigest('BTS', BTS_PROJECTS, 'Kerolos');
+  await sendOperationsTrainingDigest('Fibre', FIBRE_PROJECTS, 'Isaac');
 }
 
 function scheduleDailyDigest() {

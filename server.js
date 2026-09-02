@@ -5729,7 +5729,7 @@ async function sendOperationsTrainingDigest(label, projects, greeting) {
       }] : undefined,
       html: mailWrap(`
           <p>Hello ${escapeHtml(greeting)},</p>
-          <p>${label} has <strong>${rows.length} training record${rows.length > 1 ? 's' : ''}</strong> waiting on the Operations department.</p>
+          <p>${label} Projects has <strong>${rows.length} training record${rows.length > 1 ? 's' : ''}</strong> pending on your side (Operations department). Kindly attend to ${rows.length > 1 ? 'these' : 'this'} urgently — allowing this work to continue without the related training carries considerable risk.</p>
           ${renderBarChart('Pending per Training Type', tally('course'))}
           ${renderBarChart('Pending per Project', tally('project', 'client'))}
           <p style="margin-top:18px;">Attached as a spreadsheet, longest waiting first.</p>

@@ -5614,42 +5614,33 @@ function renderBarChart(title, rows) {
     </div>`;
 }
 
-// The expired-certificate attachment. Same project family as the email, active
-// employees only, and it says whether a renewal is already open -- an expired
-// certificate with a renewal in flight needs chasing differently from one with
-// nothing behind it.
-async function buildExpiredCertsWorkbook(projects) {
+// The attachment mirrors the email exactly: every record in this family that is
+// waiting on Operations. Where the record is a renewal it also carries the
+// previous certificate's expiry, so a lapsed one is visible in the sheet without
+// needing a separate list.
+async function buildOpsPendingWorkbook(projects) {
   const { rows } = await pool.query(`
     SELECT e.full_name, e.national_id, e.job_title,
            COALESCE(NULLIF(TRIM(e.project),''), '(none)') AS project,
            NULLIF(TRIM(e.client),'') AS client, e.organization,
-           c.name AS course, t.completed_at, t.expiry_date,
-           (CURRENT_DATE - t.expiry_date) AS days_expired,
-           r.status AS renewal_status, r.pending_reason AS renewal_reason
+           c.name AS course, t.pending_reason, t.requested_at, t.prior_expiry_date,
+           (CURRENT_DATE - t.requested_at::date) AS waiting_days,
+           CASE WHEN t.prior_expiry_date IS NOT NULL AND t.prior_expiry_date < CURRENT_DATE
+                THEN (CURRENT_DATE - t.prior_expiry_date) END AS days_expired
       FROM training_records t
       JOIN training_courses c ON c.id = t.course_id
       JOIN employees e ON e.id = t.employee_id
-      -- The renewal an expired certificate has already opened. JOIN, not LEFT
-      -- JOIN: the sheet lists only certificates whose renewal is sitting with
-      -- Operations, matching the charts above it.
-      JOIN LATERAL (
-        SELECT status, pending_reason FROM training_records o
-         WHERE o.employee_id = t.employee_id AND o.course_id = t.course_id
-           AND o.is_deleted IS NOT TRUE
-           AND o.status IN ('requested','scheduled','pending')
-           AND o.pending_reason = ANY($2)
-         ORDER BY o.requested_at DESC LIMIT 1
-      ) r ON TRUE
      WHERE t.is_deleted IS NOT TRUE
+       AND t.status IN ('requested','scheduled','pending')
        AND e.employment_status = 'active'
-       AND ${EXPIRED_CERT_SQL}
+       AND t.pending_reason = ANY($2)
        AND TRIM(e.project) = ANY($1)
-     ORDER BY days_expired DESC, e.full_name`, [projects, OPS_PENDING_REASONS]);
+     ORDER BY waiting_days DESC NULLS LAST, e.full_name`, [projects, OPS_PENDING_REASONS]);
 
   if (rows.length === 0) return null;
 
   const wb = new ExcelJS.Workbook();
-  const ws = wb.addWorksheet('Expired Certificates');
+  const ws = wb.addWorksheet('Pending with Operations');
   ws.columns = [
     { header: 'Employee', key: 'full_name', width: 28 },
     { header: 'National ID', key: 'national_id', width: 14 },
@@ -5658,16 +5649,19 @@ async function buildExpiredCertsWorkbook(projects) {
     { header: 'Client', key: 'client', width: 14 },
     { header: 'Organization', key: 'organization', width: 24 },
     { header: 'Training Type', key: 'course', width: 30 },
-    { header: 'Expired On', key: 'expiry', width: 12 },
+    { header: 'Pending Reason', key: 'pending_reason', width: 34 },
+    { header: 'Requested On', key: 'requested', width: 13 },
+    { header: 'Days Waiting', key: 'waiting_days', width: 13 },
+    { header: 'Previous Expiry', key: 'prior_expiry', width: 14 },
     { header: 'Days Expired', key: 'days_expired', width: 13 },
-    { header: 'Renewal Raised', key: 'renewal', width: 34 },
   ];
   const d = (v) => v ? new Date(v).toLocaleDateString('en-GB') : '';
   rows.forEach(r => ws.addRow({
     ...r,
-    expiry: d(r.expiry_date),
-    days_expired: Number(r.days_expired) || 0,
-    renewal: r.renewal_status ? (r.renewal_reason || titleCaseWord(r.renewal_status)) : 'No renewal open',
+    requested: d(r.requested_at),
+    waiting_days: Number(r.waiting_days) || 0,
+    prior_expiry: d(r.prior_expiry_date),
+    days_expired: r.days_expired == null ? '' : Number(r.days_expired),
   }));
   const head = ws.getRow(1);
   head.font = { bold: true, color: { argb: 'FFFFFFFF' } };
@@ -5690,8 +5684,7 @@ async function sendOperationsTrainingDigest(label, projects, greeting) {
     const { rows } = await pool.query(`
       SELECT COALESCE(NULLIF(TRIM(e.project),''), '(none)') AS project,
              NULLIF(TRIM(e.client),'') AS client,
-             c.name AS course,
-             (CURRENT_DATE - t.requested_at::date) AS waiting_days
+             c.name AS course
         FROM training_records t
         JOIN training_courses c ON c.id = t.course_id
         JOIN employees e ON e.id = t.employee_id
@@ -5702,12 +5695,8 @@ async function sendOperationsTrainingDigest(label, projects, greeting) {
          AND TRIM(e.project) = ANY($2)`, [OPS_PENDING_REASONS, projects]);
 
     if (rows.length === 0) return;
-    const oldest = Math.max(...rows.map(r => r.waiting_days || 0));
 
-    // Expired certificates ride along as a spreadsheet. Deliberately a wider net
-    // than the email body: the charts are what Operations is holding up, the
-    // attachment is every certificate that has already lapsed in this family.
-    const expired = await buildExpiredCertsWorkbook(projects);
+    const sheet = await buildOpsPendingWorkbook(projects);
     const stamp = new Date().toISOString().slice(0, 10);
 
     const tally = (key, subKey) => {
@@ -5724,23 +5713,20 @@ async function sendOperationsTrainingDigest(label, projects, greeting) {
       from: 'OneHub <esat@egypro.app>',
       to: 'e.maged@outlook.com',
       subject: `OneHub Weekly — ${label}: ${rows.length} Training${rows.length > 1 ? 's' : ''} Pending with Operations`,
-      attachments: expired ? [{
-        filename: `OneHub-Expired-Certificates-${label}-${stamp}.xlsx`,
-        content: expired.buffer,
+      attachments: sheet ? [{
+        filename: `OneHub-Pending-With-Operations-${label}-${stamp}.xlsx`,
+        content: sheet.buffer,
       }] : undefined,
       html: mailWrap(`
           <p>Hello ${escapeHtml(greeting)},</p>
-          <p>${label} has <strong>${rows.length} training record${rows.length > 1 ? 's' : ''}</strong> waiting on the Operations department. The oldest has been waiting ${redDays(oldest)}.</p>
+          <p>${label} has <strong>${rows.length} training record${rows.length > 1 ? 's' : ''}</strong> waiting on the Operations department.</p>
           ${renderBarChart('Pending per Training Type', tally('course'))}
           ${renderBarChart('Pending per Project', tally('project', 'client'))}
-          ${expired
-            ? `<p style="margin-top:18px;">Of these, <strong>${expired.count}</strong> ${expired.count > 1 ? 'have an expired certificate' : 'has an expired certificate'} — attached as a spreadsheet, longest expired first.</p>`
-            : `<p style="margin-top:18px;color:#1d9e75;">None of these have an expired certificate.</p>`}
-          <p style="margin-top:14px;color:#6b7280;font-size:10pt;">The names behind the charts are in the Trainings Tracker — filter by All Pending and the Operations pending reasons.</p>
+          <p style="margin-top:18px;">Attached as a spreadsheet, longest waiting first.</p>
           ${MAIL_SIGNOFF}
         `)
     });
-    console.log(`Operations training digest (${label}) sent — ${rows.length} pending, ${expired ? expired.count : 0} expired attached`);
+    console.log(`Operations training digest (${label}) sent — ${rows.length} pending, ${sheet ? sheet.count : 0} rows attached`);
   } catch(e) {
     console.error(`Operations training digest (${label}) error:`, e.message);
   }

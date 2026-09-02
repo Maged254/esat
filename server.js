@@ -5734,8 +5734,8 @@ async function sendOperationsTrainingDigest(label, projects, greeting) {
           ${renderBarChart('Pending per Training Type', tally('course'))}
           ${renderBarChart('Pending per Project', tally('project', 'client'))}
           ${expired
-            ? `<p style="margin-top:18px;">Of these, <strong>${expired.count}</strong> ${expired.count > 1 ? 'are renewals of certificates that have' : 'is a renewal of a certificate that has'} <strong>already expired</strong> — attached as a spreadsheet, longest expired first. The remaining ${rows.length - expired.count} ${rows.length - expired.count === 1 ? 'is a first-time training' : 'are first-time trainings'} for people who do not yet hold the certificate.</p>`
-            : `<p style="margin-top:18px;color:#1d9e75;">None of these are renewals of an expired certificate — all ${rows.length} are first-time trainings.</p>`}
+            ? `<p style="margin-top:18px;">Of these, <strong>${expired.count}</strong> ${expired.count > 1 ? 'have an expired certificate' : 'has an expired certificate'} — attached as a spreadsheet, longest expired first.</p>`
+            : `<p style="margin-top:18px;color:#1d9e75;">None of these have an expired certificate.</p>`}
           <p style="margin-top:14px;color:#6b7280;font-size:10pt;">The names behind the charts are in the Trainings Tracker — filter by All Pending and the Operations pending reasons.</p>
           ${MAIL_SIGNOFF}
         `)

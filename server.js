@@ -889,6 +889,14 @@ app.get('/api/events', (req, res) => {
 
 // ── Project / client access helpers ──────────────────────────
 // Escapes free-text values before they're interpolated into HTML email templates.
+// Collapse runs of whitespace and trim. .trim() alone leaves "Peter  Mutio
+// Wambua" intact, which is how eight employee names carried double spaces for
+// months: they were never re-typed, only imported. It also matters for matching
+// -- organization is joined to outsource_entities.name on LOWER(TRIM(...)), and
+// TRIM does not touch the middle of a string, so one stray double space there
+// silently drops someone out of the vehicle-supplier exclusion.
+const squish = (v) => v == null ? v : String(v).replace(/\s+/g, ' ').trim();
+
 const escapeHtml = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
 }[c]));
@@ -1684,6 +1692,11 @@ app.put('/api/employees/:id/ppe-assignments', auth, async (req, res) => {
 app.post('/api/employees', auth, async (req, res) => {
   if (req.user.role === 'ehs_officer') return res.status(403).json({ error: 'Not authorized' });
   let { employee_number, full_name, national_id, job_title, department, project, client, organization, resource_type, employment_status } = req.body;
+  // This endpoint took the name exactly as sent, which is how imported records
+  // arrived with double spaces in the first place.
+  full_name = squish(full_name); job_title = squish(job_title); department = squish(department);
+  project = squish(project); client = squish(client); organization = squish(organization);
+  employee_number = squish(employee_number);
   resource_type = resource_type?.toLowerCase();
   employment_status = employment_status?.toLowerCase();
   // Employment ID is IN-HOUSE only. Never import/assign one from ETMS for
@@ -1794,14 +1807,14 @@ app.put('/api/employees/:id', auth, async (req, res) => {
   // Authorized after the row loads (below): HR with edit_employee may edit anyone;
   // an outsource subtype-manager may edit only outsource of their subtype.
   const { full_name, national_id, job_title, department, project, client, reason } = req.body;
-  if (!full_name || !full_name.trim()) return res.status(400).json({ error: 'Employee name is required' });
+  if (!full_name || !squish(full_name)) return res.status(400).json({ error: 'Employee name is required' });
   if (!reason || !reason.trim()) return res.status(400).json({ error: 'A reason for the update is required' });
   const next = {
-    full_name: full_name.trim(),
-    job_title: job_title?.trim() || null,
-    department: department || null,
-    project: project || null,
-    client: client || null,
+    full_name: squish(full_name),
+    job_title: squish(job_title) || null,
+    department: squish(department) || null,
+    project: squish(project) || null,
+    client: squish(client) || null,
   };
   const client_db = await pool.connect();
   try {
@@ -3743,7 +3756,7 @@ app.post('/api/outsource-entities', auth, async (req, res) => {
   if (!name || !name.trim()) return res.status(400).json({ error: 'Name is required' });
   if (!OUTSOURCE_TYPES.includes(type)) return res.status(400).json({ error: 'Type must be services or vehicle_supplier' });
   try {
-    const { rows } = await pool.query('INSERT INTO outsource_entities (name, type, sort_order) VALUES ($1,$2,$3) RETURNING *', [name.trim(), type, sort_order || 0]);
+    const { rows } = await pool.query('INSERT INTO outsource_entities (name, type, sort_order) VALUES ($1,$2,$3) RETURNING *', [squish(name), type, sort_order || 0]);
     res.json(rows[0]);
   } catch(e) {
     if (e.code === '23505') return res.status(400).json({ error: 'That entity already exists' });
@@ -3756,7 +3769,7 @@ app.put('/api/outsource-entities/:id', auth, async (req, res) => {
   if (!name || !String(name).trim()) return res.status(400).json({ error: 'Name is required' });
   if (!OUTSOURCE_TYPES.includes(type)) return res.status(400).json({ error: 'Type must be services or vehicle_supplier' });
   try {
-    const { rows } = await pool.query('UPDATE outsource_entities SET name=$1, type=$2, is_active=$3, sort_order=$4 WHERE id=$5 RETURNING *', [name.trim(), type, is_active !== false, sort_order || 0, req.params.id]);
+    const { rows } = await pool.query('UPDATE outsource_entities SET name=$1, type=$2, is_active=$3, sort_order=$4 WHERE id=$5 RETURNING *', [squish(name), type, is_active !== false, sort_order || 0, req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'Not found' });
     res.json(rows[0]);
   } catch(e) {
@@ -6259,7 +6272,7 @@ app.post('/api/employees/manual', auth, (req, res) => {
         const { rows } = await pool.query(
           `INSERT INTO employees (employee_number, full_name, national_id, job_title, department, project, client, organization, resource_type, employment_status, created_by, national_id_doc_key)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,$11) RETURNING *`,
-          [empNo, full_name.trim(), national_id.trim(), job_title.trim(), department.trim(), project.trim(), client.trim(), organization.trim(), resource_type, req.user.id, key]
+          [empNo, squish(full_name), national_id.trim(), squish(job_title), squish(department), squish(project), squish(client), squish(organization), resource_type, req.user.id, key]
         );
         // Record the onboarding in the employee history so it shows in the daily HR digest.
         const emp = rows[0];

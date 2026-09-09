@@ -1859,24 +1859,52 @@ app.post('/api/employees/:id/promote', auth, async (req, res) => {
     const cur = (await client.query('SELECT * FROM employees WHERE id=$1 FOR UPDATE', [req.params.id])).rows[0];
     if (!cur) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
     if (!(await canManageEmployee(req.user, cur, 'edit_employee'))) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'Not authorized' }); }
-    if (!/\bintern\b/i.test(cur.job_title || '')) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Only an intern can be converted to in-house.' }); }
-    const job_title = String(req.body.job_title || '').trim();
-    const employee_number = String(req.body.employee_number || '').trim();
-    const reason = String(req.body.reason || '').trim() || 'Converted from Intern to In-House';
+
+    // Two ways in, one destination. An intern is already an Egypro record and
+    // only needs a real job title and an Employment ID; an outsourced person is
+    // classified by their ORGANIZATION, so absorbing them means moving that to
+    // Egypro as well. Classification is derived, never stored -- see the CASE in
+    // the employees list -- so the organization is what actually decides it.
+    const isEgypro = String(cur.organization || '').trim().toLowerCase() === 'egypro';
+    const wasIntern = isEgypro && /\bintern\b/i.test(cur.job_title || '');
+    const wasOutsource = !isEgypro;
+    if (!wasIntern && !wasOutsource) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Only an intern or an outsourced resource can be converted to in-house.' });
+    }
+
+    const job_title = squish(req.body.job_title);
+    const employee_number = squish(req.body.employee_number);
+    const department = squish(req.body.department) || cur.department || null;
+    const project = squish(req.body.project) || cur.project || null;
+    const client_name = squish(req.body.client) || cur.client || null;
+    const fromLabel = wasIntern ? 'Intern' : (cur.organization || 'Outsource');
+    const reason = squish(req.body.reason) || `Absorbed from ${fromLabel} to In-House`;
+
     if (!job_title) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Job Title is required' }); }
     if (/\bintern\b/i.test(job_title)) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Pick a non-intern Job Title.' }); }
     if (!employee_number) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Employment ID is required' }); }
     const dup = await client.query('SELECT id FROM employees WHERE employee_number=$1 AND id<>$2', [employee_number, cur.id]);
     if (dup.rows.length) { await client.query('ROLLBACK'); return res.status(409).json({ error: 'This Employment ID is already in use.' }); }
+
     await client.query(
-      `UPDATE employees SET job_title=$1, employee_number=$2, resource_type='inhouse', added_on=CURRENT_DATE,
-         last_edited_by=$3, last_edited_at=NOW(), last_edit_reason=$4, updated_at=NOW() WHERE id=$5`,
-      [job_title, employee_number, req.user.id, reason, cur.id]);
+      `UPDATE employees SET job_title=$1, employee_number=$2, organization='Egypro', resource_type='inhouse',
+         department=$3, project=$4, client=$5, added_on=CURRENT_DATE,
+         last_edited_by=$6, last_edited_at=NOW(), last_edit_reason=$7, updated_at=NOW() WHERE id=$8`,
+      [job_title, employee_number, department, project, client_name, req.user.id, reason, cur.id]);
+
+    // Only report what actually moved, so the history entry reads as the change
+    // it was rather than a wall of unchanged fields.
     const changes = [
-      { field: 'Job Title', before: cur.job_title || '—', after: job_title },
+      { field: 'Classification', before: wasIntern ? 'Intern' : 'Outsource', after: 'In-House' },
       { field: 'Employment Number', before: cur.employee_number || '—', after: employee_number },
-      { field: 'Classification', before: 'Intern', after: 'In-House' },
     ];
+    if (wasOutsource) changes.push({ field: 'Organization', before: cur.organization || '—', after: 'Egypro' });
+    if ((cur.job_title || '') !== job_title) changes.push({ field: 'Job Title', before: cur.job_title || '—', after: job_title });
+    if ((cur.department || null) !== department) changes.push({ field: 'Department', before: cur.department || '—', after: department || '—' });
+    if ((cur.project || null) !== project) changes.push({ field: 'Project', before: cur.project || '—', after: project || '—' });
+    if ((cur.client || null) !== client_name) changes.push({ field: 'Client', before: cur.client || '—', after: client_name || '—' });
+
     await client.query(
       `INSERT INTO employee_change_log (employee_id, employee_name, national_id, employee_number, action, reason, changes, changed_by, changed_by_name)
        VALUES ($1,$2,$3,$4,'update',$5,$6::jsonb,$7,$8)`,

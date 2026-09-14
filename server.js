@@ -4352,6 +4352,24 @@ app.put('/api/training-records/:id/update', auth, async (req, res) => {
           new Date(completed_at) >= new Date(rec.current_expiry_date)) {
         return res.status(400).json({ error: 'That date starts a new training cycle. Use Renew so the previous certificate is kept as history.' });
       }
+      // Closing an OPEN request with a date that is not after a certificate they
+      // already hold records the same certificate twice, and the copy then
+      // supersedes the original. Renew already refuses this; recording a request
+      // did not. Correcting the current certificate in place is left alone -- that
+      // record is the certificate, so there is nothing for it to duplicate.
+      if (rec.current_status !== 'completed') {
+        const { rows: [existing] } = await pool.query(
+          `SELECT completed_at FROM training_records
+            WHERE employee_id = $1 AND course_id = $2 AND id <> $3
+              AND status = 'completed' AND is_deleted IS NOT TRUE
+              AND completed_at >= $4::date
+            ORDER BY completed_at DESC LIMIT 1`,
+          [rec.employee_id, rec.course_id, rec.id, completed_at]);
+        if (existing) {
+          const d = new Date(existing.completed_at).toLocaleDateString('en-GB');
+          return res.status(400).json({ error: `This isn't later than their current certificate (${d}). If they already hold it, cancel this request instead.` });
+        }
+      }
       const cost = (training_cost === '' || training_cost == null) ? null : Number(training_cost);
       if (cost != null && (isNaN(cost) || cost < 0)) return res.status(400).json({ error: 'Training cost must be a non-negative number' });
       const { rows } = await pool.query(
@@ -4443,6 +4461,27 @@ app.post('/api/training-requests', auth, async (req, res) => {
     if (emp.employment_status !== 'active') {
       return res.status(400).json({ error: 'Cannot request training for a non-active employee' });
     }
+    // A certificate that is still valid, with more than EXPIRY_SOON_DAYS left,
+    // needs no training -- asking for one creates a duplicate. That is exactly
+    // what happened on 3 Sep 2026: six riggers already certified to 2028 were
+    // re-requested for Rope Rigging, because the request page showed no
+    // certificates, and each was then "completed" with the same certificate
+    // again. Enforced here rather than only in the page so a bulk action or any
+    // future screen is held to it too. Expiring and expired stay requestable --
+    // those are renewals.
+    const { rows: [held] } = await pool.query(
+      `SELECT p.expiry_date, c.name AS course_name, c.no_expiry, e.full_name
+         FROM training_records p
+         JOIN training_courses c ON c.id = p.course_id
+         JOIN employees e ON e.id = p.employee_id
+        WHERE p.employee_id = $1 AND p.course_id = $2 AND p.status = 'completed' AND p.is_deleted IS NOT TRUE
+        ORDER BY p.completed_at DESC, p.id DESC LIMIT 1`, [employee_id, course_id]);
+    if (held && (held.no_expiry || held.expiry_date === null ||
+        new Date(held.expiry_date) > new Date(Date.now() + EXPIRY_SOON_DAYS * 86400000))) {
+      const until = held.expiry_date ? `, valid until ${new Date(held.expiry_date).toLocaleDateString('en-GB')}` : ' (no expiry)';
+      return res.status(400).json({ error: `${held.full_name} already holds a valid ${held.course_name} certificate${until}.` });
+    }
+
     // Raising the request IS the action -- there is no separate "someone must
     // pick this up" step -- so it opens straight as Pending against the team that
     // owns the training (same rule as the expiry-opened renewals above).
@@ -4583,16 +4622,33 @@ app.delete('/api/training-records/:id', auth, async (req, res) => {
   if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   try {
     const { rows: [rec] } = await pool.query(
-      `SELECT status FROM training_records WHERE id = $1 AND is_deleted IS NOT TRUE`, [req.params.id]
+      `SELECT status, course_id, completed_at, employee_id, casual_id FROM training_records WHERE id = $1 AND is_deleted IS NOT TRUE`, [req.params.id]
     );
     if (!rec) return res.status(404).json({ error: 'Not found' });
+    // A completed record is certificate history and stays protected -- with one
+    // exception: an exact duplicate. When another completed record exists for the
+    // same person, same training and the identical completion date, this one
+    // adds nothing to the history, so it may go. Soft delete, logged, reversible;
+    // the certificate file is not touched. Because Superseded is calculated, the
+    // remaining record becomes the current certificate again by itself.
+    let duplicate = false;
     if (rec.status === 'completed') {
-      return res.status(400).json({ error: 'A completed record is certificate history and cannot be deleted' });
+      const { rows: [twin] } = await pool.query(
+        `SELECT o.id FROM training_records o
+          WHERE o.id <> $1 AND o.is_deleted IS NOT TRUE AND o.status = 'completed'
+            AND o.course_id = $2 AND o.completed_at = $3
+            AND ((o.employee_id IS NOT NULL AND o.employee_id = $4) OR (o.casual_id IS NOT NULL AND o.casual_id = $5))
+          LIMIT 1`,
+        [req.params.id, rec.course_id, rec.completed_at, rec.employee_id, rec.casual_id]);
+      if (!twin) {
+        return res.status(400).json({ error: 'A completed record is certificate history and cannot be deleted' });
+      }
+      duplicate = true;
     }
     await pool.query('UPDATE training_records SET is_deleted = TRUE, updated_at = NOW() WHERE id = $1', [req.params.id]);
     await logTrainingEvent({
       recordId: req.params.id, action: 'deleted', from: rec.status, to: 'deleted', user: req.user,
-      detail: 'Record deleted',
+      detail: duplicate ? 'Duplicate certificate removed — an identical record for the same date is kept' : 'Record deleted',
     });
     res.json({ ok: true });
   } catch(e) { sendError(res, e); }

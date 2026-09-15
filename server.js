@@ -577,13 +577,35 @@ async function setupDB() {
     await client.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS one_open_training_request_employee
         ON training_records (employee_id, course_id)
-        WHERE status IN ('requested','scheduled','pending') AND is_deleted IS NOT TRUE AND employee_id IS NOT NULL
+        WHERE status IN ('requested','scheduled','pending','not_eligible') AND is_deleted IS NOT TRUE AND employee_id IS NOT NULL
     `);
     await client.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS one_open_training_request_casual
         ON training_records (casual_id, course_id)
-        WHERE status IN ('requested','scheduled','pending') AND is_deleted IS NOT TRUE AND casual_id IS NOT NULL
+        WHERE status IN ('requested','scheduled','pending','not_eligible') AND is_deleted IS NOT TRUE AND casual_id IS NOT NULL
     `);
+    // Not Eligible is an open request, as it was in ETMS -- a reason beside Pending
+    // Reason, not a closed state -- so the one-open-request rule must count it.
+    // The CREATE above only applies to a fresh database; the live index is upgraded
+    // here, and only while it still has the old definition. It is built under a
+    // temporary name and swapped in, so the rule is never absent, and if existing
+    // data ever conflicted the build simply fails: the old index stays and boot
+    // carries on rather than taking the service down.
+    for (const [name, col] of [['one_open_training_request_employee', 'employee_id'], ['one_open_training_request_casual', 'casual_id']]) {
+      try {
+        const { rows: [ix] } = await client.query('SELECT indexdef FROM pg_indexes WHERE indexname = $1', [name]);
+        if (ix && !ix.indexdef.includes('not_eligible')) {
+          await client.query(`DROP INDEX IF EXISTS ${name}_v2`);
+          await client.query(`CREATE UNIQUE INDEX ${name}_v2 ON training_records (${col}, course_id)
+            WHERE status IN ('requested','scheduled','pending','not_eligible') AND is_deleted IS NOT TRUE AND ${col} IS NOT NULL`);
+          await client.query(`DROP INDEX IF EXISTS ${name}`);
+          await client.query(`ALTER INDEX ${name}_v2 RENAME TO ${name}`);
+          console.log(`${name}: widened to count not_eligible as open`);
+        }
+      } catch (e) {
+        console.warn(`${name}: could not widen to include not_eligible; keeping the existing rule --`, e.message);
+      }
+    }
     await client.query('CREATE INDEX IF NOT EXISTS idx_training_records_employee ON training_records(employee_id)');
     await client.query('CREATE INDEX IF NOT EXISTS idx_training_records_status ON training_records(status)');
     await client.query('CREATE INDEX IF NOT EXISTS idx_training_records_expiry ON training_records(expiry_date)');
@@ -3981,7 +4003,7 @@ const ensureRenewalRequests = async (courseId) => {
           SELECT 1 FROM training_records o
            WHERE o.employee_id = t.employee_id AND o.course_id = t.course_id
              AND o.is_deleted IS NOT TRUE
-             AND o.status IN ('requested','scheduled','pending'))
+             AND o.status IN ('requested','scheduled','pending','not_eligible'))
         AND NOT EXISTS (
           SELECT 1 FROM training_records d
            WHERE d.employee_id = t.employee_id AND d.course_id = t.course_id
@@ -4264,7 +4286,7 @@ app.post('/api/training-records/:id/renew', auth, async (req, res) => {
     const { rows: [open] } = await pool.query(
       `SELECT id FROM training_records
         WHERE employee_id=$1 AND course_id=$2 AND is_deleted IS NOT TRUE
-          AND status IN ('requested','scheduled','pending') LIMIT 1`,
+          AND status IN ('requested','scheduled','pending','not_eligible') LIMIT 1`,
       [rec.employee_id, rec.course_id]
     );
     if (open) {
@@ -4461,25 +4483,29 @@ app.post('/api/training-requests', auth, async (req, res) => {
     if (emp.employment_status !== 'active') {
       return res.status(400).json({ error: 'Cannot request training for a non-active employee' });
     }
-    // A certificate that is still valid, with more than EXPIRY_SOON_DAYS left,
-    // needs no training -- asking for one creates a duplicate. That is exactly
-    // what happened on 3 Sep 2026: six riggers already certified to 2028 were
-    // re-requested for Rope Rigging, because the request page showed no
-    // certificates, and each was then "completed" with the same certificate
-    // again. Enforced here rather than only in the page so a bulk action or any
-    // future screen is held to it too. Expiring and expired stay requestable --
-    // those are renewals.
-    const { rows: [held] } = await pool.query(
-      `SELECT p.expiry_date, c.name AS course_name, c.no_expiry, e.full_name
+    // One standing request per person and training, as in ETMS. While any record
+    // for it is not cancelled -- open in any state (pending on any reason, Not
+    // Eligible included; scheduled) or a completed certificate, valid or expired --
+    // nothing new may be raised. Renewals are opened automatically when a
+    // certificate expires, so EHS never requests one by hand. Only a training
+    // whose records are ALL cancelled can be requested again. Enforced here and
+    // not only in the page, so no screen or bulk action can recreate the
+    // duplicates of 3 Sep 2026.
+    const { rows: [onFile] } = await pool.query(
+      `SELECT p.status, p.expiry_date, c.name AS course_name, e.full_name
          FROM training_records p
          JOIN training_courses c ON c.id = p.course_id
          JOIN employees e ON e.id = p.employee_id
-        WHERE p.employee_id = $1 AND p.course_id = $2 AND p.status = 'completed' AND p.is_deleted IS NOT TRUE
-        ORDER BY p.completed_at DESC, p.id DESC LIMIT 1`, [employee_id, course_id]);
-    if (held && (held.no_expiry || held.expiry_date === null ||
-        new Date(held.expiry_date) > new Date(Date.now() + EXPIRY_SOON_DAYS * 86400000))) {
-      const until = held.expiry_date ? `, valid until ${new Date(held.expiry_date).toLocaleDateString('en-GB')}` : ' (no expiry)';
-      return res.status(400).json({ error: `${held.full_name} already holds a valid ${held.course_name} certificate${until}.` });
+        WHERE p.employee_id = $1 AND p.course_id = $2
+          AND p.is_deleted IS NOT TRUE AND p.status <> 'cancelled'
+        ORDER BY (p.status IN ('requested','scheduled','pending','not_eligible')) DESC,
+                 p.completed_at DESC NULLS LAST, p.requested_at DESC NULLS LAST
+        LIMIT 1`, [employee_id, course_id]);
+    if (onFile) {
+      const what = onFile.status === 'completed'
+        ? `already holds a ${onFile.course_name} certificate${onFile.expiry_date ? ` (expiry ${new Date(onFile.expiry_date).toLocaleDateString('en-GB')})` : ''}`
+        : `already has ${onFile.course_name} requested (${onFile.status.replace('_', ' ')})`;
+      return res.status(400).json({ error: `${onFile.full_name} ${what}. It is listed under Currently Requested Trainings.` });
     }
 
     // Raising the request IS the action -- there is no separate "someone must
@@ -4537,7 +4563,7 @@ app.put('/api/training-records/:id/cancel', auth, async (req, res) => {
     );
     if (!rec) return res.status(404).json({ error: 'Not found' });
     if (!(await inScope(req.user, rec.project, rec.client))) return res.status(404).json({ error: 'Not found' });
-    if (!['requested', 'scheduled', 'pending'].includes(rec.current_status)) {
+    if (!['requested', 'scheduled', 'pending', 'not_eligible'].includes(rec.current_status)) {
       return res.status(400).json({ error: `This request is already ${rec.current_status} and can't be removed` });
     }
     const { rows: [updated] } = await pool.query(

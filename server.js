@@ -5746,18 +5746,16 @@ function renderBarChart(title, rows) {
 }
 
 // The attachment mirrors the email exactly: every record in this family that is
-// waiting on Operations. Where the record is a renewal it also carries the
-// previous certificate's expiry, so a lapsed one is visible in the sheet without
-// needing a separate list.
+// waiting on Operations. Still ordered longest-waiting first, though the waiting
+// days are no longer a column -- the sheet is a worklist, and the order is the
+// only place that matters.
 async function buildOpsPendingWorkbook(projects) {
   const { rows } = await pool.query(`
     SELECT e.full_name, e.national_id, e.job_title,
            COALESCE(NULLIF(TRIM(e.project),''), '(none)') AS project,
            NULLIF(TRIM(e.client),'') AS client, e.organization,
-           c.name AS course, t.pending_reason, t.requested_at, t.prior_expiry_date,
-           (CURRENT_DATE - t.requested_at::date) AS waiting_days,
-           CASE WHEN t.prior_expiry_date IS NOT NULL AND t.prior_expiry_date < CURRENT_DATE
-                THEN (CURRENT_DATE - t.prior_expiry_date) END AS days_expired
+           c.name AS course, t.pending_reason,
+           (CURRENT_DATE - t.requested_at::date) AS waiting_days
       FROM training_records t
       JOIN training_courses c ON c.id = t.course_id
       JOIN employees e ON e.id = t.employee_id
@@ -5782,19 +5780,8 @@ async function buildOpsPendingWorkbook(projects) {
     { header: 'Organization', key: 'organization', width: 24 },
     { header: 'Training Type', key: 'course', width: 30 },
     { header: 'Pending Reason', key: 'pending_reason', width: 34 },
-    { header: 'Requested On', key: 'requested', width: 13 },
-    { header: 'Days Waiting', key: 'waiting_days', width: 13 },
-    { header: 'Previous Expiry', key: 'prior_expiry', width: 14 },
-    { header: 'Days Expired', key: 'days_expired', width: 13 },
   ];
-  const d = (v) => v ? new Date(v).toLocaleDateString('en-GB') : '';
-  rows.forEach(r => ws.addRow({
-    ...r,
-    requested: d(r.requested_at),
-    waiting_days: Number(r.waiting_days) || 0,
-    prior_expiry: d(r.prior_expiry_date),
-    days_expired: r.days_expired == null ? '' : Number(r.days_expired),
-  }));
+  rows.forEach(r => ws.addRow(r));
   const head = ws.getRow(1);
   head.font = { bold: true, color: { argb: 'FFFFFFFF' } };
   head.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0F2A4A' } };
@@ -5845,17 +5832,17 @@ async function sendOperationsTrainingDigest(label, projects, greeting) {
     await resend.emails.send({
       from: 'OneHub <esat@egypro.app>',
       to: 'e.maged@outlook.com',
-      subject: `OneHub Weekly — ${label}: ${rows.length} Training${rows.length > 1 ? 's' : ''} Pending with Operations`,
+      subject: `OneHub Weekly (${label}): ${rows.length} Training${rows.length > 1 ? 's' : ''} Pending with Operations`,
       attachments: sheet ? [{
         filename: `OneHub-Pending-With-Operations-${label}-${stamp}.xlsx`,
         content: sheet.buffer,
       }] : undefined,
       html: mailWrap(`
           <p>Hello ${escapeHtml(greeting)},</p>
-          <p>${label} Projects has <strong>${rows.length} training record${rows.length > 1 ? 's' : ''}</strong> pending on your side (Operations department). Kindly attend to ${rows.length > 1 ? 'these' : 'this'} urgently — allowing this work to continue without the related training carries considerable risk.</p>
+          <p>${label} Projects has <strong>${rows.length} training record${rows.length > 1 ? 's' : ''}</strong> pending on the (Operations department) side. Kindly support to avail ${rows.length > 1 ? 'them' : 'it'} urgently as allowing this work to continue without the related training carries considerable risk.</p>
           ${renderBarChart('Pending per Training Type', tally('course'))}
           ${renderBarChart('Pending per Project', tally('project', 'client'))}
-          <p style="margin-top:18px;">Attached as a spreadsheet, longest waiting first.</p>
+          <p style="margin-top:18px;">Attached as a spreadsheet.</p>
           ${MAIL_SIGNOFF}
         `)
     });

@@ -2583,7 +2583,16 @@ app.get('/api/audits/:id', auth, async (req, res) => {
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
+// Conducting an audit is a safety role, not something every account may do.
+// The UI has always gated the New Audit page, but this endpoint did not check
+// at all -- so any signed-in user could post an audit straight to the API,
+// whatever the page showed them. Mirrors the route's own role list.
+const AUDIT_CREATE_ROLES = ['admin', 'ehs_officer', 'ehs_manager'];
+
 app.post('/api/audits', auth, async (req, res) => {
+  if (!AUDIT_CREATE_ROLES.includes(req.user.role)) {
+    return res.status(403).json({ error: 'Not authorized to conduct audits' });
+  }
   const { employee_id, casual_id, audit_date, notes, items, audited_by_override, employee_present, location_id } = req.body;
   if (!employee_id && !casual_id) return res.status(400).json({ error: 'employee_id or casual_id required' });
   if (employee_id && casual_id) return res.status(400).json({ error: 'Provide only one of employee_id or casual_id' });

@@ -264,6 +264,10 @@ async function setupDB() {
     catch (e) { console.warn('casuals national_id unique index deferred (duplicates present?):', e.message); }
     try { await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_casuals_full_name ON casuals (LOWER(TRIM(full_name)))`); }
     catch (e) { console.warn('casuals full_name unique index deferred (duplicates present?):', e.message); }
+    // Employees get the same backstop the casuals already had. Exited people
+    // keep their name, so this is not a partial index.
+    try { await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_employees_full_name ON employees (LOWER(TRIM(full_name)))`); }
+    catch (e) { console.warn('employees full_name unique index deferred (duplicates present?):', e.message); }
 
     // Ensure distribution columns exist on ppe_requests
     await client.query('ALTER TABLE ppe_requests ADD COLUMN IF NOT EXISTS distribution_method VARCHAR(50)');
@@ -1406,6 +1410,29 @@ async function nationalIdConflict(nationalId, { excludeEmployeeId = null, exclud
   return null;
 }
 
+// The same backstop for the name. Two people really can share a name, but on a
+// register of this size a repeat is far more often one person entered twice --
+// so it is refused outright and whoever is entering it has to disambiguate.
+// Exited people still hold their name (Maged, 2026-10-09): the register is a
+// permanent record, not a list of who is here today. Matched the way the casuals
+// index already matches -- case- and outer-space-insensitive -- and every write
+// path squishes inner spaces first, so "A  B" cannot slip past "A B".
+async function fullNameConflict(fullName, { excludeEmployeeId = null, excludeCasualId = null } = {}) {
+  const name = squish(fullName);
+  if (!name) return null;
+  const emp = await pool.query(
+    'SELECT full_name, national_id FROM employees WHERE LOWER(TRIM(full_name))=LOWER($1) AND ($2::uuid IS NULL OR id<>$2) LIMIT 1',
+    [name, excludeEmployeeId]);
+  if (emp.rows.length) return `an employee (National ID ${emp.rows[0].national_id || '—'})`;
+  const cas = await pool.query(
+    'SELECT full_name, national_id FROM casuals WHERE LOWER(TRIM(full_name))=LOWER($1) AND ($2::uuid IS NULL OR id<>$2) LIMIT 1',
+    [name, excludeCasualId]);
+  if (cas.rows.length) return `a casual (National ID ${cas.rows[0].national_id || '—'})`;
+  return null;
+}
+const nameTakenError = (who, name) =>
+  `The name "${name}" already belongs to ${who}. Two people cannot share a name here — add a distinguishing part of the name, or correct the existing record.`;
+
 app.get('/api/employees/filter-options', auth, async (req, res) => {
   if (!['admin','hr','ehs_manager','ehs_officer','supervisor','project_director'].includes(req.user.role)) {
     return res.status(403).json({ error: 'Not authorized' });
@@ -1731,6 +1758,9 @@ app.post('/api/employees', auth, async (req, res) => {
     if (national_id) {
       const existing = await dbClient.query('SELECT id FROM employees WHERE national_id=$1', [national_id]);
       if (existing.rows.length > 0) {
+        // Updating this person must not rename them onto somebody else's name.
+        const taken = await fullNameConflict(full_name, { excludeEmployeeId: existing.rows[0].id });
+        if (taken) return res.status(409).json({ error: nameTakenError(taken, squish(full_name)) });
         await dbClient.query('BEGIN');
         const { rows } = await dbClient.query(
           `UPDATE employees SET full_name=$1, job_title=$2, department=$3, project=$4, client=$5, organization=$6, resource_type=$7, employment_status=$8${noEmpId ? ', employee_number=NULL' : ''} WHERE national_id=$9 RETURNING *`,
@@ -1749,13 +1779,16 @@ app.post('/api/employees', auth, async (req, res) => {
         return res.json(rows[0]);
       }
     }
+    const takenByName = await fullNameConflict(full_name);
+    if (takenByName) return res.status(409).json({ error: nameTakenError(takenByName, squish(full_name)) });
     const empNumber = noEmpId ? null : (employee_number || national_id || ('EMP-' + Date.now()));
     const { rows } = await dbClient.query(`INSERT INTO employees (employee_number,full_name,national_id,job_title,department,project,client,organization,resource_type,employment_status,created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`, [empNumber, full_name, national_id, job_title, department, project, client, organization, resource_type, employment_status || 'active', req.user.id]);
     broadcastEmployeesChanged();
     res.status(201).json(rows[0]);
   } catch(e) {
     await dbClient.query('ROLLBACK').catch(()=>{});
-    if (e.code === '23505') return res.status(409).json({ error: 'Employee number exists' });
+    if (e.code === '23505') return res.status(409).json({
+      error: e.constraint === 'uniq_employees_full_name' ? nameTakenError('another person', squish(full_name)) : 'Employee number exists' });
     res.status(500).json({ error: 'Server error' });
   } finally {
     dbClient.release();
@@ -1844,6 +1877,8 @@ app.put('/api/employees/:id', auth, async (req, res) => {
     const cur = (await client_db.query('SELECT * FROM employees WHERE id=$1 FOR UPDATE', [req.params.id])).rows[0];
     if (!cur) { await client_db.query('ROLLBACK'); return res.status(404).json({ error: 'Not found' }); }
     if (!(await canManageEmployee(req.user, cur, 'edit_employee'))) { await client_db.query('ROLLBACK'); return res.status(403).json({ error: 'Not authorized' }); }
+    const takenByName = await fullNameConflict(next.full_name, { excludeEmployeeId: cur.id });
+    if (takenByName) { await client_db.query('ROLLBACK'); return res.status(409).json({ error: nameTakenError(takenByName, squish(next.full_name)) }); }
     // Field-level diff over the editable fields only (national_id is read-only).
     const norm = (v) => (v === undefined || v === null || v === '') ? null : v;
     const changes = EMPLOYEE_EDITABLE
@@ -2125,6 +2160,12 @@ app.post('/api/casuals/batch', auth, async (req, res) => {
         skipped.push({ full_name: c.full_name, reason: `Full name "${c.full_name}" already exists as another casual (National ID ${nameMatch.national_id})` });
         continue;
       }
+      // ...and unique against the employee register too, not just the other casuals.
+      const nameElsewhere = await fullNameConflict(c.full_name);
+      if (nameElsewhere) {
+        skipped.push({ full_name: c.full_name, reason: `Full name "${c.full_name}" already belongs to ${nameElsewhere}` });
+        continue;
+      }
       const { rows } = await client_db.query(
         `INSERT INTO casuals (full_name, national_id, job_title, project, client, organization, created_by, last_edited_by)
          VALUES ($1,$2,'Casual',$3,$4,$5,$6,$6) RETURNING *`,
@@ -2189,6 +2230,10 @@ app.put('/api/casuals/:id', auth, async (req, res) => {
     return res.status(404).json({ error: 'Not found' });
   }
   const { full_name, national_id, project, client, organization } = req.body;
+  // Renaming a casual must not land on a name already held by anyone, casual or
+  // employee -- the same rule the add path applies.
+  const takenByName = await fullNameConflict(full_name, { excludeCasualId: req.params.id });
+  if (takenByName) return res.status(409).json({ error: nameTakenError(takenByName, squish(full_name)) });
   const { rows } = await pool.query(
     `UPDATE casuals SET full_name=$1, national_id=$2, project=$3, client=$4, organization=$5, updated_at=NOW(), last_edited_by=$6 WHERE id=$7 RETURNING *`,
     [full_name, national_id || null, project, client || null, organization || null, req.user.id, req.params.id]
@@ -6357,6 +6402,8 @@ app.post('/api/employees/manual', auth, (req, res) => {
       // National ID must be unique across ALL resources (employees + casuals).
       const conflict = await nationalIdConflict(national_id.trim());
       if (conflict) return res.status(409).json({ error: `This National ID already belongs to ${conflict}.` });
+      const nameConflict = await fullNameConflict(full_name);
+      if (nameConflict) return res.status(409).json({ error: nameTakenError(nameConflict, squish(full_name)) });
       if (empNo) {
         const dupNo = await pool.query('SELECT id FROM employees WHERE employee_number=$1', [empNo]);
         if (dupNo.rows.length) return res.status(409).json({ error: 'This Employment ID is already in use.' });

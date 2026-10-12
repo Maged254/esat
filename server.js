@@ -7,6 +7,23 @@ const cors = require('cors');
 const compression = require('compression');
 const ExcelJS = require('exceljs');
 
+// ── Training request states ────────────────────────────────
+// An OPEN request is work someone owes: it is counted as Pending everywhere and
+// it is what the Update screen lists.
+//
+// QUEUED is a request raised against a certificate that is still valid. It is
+// booked but not yet due, so it is counted NOWHERE -- not the dashboard, not the
+// Tracker, not the weekly digests -- because a card cannot honestly read "Valid
+// until 2027" and "Pending" at the same time (Maged, 2026-10-12). It holds the
+// slot so a second request cannot be raised, and the renewal sweep turns it into
+// the pending renewal it was always going to become on the day the certificate
+// expires.
+const OPEN_STATUSES = ['requested', 'scheduled', 'pending', 'not_eligible'];
+const QUEUED = 'queued';
+// What occupies a person's slot for a course: one request, open or booked.
+const SLOT_STATUSES = [...OPEN_STATUSES, QUEUED];
+const sqlList = (arr) => arr.map(s => `'${s}'`).join(',');
+
 const app = express();
 app.set('trust proxy', true); // so req.ip reflects the real client IP behind Render's proxy
 app.use(compression());
@@ -581,12 +598,12 @@ async function setupDB() {
     await client.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS one_open_training_request_employee
         ON training_records (employee_id, course_id)
-        WHERE status IN ('requested','scheduled','pending','not_eligible') AND is_deleted IS NOT TRUE AND employee_id IS NOT NULL
+        WHERE status IN (${sqlList(SLOT_STATUSES)}) AND is_deleted IS NOT TRUE AND employee_id IS NOT NULL
     `);
     await client.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS one_open_training_request_casual
         ON training_records (casual_id, course_id)
-        WHERE status IN ('requested','scheduled','pending','not_eligible') AND is_deleted IS NOT TRUE AND casual_id IS NOT NULL
+        WHERE status IN (${sqlList(SLOT_STATUSES)}) AND is_deleted IS NOT TRUE AND casual_id IS NOT NULL
     `);
     // Not Eligible is an open request, as it was in ETMS -- a reason beside Pending
     // Reason, not a closed state -- so the one-open-request rule must count it.
@@ -608,6 +625,23 @@ async function setupDB() {
         }
       } catch (e) {
         console.warn(`${name}: could not widen to include not_eligible; keeping the existing rule --`, e.message);
+      }
+      // ...and again for `queued`: a request booked against a still-valid
+      // certificate occupies the slot exactly as an open one does, so a second
+      // request for the same training cannot be raised beside it. Same
+      // build-and-swap, same refusal to take boot down if it cannot be done.
+      try {
+        const { rows: [ix] } = await client.query('SELECT indexdef FROM pg_indexes WHERE indexname = $1', [name]);
+        if (ix && !ix.indexdef.includes(QUEUED)) {
+          await client.query(`DROP INDEX IF EXISTS ${name}_v3`);
+          await client.query(`CREATE UNIQUE INDEX ${name}_v3 ON training_records (${col}, course_id)
+            WHERE status IN (${sqlList(SLOT_STATUSES)}) AND is_deleted IS NOT TRUE AND ${col} IS NOT NULL`);
+          await client.query(`DROP INDEX IF EXISTS ${name}`);
+          await client.query(`ALTER INDEX ${name}_v3 RENAME TO ${name}`);
+          console.log(`${name}: widened to count queued as holding the slot`);
+        }
+      } catch (e) {
+        console.warn(`${name}: could not widen to include queued; keeping the existing rule --`, e.message);
       }
     }
     await client.query('CREATE INDEX IF NOT EXISTS idx_training_records_employee ON training_records(employee_id)');
@@ -4135,6 +4169,45 @@ const ensureRenewalRequests = async (courseId) => {
   // comma-separated list; a single id is just a list of one.
   const courseIds = String(courseId || '').split(',').map(s => s.trim()).filter(Boolean);
   if (courseIds.length) { params.push(courseIds); courseClause = ` AND t.course_id = ANY($${params.length}::uuid[])`; }
+
+  // A request booked while the certificate was still valid comes due the day it
+  // expires. Waking it must happen BEFORE the insert below, or that insert would
+  // see no open request and raise a second one beside it. It becomes an ordinary
+  // pending renewal -- same pending reason, same prior_expiry_date -- so nothing
+  // downstream has to know it was ever queued.
+  try {
+    const { rows: woken } = await pool.query(`
+      UPDATE training_records q
+         SET status = 'pending',
+             pending_reason = ${PENDING_TEAM_REASON_SQL},
+             prior_expiry_date = cert.expiry_date,
+             requested_at = COALESCE(q.requested_at, NOW()),
+             updated_at = NOW()
+        FROM employees e
+        LEFT JOIN outsource_entities oe ON LOWER(TRIM(oe.name)) = LOWER(TRIM(e.organization))
+        JOIN LATERAL (
+          SELECT p.expiry_date FROM training_records p
+           WHERE p.employee_id = e.id AND p.course_id = q.course_id
+             AND p.status = 'completed' AND p.is_deleted IS NOT TRUE
+           ORDER BY p.completed_at DESC NULLS LAST, p.id DESC LIMIT 1
+        ) cert ON TRUE
+       WHERE q.status = '${QUEUED}'
+         AND q.is_deleted IS NOT TRUE
+         AND e.id = q.employee_id
+         AND e.employment_status = 'active'
+         ${courseClause.replace(/\bt\./g, 'q.')}
+         AND cert.expiry_date < CURRENT_DATE
+      RETURNING q.id, q.prior_expiry_date, q.pending_reason`, params);
+    for (const r of woken) {
+      await logTrainingEvent({
+        recordId: r.id, action: 'opened', to: 'pending', user: null,
+        detail: `Booked renewal came due — certificate expired ${r.prior_expiry_date.toISOString().slice(0, 10)} (${r.pending_reason})`,
+      });
+    }
+  } catch (e) {
+    console.error('queued renewal wake-up failed:', e.message);
+  }
+
   try {
     const { rows: opened } = await pool.query(`
       INSERT INTO training_records (employee_id, course_id, status, pending_reason, requested_at, prior_expiry_date, created_at, updated_at)
@@ -4153,7 +4226,7 @@ const ensureRenewalRequests = async (courseId) => {
           SELECT 1 FROM training_records o
            WHERE o.employee_id = t.employee_id AND o.course_id = t.course_id
              AND o.is_deleted IS NOT TRUE
-             AND o.status IN ('requested','scheduled','pending','not_eligible'))
+             AND o.status IN (${sqlList(SLOT_STATUSES)}))
         AND NOT EXISTS (
           SELECT 1 FROM training_records d
            WHERE d.employee_id = t.employee_id AND d.course_id = t.course_id
@@ -4182,7 +4255,10 @@ const trainingTrackerWhere = async (req, params) => {
   // single-valued everywhere else, so each arrives as a comma-separated list of
   // one or more values and is matched with ANY.
   const csv = (v) => String(v || '').split(',').map(s => s.trim()).filter(Boolean);
-  let w = ` WHERE t.is_deleted IS NOT TRUE AND t.employee_id IS NOT NULL`;
+  // A queued request is booked, not due. Excluding it here keeps it out of the
+  // Tracker, the dashboard (counts and donut alike) and the weekly digests in
+  // one place, rather than hoping every status list downstream remembers it.
+  let w = ` WHERE t.is_deleted IS NOT TRUE AND t.employee_id IS NOT NULL AND t.status <> '${QUEUED}'`;
   if (status) { params.push(status.split(',')); w += ` AND t.status = ANY($${params.length})`; }
   if (employment_status) { params.push(employment_status); w += ` AND e.employment_status = $${params.length}`; }
   if (search) { params.push(`%${search}%`); w += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length})`; }
@@ -4434,13 +4510,16 @@ app.post('/api/training-records/:id/renew', auth, async (req, res) => {
     // If EHS already raised a fresh request for this training, that record is the
     // one to record against -- renewing separately would strand it open.
     const { rows: [open] } = await pool.query(
-      `SELECT id FROM training_records
+      `SELECT id, status FROM training_records
         WHERE employee_id=$1 AND course_id=$2 AND is_deleted IS NOT TRUE
-          AND status IN ('requested','scheduled','pending','not_eligible') LIMIT 1`,
+          AND status IN (${sqlList(SLOT_STATUSES)}) LIMIT 1`,
       [rec.employee_id, rec.course_id]
     );
     if (open) {
-      return res.status(400).json({ error: 'This employee already has an open request for this training — record that one as completed instead of renewing.' });
+      return res.status(400).json({
+        error: open.status === QUEUED
+          ? 'This employee already has a renewal booked for this training — cancel that booking first, or record it as completed once it comes due.'
+          : 'This employee already has an open request for this training — record that one as completed instead of renewing.' });
     }
     const cost = (training_cost === '' || training_cost == null) ? null : Number(training_cost);
     if (cost != null && (isNaN(cost) || cost < 0)) return res.status(400).json({ error: 'Training cost must be a non-negative number' });
@@ -4633,43 +4712,51 @@ app.post('/api/training-requests', auth, async (req, res) => {
     if (emp.employment_status !== 'active') {
       return res.status(400).json({ error: 'Cannot request training for a non-active employee' });
     }
-    // One standing request per person and training, as in ETMS. While any record
-    // for it is not cancelled -- open in any state (pending on any reason, Not
-    // Eligible included; scheduled) or a completed certificate, valid or expired --
-    // nothing new may be raised. Renewals are opened automatically when a
-    // certificate expires, so EHS never requests one by hand. Only a training
-    // whose records are ALL cancelled can be requested again. Enforced here and
-    // not only in the page, so no screen or bulk action can recreate the
-    // duplicates of 3 Sep 2026.
+    // One OPEN request per person and training, as in ETMS -- and only that.
+    // A completed certificate on file used to block a new request too, which
+    // left an expired certificate whose renewal had been cancelled stranded:
+    // nothing was chasing it and nobody could ask for it again (Maged,
+    // 2026-10-12). What must never happen is two live requests for the same
+    // training, so the check is now exactly that, and the partial unique index
+    // still backs it up. Automatic renewals are unchanged: they open on expiry
+    // on their own, this is the manual route back in.
     const { rows: [onFile] } = await pool.query(
-      `SELECT p.status, p.expiry_date, c.name AS course_name, e.full_name
+      `SELECT p.status, c.name AS course_name, e.full_name
          FROM training_records p
          JOIN training_courses c ON c.id = p.course_id
          JOIN employees e ON e.id = p.employee_id
         WHERE p.employee_id = $1 AND p.course_id = $2
-          AND p.is_deleted IS NOT TRUE AND p.status <> 'cancelled'
-        ORDER BY (p.status IN ('requested','scheduled','pending','not_eligible')) DESC,
-                 p.completed_at DESC NULLS LAST, p.requested_at DESC NULLS LAST
+          AND p.is_deleted IS NOT TRUE
+          AND p.status IN (${sqlList(SLOT_STATUSES)})
+        ORDER BY p.requested_at DESC NULLS LAST
         LIMIT 1`, [employee_id, course_id]);
     if (onFile) {
-      const what = onFile.status === 'completed'
-        ? `already holds a ${onFile.course_name} certificate${onFile.expiry_date ? ` (expiry ${new Date(onFile.expiry_date).toLocaleDateString('en-GB')})` : ''}`
-        : `already has ${onFile.course_name} requested (${onFile.status.replace('_', ' ')})`;
-      return res.status(400).json({ error: `${onFile.full_name} ${what}. It is listed under Currently Requested Trainings.` });
+      return res.status(400).json({
+        error: onFile.status === QUEUED
+          ? `${onFile.full_name} already has ${onFile.course_name} booked for renewal when the current certificate expires. It is listed under Currently Requested Trainings.`
+          : `${onFile.full_name} already has ${onFile.course_name} requested (${onFile.status.replace('_', ' ')}). It is listed under Currently Requested Trainings.`,
+      });
     }
 
     // Raising the request IS the action -- there is no separate "someone must
     // pick this up" step -- so it opens straight as Pending against the team that
     // owns the training (same rule as the expiry-opened renewals above).
     //
-    // If the person already holds an EXPIRED certificate for this course, this is
-    // a renewal however it was raised -- typically re-asking for one that was
-    // cancelled earlier. Carry that certificate's expiry across as
-    // `prior_expiry_date` so the record keeps its history ("Expired on <date>")
-    // and files under Expired rather than posing as a brand-new request.
+    // Three cases, decided by the certificate on file:
+    //   no certificate, or an EXPIRED one -> Pending now. An expired one makes
+    //     this a renewal however it was raised (typically re-asking for one that
+    //     was cancelled earlier), so its expiry is carried across as
+    //     `prior_expiry_date` and the record reads "Expired on <date>" rather
+    //     than posing as a brand-new request.
+    //   a certificate still VALID -> queued, not pending. Booking a renewal
+    //     eight months early must not make the dashboard claim the training is
+    //     outstanding while the certificate is good; the sweep turns it pending
+    //     on the day it expires.
     const { rows: [rec] } = await pool.query(
       `INSERT INTO training_records (employee_id, course_id, status, pending_reason, prior_expiry_date, requested_by, requested_at)
-       SELECT e.id, $2::uuid, 'pending', ${PENDING_TEAM_REASON_SQL},
+       SELECT e.id, $2::uuid,
+              CASE WHEN prev.expiry_date >= CURRENT_DATE THEN '${QUEUED}' ELSE 'pending' END,
+              CASE WHEN prev.expiry_date >= CURRENT_DATE THEN NULL ELSE ${PENDING_TEAM_REASON_SQL} END,
               CASE WHEN prev.expiry_date < CURRENT_DATE THEN prev.expiry_date END, $3, NOW()
        FROM employees e
        LEFT JOIN outsource_entities oe ON LOWER(TRIM(oe.name)) = LOWER(TRIM(e.organization))
@@ -4684,8 +4771,10 @@ app.post('/api/training-requests', auth, async (req, res) => {
       [employee_id, course_id, req.user.id]
     );
     await logTrainingEvent({
-      recordId: rec.id, action: 'opened', to: 'pending', user: req.user,
-      detail: `Requested${rec.prior_expiry_date ? ` — renewal, certificate expired ${rec.prior_expiry_date.toISOString().slice(0, 10)}` : ''} (${rec.pending_reason})`,
+      recordId: rec.id, action: 'opened', to: rec.status, user: req.user,
+      detail: rec.status === QUEUED
+        ? 'Requested — booked, opens for renewal when the current certificate expires'
+        : `Requested${rec.prior_expiry_date ? ` — renewal, certificate expired ${rec.prior_expiry_date.toISOString().slice(0, 10)}` : ''} (${rec.pending_reason})`,
     });
     res.json(rec);
   } catch(e) {
@@ -4713,7 +4802,9 @@ app.put('/api/training-records/:id/cancel', auth, async (req, res) => {
     );
     if (!rec) return res.status(404).json({ error: 'Not found' });
     if (!(await inScope(req.user, rec.project, rec.client))) return res.status(404).json({ error: 'Not found' });
-    if (!['requested', 'scheduled', 'pending', 'not_eligible'].includes(rec.current_status)) {
+    // A queued request is cancellable too -- unbooking a renewal you booked
+    // early is the whole reason it is visible on the page.
+    if (!SLOT_STATUSES.includes(rec.current_status)) {
       return res.status(400).json({ error: `This request is already ${rec.current_status} and can't be removed` });
     }
     const { rows: [updated] } = await pool.query(

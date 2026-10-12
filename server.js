@@ -1576,6 +1576,102 @@ app.get('/api/audit-coverage', auth, async (req, res) => {
     });
   } catch(e) { sendError(res, e); }
 });
+// The roster behind the coverage buckets, as a file. Deliberately its own
+// endpoint rather than something the page assembles client-side: a list of
+// every person and how long they have gone unaudited is a different thing from
+// the counts, and only the two roles that plan audits may take it away.
+const AUDIT_PLAN_ROLES = ['admin', 'ehs_manager'];
+
+app.get('/api/audit-coverage/export', auth, async (req, res) => {
+  if (!AUDIT_PLAN_ROLES.includes(req.user.role)) {
+    return res.status(403).json({ error: 'Not authorized to export the audit plan' });
+  }
+  try {
+    // Same scoping as /api/audit-coverage: the caller's own project/client
+    // grant first, then whatever chips the page has selected.
+    const projectFilter = await getProjectFilter(req.user);
+    const clientFilter = await getClientFilter(req.user);
+    if ((projectFilter !== null && projectFilter.length === 0) || (clientFilter !== null && clientFilter.length === 0)) {
+      return res.status(404).json({ error: 'No resources in your scope' });
+    }
+    const requestedProjects = String(req.query.project || '').split(',').map(s => s.trim()).filter(Boolean);
+    const requestedClients = String(req.query.client || '').split(',').map(s => s.trim()).filter(Boolean);
+    const params = [];
+    let whereExtra = '';
+    if (projectFilter !== null) { params.push(projectFilter); whereExtra += ` AND e.project = ANY($${params.length})`; }
+    if (clientFilter !== null) { params.push(clientFilter); whereExtra += ` AND e.client = ANY($${params.length})`; }
+    if (requestedProjects.length) { params.push(requestedProjects); whereExtra += ` AND e.project = ANY($${params.length})`; }
+    if (requestedClients.length) { params.push(requestedClients); whereExtra += ` AND e.client = ANY($${params.length})`; }
+
+    // Never audited first, then longest-waiting: read top-down, that is the
+    // order to book them in. NULLS FIRST on a DESC sort does exactly that.
+    const { rows } = await pool.query(`
+      WITH last_audit AS (
+        SELECT employee_id, MAX(audit_date) AS last_audit_date
+          FROM audits WHERE employee_present = TRUE AND is_deleted IS NOT TRUE
+         GROUP BY employee_id
+      )
+      SELECT e.full_name, e.national_id, e.job_title, e.department, e.project, e.client, e.organization,
+             la.last_audit_date,
+             CASE WHEN la.last_audit_date IS NULL THEN NULL ELSE CURRENT_DATE - la.last_audit_date END AS days_since
+        FROM employees e
+        LEFT JOIN last_audit la ON la.employee_id = e.id
+       WHERE e.employment_status = 'active' AND e.san = TRUE ${whereExtra}
+       ORDER BY days_since DESC NULLS FIRST, e.full_name`, params);
+
+    const bucketOf = (d) => d == null ? 'Never audited'
+      : d <= 30 ? '0–30 days' : d <= 60 ? '31–60 days' : d <= 90 ? '61–90 days' : '90+ days';
+    const BUCKET_FILL = {
+      'Never audited': 'FFE5E7EB', '0–30 days': 'FFDCFCE7',
+      '31–60 days': 'FFFEF3C7', '61–90 days': 'FFFDE8E8', '90+ days': 'FFFDE8E8',
+    };
+
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('Audit Plan');
+    ws.columns = [
+      { header: 'Employee', key: 'full_name', width: 28 },
+      { header: 'National ID', key: 'national_id', width: 14 },
+      { header: 'Job Title', key: 'job_title', width: 24 },
+      { header: 'Department', key: 'department', width: 16 },
+      { header: 'Project', key: 'project', width: 18 },
+      { header: 'Client', key: 'client', width: 14 },
+      { header: 'Organization', key: 'organization', width: 20 },
+      { header: 'Last Audit', key: 'last_audit', width: 13 },
+      { header: 'Days Since', key: 'days_since', width: 11 },
+      { header: 'Status', key: 'status', width: 15 },
+    ];
+    rows.forEach(r => {
+      const days = r.days_since == null ? null : Number(r.days_since);
+      ws.addRow({
+        ...r,
+        last_audit: r.last_audit_date ? new Date(r.last_audit_date).toLocaleDateString('en-GB') : 'Never',
+        days_since: days == null ? '' : days,
+        status: bucketOf(days),
+      });
+    });
+    const head = ws.getRow(1);
+    head.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    head.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0F2A4A' } };
+    head.height = 20;
+    // Overdue is the point of the sheet, so it reads at a glance rather than
+    // being worked out from the Days column.
+    ws.getColumn('status').eachCell((cell, row) => {
+      if (row === 1) return;
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: BUCKET_FILL[cell.value] || 'FFFFFFFF' } };
+    });
+    ws.getColumn('days_since').alignment = { horizontal: 'center' };
+    ws.views = [{ state: 'frozen', xSplit: 1, ySplit: 1 }];
+    ws.autoFilter = { from: 'A1', to: { row: 1, column: ws.columns.length } };
+
+    const buffer = await wb.xlsx.writeBuffer();
+    const name = `OneHub-Audit-Plan-${new Date().toISOString().slice(0, 10)}.xlsx`;
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.send(Buffer.from(buffer));
+  } catch (e) { sendError(res, e); }
+});
+
 app.get('/api/employees/overdue', auth, async (req, res) => {
   try {
     const overdueProjects = await getProjectFilter(req.user);

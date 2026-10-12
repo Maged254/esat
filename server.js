@@ -6746,7 +6746,7 @@ app.get('/api/graphs', auth, async (req, res) => {
     }
     const accessWhere = accessConditions.length ? `WHERE ${accessConditions.join(' AND ')}` : '';
 
-    const [ppeByEmployee, ppeRepeatedByEmployee, auditsByMonth, ncrByMonth, ppeStageDelays, filterOptions, auditsByAuditor, auditsByAuditorProject] = await Promise.all([
+    const [ppeByEmployee, ppeRepeatedByEmployee, auditsByMonth, ncrByMonth, ppeStageDelays, filterOptions, auditsByAuditor, auditorWindows, auditsByAuditorProject] = await Promise.all([
       pool.query(`
         SELECT COALESCE(e.full_name, c.full_name) as employee_name, COUNT(r.id) as ppe_count
         FROM ppe_requests r
@@ -6942,6 +6942,28 @@ app.get('/api/graphs', auth, async (req, res) => {
         GROUP BY month_date, month, u.id, u.full_name, u.profile_picture
         ORDER BY month_date ASC
       `, scopeParams),
+      // Auditor Pulse, on rolling 30-day windows rather than calendar months.
+      // A calendar comparison on the 12th pits 12 days against a full 30, so it
+      // measured the date more than the auditor: Emmanuel read -50% while
+      // actually running 141 audits against 145 (Maged, 2026-10-12). Bucket 0 is
+      // the last 30 days, 1 the 30 before it, out to 5 -- the card's number, its
+      // change and its sparkline all read from the same windows.
+      pool.query(`
+        SELECT u.full_name as auditor,
+               u.profile_picture as photo,
+               FLOOR((CURRENT_DATE - a.audit_date) / 30)::int AS bucket,
+               COUNT(*) as count
+        FROM audits a
+        LEFT JOIN employees e ON e.id = a.employee_id
+        LEFT JOIN casuals c ON c.id = a.casual_id
+        JOIN users u ON u.id = a.audited_by
+        WHERE a.audit_date > CURRENT_DATE - INTERVAL '180 days'
+          AND a.audit_date <= CURRENT_DATE
+          AND a.employee_present = TRUE
+          AND a.is_deleted IS NOT TRUE
+        ${scopeWhere}
+        GROUP BY u.id, u.full_name, u.profile_picture, bucket
+      `, scopeParams),
       pool.query(`
         SELECT u.full_name as auditor,
                COALESCE(NULLIF(COALESCE(e.project, c.project), ''), 'Unassigned') as project,
@@ -6975,7 +6997,27 @@ app.get('/api/graphs', auth, async (req, res) => {
     const auditsByAuditorMonth = Object.values(auditorMonthRows)
       .sort((a, b) => new Date(a._sort) - new Date(b._sort))
       .map(({ _sort, ...rest }) => rest);
+    // One row per auditor: the six rolling windows oldest-first (the sparkline),
+    // with `current` = the last 30 days and `previous` = the 30 before it. Every
+    // auditor who appears in either view gets a row, so a card never has to fall
+    // back on the monthly numbers for part of its content.
+    const WINDOWS = 6;
+    const windowsByAuditor = {};
+    auditorWindows.rows.forEach(r => {
+      const b = Number(r.bucket);
+      if (b < 0 || b >= WINDOWS) return;
+      if (!windowsByAuditor[r.auditor]) windowsByAuditor[r.auditor] = new Array(WINDOWS).fill(0);
+      windowsByAuditor[r.auditor][b] = parseInt(r.count);
+      auditorNames.add(r.auditor);
+      if (r.photo) auditorPhotos[r.auditor] = r.photo;
+    });
+    // Computed after the rolling pivot so an auditor who worked in the last six
+    // windows but not in the monthly series still gets a card.
     const auditors = [...auditorNames].sort();
+    const auditorRolling = auditors.map(name => {
+      const w = windowsByAuditor[name] || new Array(WINDOWS).fill(0);
+      return { auditor: name, current: w[0], previous: w[1], series: [...w].reverse() };
+    });
 
     // Pivot (auditor, project, count) rows into one row per auditor with each
     // project as its own key, e.g. { auditor: 'Jane Doe', 'Project A': 5 }.
@@ -7031,6 +7073,10 @@ app.get('/api/graphs', auth, async (req, res) => {
         project_open_count: parseInt(r.project_open_count),
       })),
       audits_by_auditor_month: auditsByAuditorMonth,
+      auditor_rolling: auditorRolling,
+      // So the monthly chart can mark its last point as a part-month rather than
+      // letting every line droop at the right edge for no reason.
+      current_month_days: new Date().getDate(),
       auditors,
       auditor_photos: auditorPhotos,
       audits_by_auditor_project: auditsByAuditorProjectOut,

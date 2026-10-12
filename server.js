@@ -4351,6 +4351,28 @@ app.get('/api/training-records/tracker', auth, async (req, res) => {
                     ELSE 'valid' END
                   WHEN t.status='completed' THEN 'valid'
              END AS expiry_state,
+             -- Has this person held this certificate before? A refresher is
+             -- priced differently from a first-time course, and the Tracker
+             -- export is where that decision gets made. Any earlier COMPLETED
+             -- record for the same person and course counts, including the
+             -- superseded ones -- those are exactly the previous sittings.
+             EXISTS (
+               SELECT 1 FROM training_records pr
+                WHERE pr.employee_id = t.employee_id
+                  AND pr.course_id = t.course_id
+                  AND pr.id <> t.id
+                  AND pr.status = 'completed'
+                  AND pr.is_deleted IS NOT TRUE
+                  AND (pr.completed_at IS NULL OR t.completed_at IS NULL OR pr.completed_at < t.completed_at)
+             ) AS trained_before,
+             (SELECT MAX(pr.completed_at) FROM training_records pr
+               WHERE pr.employee_id = t.employee_id
+                 AND pr.course_id = t.course_id
+                 AND pr.id <> t.id
+                 AND pr.status = 'completed'
+                 AND pr.is_deleted IS NOT TRUE
+                 AND (pr.completed_at IS NULL OR t.completed_at IS NULL OR pr.completed_at < t.completed_at)
+             ) AS last_trained_at,
              COUNT(*) OVER() AS full_count
       FROM training_records t
       JOIN training_courses c ON c.id = t.course_id

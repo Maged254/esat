@@ -1308,7 +1308,12 @@ app.get('/api/employees', auth, async (req, res) => {
     let q = `SELECT e.*, MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as last_audit_date, CURRENT_DATE - MAX(a.audit_date) FILTER (WHERE a.employee_present = TRUE AND a.is_deleted IS NOT TRUE) as days_since_audit, COUNT(epa.id) > 0 as ppe_assigned, u.full_name as ppe_last_edited_by_name, ued.full_name as last_edited_by_name, COALESCE(uc.full_name, e.created_by_name_text) as created_by_name, COALESCE(ex.changed_by_name, e.exited_by_name_text) as exited_by_name, ex.changed_at as exited_at, CASE WHEN LOWER(TRIM(e.organization))='egypro' AND COALESCE(e.job_title,'') NOT ILIKE '%intern%' THEN 'Inhouse' WHEN LOWER(TRIM(e.organization))='egypro' AND e.job_title ILIKE '%intern%' THEN 'Intern' WHEN oe.type='services' THEN 'Outsource (Services)' WHEN oe.type='vehicle_supplier' THEN 'Outsource (Vehicle Supplier)' ELSE 'Outsource' END as classification, COUNT(*) OVER() as full_count FROM employees e LEFT JOIN audits a ON a.employee_id=e.id LEFT JOIN employee_ppe_assignments epa ON epa.employee_id=e.id LEFT JOIN users u ON u.id=e.ppe_last_edited_by LEFT JOIN users ued ON ued.id=e.last_edited_by LEFT JOIN users uc ON uc.id=e.created_by LEFT JOIN outsource_entities oe ON LOWER(TRIM(oe.name))=LOWER(TRIM(e.organization)) LEFT JOIN LATERAL (SELECT changed_by_name, changed_at FROM employee_change_log WHERE employee_id=e.id AND action='exit' ORDER BY changed_at DESC LIMIT 1) ex ON true WHERE 1=1`;
     const params = [];
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
-    if (search) { params.push(`%${search}%`); q += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length})`; }
+    // One search box, three identifiers: people look someone up by name, by
+    // national ID (what is on the card in their hand) or by employment ID.
+    // National ID was missing, so typing one found nothing while the phone
+    // screens invited exactly that. The dedicated national_id/employee_number
+    // params are unchanged -- this only widens the free-text box.
+    if (search) { params.push(`%${search}%`); q += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length} OR e.national_id ILIKE $${params.length})`; }
     if (national_id) { params.push(`%${national_id}%`); q += ` AND e.national_id ILIKE $${params.length}`; }
     if (employee_number) { params.push(`%${employee_number}%`); q += ` AND e.employee_number ILIKE $${params.length}`; }
     if (project) { params.push(project); q += ` AND e.project=$${params.length}`; }
@@ -1376,7 +1381,12 @@ app.get('/api/employees/stats', auth, async (req, res) => {
         WHERE 1=1`;
     const params = [];
     if (status) { params.push(status); q += ` AND e.employment_status=$${params.length}`; }
-    if (search) { params.push(`%${search}%`); q += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length})`; }
+    // One search box, three identifiers: people look someone up by name, by
+    // national ID (what is on the card in their hand) or by employment ID.
+    // National ID was missing, so typing one found nothing while the phone
+    // screens invited exactly that. The dedicated national_id/employee_number
+    // params are unchanged -- this only widens the free-text box.
+    if (search) { params.push(`%${search}%`); q += ` AND (e.full_name ILIKE $${params.length} OR e.employee_number ILIKE $${params.length} OR e.national_id ILIKE $${params.length})`; }
     if (national_id) { params.push(`%${national_id}%`); q += ` AND e.national_id ILIKE $${params.length}`; }
     if (employee_number) { params.push(`%${employee_number}%`); q += ` AND e.employee_number ILIKE $${params.length}`; }
     if (project) { params.push(project); q += ` AND e.project=$${params.length}`; }

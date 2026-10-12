@@ -1636,6 +1636,17 @@ app.get('/api/audit-coverage/export', auth, async (req, res) => {
     if (clientFilter !== null) { params.push(clientFilter); whereExtra += ` AND e.client = ANY($${params.length})`; }
     if (requestedProjects.length) { params.push(requestedProjects); whereExtra += ` AND e.project = ANY($${params.length})`; }
     if (requestedClients.length) { params.push(requestedClients); whereExtra += ` AND e.client = ANY($${params.length})`; }
+    // Last-audit age, worded and cut exactly as the Employees page cuts it, so
+    // "More than 2 Months" means the same thing on both screens -- never audited
+    // included, since someone never seen is the most overdue of all. It narrows
+    // the sheet only: the page keeps reporting coverage for everyone, because an
+    // audit rate computed over just the overdue would always read 0%.
+    const AGE_SQL = {
+      '1month': 'la.last_audit_date IS NOT NULL AND CURRENT_DATE - la.last_audit_date <= 30',
+      '2months': 'la.last_audit_date IS NOT NULL AND CURRENT_DATE - la.last_audit_date > 30 AND CURRENT_DATE - la.last_audit_date <= 60',
+      'over2months': 'la.last_audit_date IS NULL OR CURRENT_DATE - la.last_audit_date > 60',
+    };
+    const ageClause = AGE_SQL[req.query.audit_age] ? ` AND (${AGE_SQL[req.query.audit_age]})` : '';
 
     // Never audited first, then longest-waiting: read top-down, that is the
     // order to book them in. NULLS FIRST on a DESC sort does exactly that.
@@ -1650,8 +1661,12 @@ app.get('/api/audit-coverage/export', auth, async (req, res) => {
              CASE WHEN la.last_audit_date IS NULL THEN NULL ELSE CURRENT_DATE - la.last_audit_date END AS days_since
         FROM employees e
         LEFT JOIN last_audit la ON la.employee_id = e.id
-       WHERE e.employment_status = 'active' AND e.san = TRUE ${whereExtra}
+       WHERE e.employment_status = 'active' AND e.san = TRUE ${whereExtra}${ageClause}
        ORDER BY days_since DESC NULLS FIRST, e.full_name`, params);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Nobody matches that filter — nothing to export.' });
+    }
 
     const bucketOf = (d) => d == null ? 'Never audited'
       : d <= 30 ? '0–30 days' : d <= 60 ? '31–60 days' : d <= 90 ? '61–90 days' : '90+ days';

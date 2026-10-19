@@ -1180,7 +1180,14 @@ app.use('/api/mobile-lines', mobileLines.router);
 
 // ── Route Patrol (OneHub Operations) ─────────────────────────
 // Routes and cycles for now; patrols, pins and tickets join in later stages.
-const patrol = require('./modules/patrol')({ express, pool, auth, sendError });
+// The mail helpers are defined further down; passed as thunks, evaluated when a
+// mail is actually sent (same arrangement as Mobile Lines).
+const patrol = require('./modules/patrol')({
+  express, pool, auth, sendError,
+  sendMail: (opts) => resend.emails.send({ from: 'OneHub <esat@egypro.app>', ...opts }),
+  mailWrap: (html) => mailWrap(html),
+  mailSignoff: () => MAIL_SIGNOFF,
+});
 app.use('/api/patrol', patrol.router);
 app.use('/api/mobile-line-requests', mobileLines.lineRequests);
 // The product-change workflow (change requests, operator email batches,

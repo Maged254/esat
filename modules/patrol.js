@@ -38,6 +38,14 @@ const TICKET_COMMENT_ROLES = ['admin', 'field_supervisor', 'pm_coordinator'];
 const TICKET_CLOSE_ROLES = ['admin', 'pm_coordinator'];
 const TICKET_REOPEN_ROLES = ['admin', 'field_supervisor', 'pm_coordinator'];
 const COMMENT_MAX = 1000;
+// Who is told about pins and tickets (agreed: supervisors, PM Coordinators
+// and the Director all get the same notifications), plus admins.
+const NOTIFY_ROLES = ['field_supervisor', 'pm_coordinator', 'director'];
+// While OneHub is being tested every email goes to the admin only, as all of
+// OneHub's other emails do; each one lists who it would have gone to. Set this
+// to null to send to the real recipients.
+const EMAIL_TEST_TO = 'e.maged@outlook.com';
+const APP_URL = 'https://onehub.egypro.app';
 
 // ── KML reading ───────────────────────────────────────────────
 // KML is plain, regular XML. A small tokenizer is enough and avoids pulling in
@@ -191,7 +199,7 @@ const todayEAT = () => new Date(Date.now() + 3 * 3600 * 1000).toISOString().slic
 
 const cleanArea = (s) => String(s || '').replace(/[\\/\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
 
-module.exports = function patrolModule({ express, pool, auth, sendError }) {
+module.exports = function patrolModule({ express, pool, auth, sendError, sendMail, mailWrap, mailSignoff }) {
   const router = express.Router();
 
   // Its own bucket and key, scoped to that bucket only -- a leak here cannot
@@ -384,6 +392,29 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
         detail JSONB,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
+
+    // In-app notifications (the bell in OneHub Operations).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS patrol_notifications (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        pin_id UUID REFERENCES patrol_pins(id) ON DELETE CASCADE,
+        kind VARCHAR(30) NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        read_at TIMESTAMPTZ
+      )`);
+    await client.query('CREATE INDEX IF NOT EXISTS idx_patrol_notif_user ON patrol_notifications(user_id, created_at DESC)');
+    // When each daily email last went out, so the next one covers exactly the
+    // time since (and a missed day while OneHub was down is not lost).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS patrol_jobs (
+        name VARCHAR(40) PRIMARY KEY,
+        last_run_at TIMESTAMPTZ NOT NULL
+      )`);
+    // When a Normal pin went out in the daily summary email.
+    await client.query('ALTER TABLE patrol_pins ADD COLUMN IF NOT EXISTS summary_sent_at TIMESTAMPTZ');
 
     // Before the list existed the area was typed in, suggested from the file
     // name as NW / RIFT. Bring any such upload onto the listed names.
@@ -906,6 +937,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
             "INSERT INTO patrol_pin_events (pin_id, user_id, action, detail) VALUES ($1,$2,'created',$3)",
             [pin.id, req.user.id, JSON.stringify({ status, observation: type.label, off_route: offRoute })]);
           await client.query('COMMIT');
+          notifyPinCreated(pin.id); // not awaited: the officer is not kept waiting on email
           res.status(201).json({
             id: pin.id, created_at: pin.created_at, off_route: offRoute,
             distance_to_route_m: nearest ? Math.round(nearest.d) : null, nearest_route_name: nearest?.name || null,
@@ -1054,6 +1086,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
         { decision, ...(changed ? { from: pin.review_status } : {}), ...(comment ? { comment } : {}) });
       if (decision === 'action_needed') await event(client, pin.id, req.user.id, 'ticket_opened', {});
       await client.query('COMMIT');
+      if (decision === 'action_needed') notifyTicket(pin.id, 'ticket_opened', req.user.id, comment);
       res.json(await pinDetail(pin.id, req.user));
     } catch (e) { await client.query('ROLLBACK').catch(() => {}); sendError(res, e); }
     finally { client.release(); }
@@ -1086,7 +1119,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
     } catch (e) { sendError(res, e); }
   });
 
-  const ticketStep = (roles, needState, apply) => [auth, allow(roles), async (req, res) => {
+  const ticketStep = (roles, needState, apply, notifyKind) => [auth, allow(roles), async (req, res) => {
     const comment = commentOf(req);
     if (!comment) return res.status(400).json({ error: 'Write a comment.' });
     const client = await pool.connect();
@@ -1100,6 +1133,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
       }
       await apply(client, pin.id, req.user.id, comment);
       await client.query('COMMIT');
+      if (notifyKind) notifyTicket(pin.id, notifyKind, req.user.id, comment);
       res.json(await pinDetail(pin.id, req.user));
     } catch (e) { await client.query('ROLLBACK').catch(() => {}); sendError(res, e); }
     finally { client.release(); }
@@ -1111,12 +1145,214 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
   router.post('/pins/:id/ticket/close', ...ticketStep(TICKET_CLOSE_ROLES, 'open', async (db, id, uid, comment) => {
     await db.query("UPDATE patrol_pins SET ticket_status='closed', ticket_closed_at=NOW(), ticket_closed_by=$1 WHERE id=$2", [uid, id]);
     await event(db, id, uid, 'ticket_closed', { comment });
-  }));
+  }, 'ticket_closed'));
 
   router.post('/pins/:id/ticket/reopen', ...ticketStep(TICKET_REOPEN_ROLES, 'closed', async (db, id, uid, comment) => {
     await db.query("UPDATE patrol_pins SET ticket_status='open', ticket_closed_at=NULL, ticket_closed_by=NULL WHERE id=$1", [id]);
     await event(db, id, uid, 'ticket_reopened', { comment });
-  }));
+  }, 'ticket_reopened'));
+
+  // ── Notifications ─────────────────────────────────────────
+  const STATUS_WORD = { critical: 'Critical', medium: 'Medium', normal: 'Normal' };
+  const STATUS_HEX = { critical: '#E24B4A', medium: '#EF9F27', normal: '#1D9E75' };
+  const escapeHtml = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const eatTime = (d) => new Date(d).toLocaleString('en-GB', { timeZone: 'Africa/Nairobi', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false });
+  const pinLink = (pinId, page = 'review') => `${APP_URL}/ops/${page}?pin=${pinId}`;
+
+  const recipients = async () => {
+    const { rows } = await pool.query(`
+      SELECT id, full_name, email FROM users
+      WHERE is_active AND (patrol_role = ANY($1) OR role = 'admin')
+      ORDER BY full_name`, [NOTIFY_ROLES]);
+    return rows;
+  };
+
+  const email = async (people, subject, inner) => {
+    if (!sendMail || !people.length) return;
+    const to = EMAIL_TEST_TO ? [EMAIL_TEST_TO] : people.map(p => p.email).filter(Boolean);
+    const testNote = EMAIL_TEST_TO
+      ? `<p style="margin-top:18px;font-size:9pt;color:#888;">Testing: this email would go to ${people.map(p => escapeHtml(p.full_name)).join(', ')}.</p>`
+      : '';
+    await sendMail({ to, subject, html: mailWrap(`${inner}${mailSignoff ? mailSignoff() : ''}${testNote}`) });
+  };
+
+  const notifyInApp = async (people, pinId, kind, title, body) => {
+    for (const p of people) {
+      await pool.query('INSERT INTO patrol_notifications (user_id, pin_id, kind, title, body) VALUES ($1,$2,$3,$4,$5)', [p.id, pinId, kind, title, body || null]);
+    }
+  };
+
+  const pinFacts = (p) => `
+    <table style="border-collapse:collapse;font-size:10.5pt;">
+      <tr><td style="padding:2px 12px 2px 0;color:#666;">Point</td><td><b>${escapeHtml(p.name)}</b></td></tr>
+      <tr><td style="padding:2px 12px 2px 0;color:#666;">Status</td><td style="color:${STATUS_HEX[p.status]};font-weight:700;">${STATUS_WORD[p.status]}</td></tr>
+      <tr><td style="padding:2px 12px 2px 0;color:#666;">Observation</td><td>${escapeHtml(p.observation_label)}</td></tr>
+      ${p.location_note ? `<tr><td style="padding:2px 12px 2px 0;color:#666;">Location</td><td>${escapeHtml(p.location_note)}</td></tr>` : ''}
+      <tr><td style="padding:2px 12px 2px 0;color:#666;">Nearest link</td><td>${escapeHtml(p.nearest_route_name || '—')}${p.off_route ? ' <span style="color:#6D28D9;font-weight:700;">(off route)</span>' : ''}</td></tr>
+      <tr><td style="padding:2px 12px 2px 0;color:#666;">Officer</td><td>${escapeHtml(p.officer_name)}, ${eatTime(p.created_at)}</td></tr>
+    </table>`;
+
+  const loadPinForMail = async (pinId) => {
+    const { rows: [p] } = await pool.query(`
+      SELECT pp.*, u.full_name AS officer_name FROM patrol_pins pp JOIN users u ON u.id = pp.officer_id WHERE pp.id=$1`, [pinId]);
+    return p;
+  };
+
+  // A Critical or Medium pin: straight away, by email and in the app.
+  const notifyPinCreated = async (pinId) => {
+    try {
+      const p = await loadPinForMail(pinId);
+      if (!p || p.status === 'normal') return; // Normal pins go in the hourly summary
+      const people = await recipients();
+      const title = `${STATUS_WORD[p.status]} pin: ${p.name}`;
+      await notifyInApp(people, p.id, 'pin_' + p.status, title, `${p.observation_label} · ${p.officer_name}`);
+      await email(people, `OneHub Route Patrol: ${title}`, `
+        <p>Hello,</p>
+        <p>A <b style="color:${STATUS_HEX[p.status]}">${STATUS_WORD[p.status]}</b> pin was just added on patrol and is waiting for review.</p>
+        ${pinFacts(p)}
+        <p><a href="${pinLink(p.id)}">Open the pin in OneHub</a></p>`);
+    } catch (e) { console.error('Patrol pin notification failed:', e.message); }
+  };
+
+  const TICKET_WORD = { ticket_opened: 'Ticket opened', ticket_closed: 'Ticket closed', ticket_reopened: 'Ticket reopened' };
+  const notifyTicket = async (pinId, kind, byUserId, comment) => {
+    try {
+      const p = await loadPinForMail(pinId);
+      if (!p) return;
+      const { rows: [by] } = await pool.query('SELECT full_name FROM users WHERE id=$1', [byUserId]);
+      const people = await recipients();
+      const title = `${TICKET_WORD[kind]}: ${p.name}`;
+      // The bell straight away; the email waits for the 4:15 pm ticket digest.
+      await notifyInApp(people, p.id, kind, title, `${by?.full_name || ''}${comment ? ' · ' + comment.slice(0, 140) : ''}`);
+    } catch (e) { console.error('Patrol ticket notification failed:', e.message); }
+  };
+
+  // Runs a daily job once per day at hh:mm East Africa time. The window it
+  // covers starts where the last run ended, kept in patrol_jobs.
+  const EAT_OFFSET_MS = 3 * 3600 * 1000;
+  const scheduleDailyEAT = (hh, mm, name, fn) => {
+    const next = () => {
+      const now = Date.now();
+      const eatNow = new Date(now + EAT_OFFSET_MS);
+      const target = Date.UTC(eatNow.getUTCFullYear(), eatNow.getUTCMonth(), eatNow.getUTCDate(), hh, mm) - EAT_OFFSET_MS;
+      return target > now ? target - now : target + 24 * 3600 * 1000 - now;
+    };
+    const run = async () => {
+      try {
+        const { rows: [job] } = await pool.query('SELECT last_run_at FROM patrol_jobs WHERE name=$1', [name]);
+        const since = job ? job.last_run_at : new Date(Date.now() - 24 * 3600 * 1000);
+        const until = new Date();
+        await fn(since, until);
+        await pool.query(`INSERT INTO patrol_jobs (name, last_run_at) VALUES ($1,$2)
+          ON CONFLICT (name) DO UPDATE SET last_run_at = EXCLUDED.last_run_at`, [name, until]);
+      } catch (e) { console.error(`Patrol ${name} failed:`, e.message); }
+      setTimeout(run, next());
+    };
+    setTimeout(run, next());
+  };
+
+  // 4:15 pm: every ticket opened, closed or reopened since the last digest.
+  const sendTicketDigest = async (since, until) => {
+    const { rows } = await pool.query(`
+      SELECT e.action, e.detail, e.created_at, u.full_name AS by_name,
+             pp.id AS pin_id, pp.name, pp.status, pp.observation_label, pp.nearest_route_name, pp.ticket_status
+      FROM patrol_pin_events e
+      JOIN patrol_pins pp ON pp.id = e.pin_id
+      LEFT JOIN users u ON u.id = e.user_id
+      WHERE e.action IN ('ticket_opened','ticket_closed','ticket_reopened')
+        AND e.created_at > $1 AND e.created_at <= $2
+      ORDER BY e.created_at`, [since, until]);
+    if (!rows.length) return;
+    // The comment for "opened" is on the review event just before it.
+    const { rows: reviews } = await pool.query(`
+      SELECT pin_id, detail->>'comment' AS comment, created_at FROM patrol_pin_events
+      WHERE action IN ('reviewed','decision_changed') AND detail->>'decision' = 'action_needed' AND created_at > $1 AND created_at <= $2`, [since, until]);
+    const reviewComment = (r) => reviews.find(x => x.pin_id === r.pin_id && Math.abs(new Date(x.created_at) - new Date(r.created_at)) < 5000)?.comment;
+    const { rows: [{ open }] } = await pool.query("SELECT COUNT(*)::int AS open FROM patrol_pins WHERE ticket_status='open'");
+    const people = await recipients();
+    const counts = { ticket_opened: 0, ticket_closed: 0, ticket_reopened: 0 };
+    rows.forEach(r => { counts[r.action]++; });
+    const list = rows.map(r => {
+      const comment = r.action === 'ticket_opened' ? reviewComment(r) : r.detail?.comment;
+      return `
+        <tr>
+          <td style="padding:6px 10px 6px 0;white-space:nowrap;vertical-align:top;">${eatTime(r.created_at)}</td>
+          <td style="padding:6px 10px 6px 0;vertical-align:top;font-weight:700;">${TICKET_WORD[r.action]}</td>
+          <td style="padding:6px 0;vertical-align:top;">
+            <a href="${pinLink(r.pin_id, 'tickets')}">${escapeHtml(r.name)}</a>
+            <span style="color:${STATUS_HEX[r.status]};font-weight:700;">(${STATUS_WORD[r.status]})</span>
+            · ${escapeHtml(r.observation_label)} · ${escapeHtml(r.nearest_route_name || '—')}<br/>
+            <span style="color:#666;">by ${escapeHtml(r.by_name || '—')}</span>
+            ${comment ? `<div style="margin-top:4px;padding:6px 10px;background:#f5f6f8;border-radius:6px;">${escapeHtml(comment)}</div>` : ''}
+          </td>
+        </tr>`;
+    }).join('');
+    const parts = [counts.ticket_opened && `${counts.ticket_opened} opened`, counts.ticket_closed && `${counts.ticket_closed} closed`, counts.ticket_reopened && `${counts.ticket_reopened} reopened`].filter(Boolean).join(', ');
+    await email(people, `OneHub Route Patrol: tickets today (${parts})`, `
+      <p>Hello,</p>
+      <p>Ticket changes since the last summary: <b>${parts}</b>. <b>${open}</b> ticket${open === 1 ? ' is' : 's are'} open now.</p>
+      <table style="border-collapse:collapse;font-size:10pt;">${list}</table>
+      <p><a href="${APP_URL}/ops/tickets">Open Tickets in OneHub</a></p>`);
+  };
+
+  // 4 pm: one email listing the Normal pins added since the last summary.
+  const sendNormalSummary = async () => {
+    try {
+      const { rows } = await pool.query(`
+        UPDATE patrol_pins pp SET summary_sent_at = NOW()
+        WHERE status = 'normal' AND summary_sent_at IS NULL AND created_at < NOW()
+        RETURNING id`);
+      if (!rows.length) return;
+      const { rows: pins } = await pool.query(`
+        SELECT pp.*, u.full_name AS officer_name FROM patrol_pins pp JOIN users u ON u.id = pp.officer_id
+        WHERE pp.id = ANY($1) ORDER BY u.full_name, pp.created_at`, [rows.map(r => r.id)]);
+      const people = await recipients();
+      const list = pins.map(p => `
+        <tr>
+          <td style="padding:4px 10px 4px 0;white-space:nowrap;">${eatTime(p.created_at).slice(-5)}</td>
+          <td style="padding:4px 10px 4px 0;">${escapeHtml(p.officer_name)}</td>
+          <td style="padding:4px 10px 4px 0;"><a href="${pinLink(p.id)}">${escapeHtml(p.name)}</a></td>
+          <td style="padding:4px 10px 4px 0;">${escapeHtml(p.observation_label)}</td>
+          <td style="padding:4px 0;">${escapeHtml(p.nearest_route_name || '—')}${p.off_route ? ' <span style="color:#6D28D9;">(off route)</span>' : ''}</td>
+        </tr>`).join('');
+      await email(people, `OneHub Route Patrol: ${pins.length} Normal pin${pins.length === 1 ? '' : 's'} today`, `
+        <p>Hello,</p>
+        <p>${pins.length} <b style="color:${STATUS_HEX.normal}">Normal</b> pin${pins.length === 1 ? ' was' : 's were'} added since the last summary. They are in the Review Queue; "Confirm all Normal" clears a patrol's Normal pins in one step.</p>
+        <table style="border-collapse:collapse;font-size:10pt;">
+          <tr style="color:#666;text-align:left;"><th style="padding:4px 10px 4px 0;">Time</th><th style="padding:4px 10px 4px 0;">Officer</th><th style="padding:4px 10px 4px 0;">Point</th><th style="padding:4px 10px 4px 0;">Observation</th><th style="padding:4px 0;">Nearest link</th></tr>
+          ${list}
+        </table>
+        <p><a href="${APP_URL}/ops/review">Open the Review Queue</a></p>`);
+      if (people.length) await notifyInApp(people, null, 'normal_summary', `${pins.length} Normal pin${pins.length === 1 ? '' : 's'} today`, 'In the Review Queue');
+    } catch (e) { console.error('Patrol Normal summary failed:', e.message); }
+  };
+  // Agreed times (East Africa): Normal pins at 4:00 pm, tickets at 4:15 pm.
+  scheduleDailyEAT(16, 0, 'normal_summary', () => sendNormalSummary());
+  scheduleDailyEAT(16, 15, 'ticket_digest', sendTicketDigest);
+
+  // The bell: the signed-in person's latest notifications.
+  router.get('/notifications', auth, async (req, res) => {
+    try {
+      const { rows } = await pool.query(`
+        SELECT id, pin_id, kind, title, body, created_at, read_at FROM patrol_notifications
+        WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50`, [req.user.id]);
+      const { rows: [{ unread }] } = await pool.query(
+        'SELECT COUNT(*)::int AS unread FROM patrol_notifications WHERE user_id=$1 AND read_at IS NULL', [req.user.id]);
+      res.json({ unread, items: rows });
+    } catch (e) { sendError(res, e); }
+  });
+
+  router.post('/notifications/read', auth, async (req, res) => {
+    try {
+      const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(x => typeof x === 'string') : null;
+      if (ids && ids.length) {
+        await pool.query('UPDATE patrol_notifications SET read_at=NOW() WHERE user_id=$1 AND id = ANY($2::uuid[]) AND read_at IS NULL', [req.user.id, ids]);
+      } else {
+        await pool.query('UPDATE patrol_notifications SET read_at=NOW() WHERE user_id=$1 AND read_at IS NULL', [req.user.id]);
+      }
+      res.json({ ok: true });
+    } catch (e) { sendError(res, e); }
+  });
 
   // ── Ending forgotten patrols ──────────────────────────────
   // A patrol ended automatically is given its last activity as the end time

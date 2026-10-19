@@ -936,6 +936,8 @@ async function setupDB() {
     await mobileLines.setup(client);
     // Route Patrol (OneHub Operations) -- same arrangement, modules/patrol.js.
     await patrol.setup(client);
+    // This boot signs everyone out, so a patrol still running ends now.
+    await patrol.endPatrolsOnRestart();
 
     console.log("Database setup complete");
   } catch(e) {

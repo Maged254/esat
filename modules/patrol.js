@@ -23,7 +23,11 @@ const PIN_MAX_FROM_OFFICER_M = 100;  // a pin may sit at most this far from the 
 const PIN_OFF_ROUTE_M = 100;         // further than this from every route line = Off route (warning only)
 const PHOTOS_MIN = 1, PHOTOS_MAX = 3;
 const PHOTO_MAX_BYTES = 4 * 1024 * 1024;
-const PHOTO_RETENTION_DAYS = 60;     // ~2 months; photos on a pin with an open ticket are kept
+const PHOTO_RETENTION_DAYS = 60;
+// A patrol left running ends by itself after this long with no new pin, and
+// always at midnight (East Africa time). It also ends whenever the officer is
+// signed out, by themselves, by the idle timer, or by a OneHub restart.
+const PATROL_IDLE_END_HOURS = 2;     // ~2 months; photos on a pin with an open ticket are kept
 const PIN_STATUSES = ['critical', 'medium', 'normal'];
 // Review and tickets. Any supervisor can review any pin (no officer→supervisor
 // link for now); PM Coordinators work and close tickets; the Director watches.
@@ -308,6 +312,8 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
       )`);
     // One running patrol per officer at a time.
     await client.query('CREATE UNIQUE INDEX IF NOT EXISTS uniq_patrols_running ON patrols (officer_id) WHERE ended_at IS NULL');
+    // How a patrol ended: officer (End patrol) | signed_out | inactive | midnight | restart
+    await client.query('ALTER TABLE patrols ADD COLUMN IF NOT EXISTS end_reason VARCHAR(20)');
     await client.query(`
       CREATE TABLE IF NOT EXISTS patrol_pins (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -770,9 +776,19 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
   router.post('/patrols/:id/end', auth, allow(PATROL_ROLES), async (req, res) => {
     try {
       const { rows } = await pool.query(
-        'UPDATE patrols SET ended_at=NOW() WHERE id=$1 AND officer_id=$2 AND ended_at IS NULL RETURNING id', [req.params.id, req.user.id]);
+        "UPDATE patrols SET ended_at=NOW(), end_reason='officer' WHERE id=$1 AND officer_id=$2 AND ended_at IS NULL RETURNING id", [req.params.id, req.user.id]);
       if (!rows[0]) return res.status(404).json({ error: 'This patrol is not running.' });
       res.json({ ok: true });
+    } catch (e) { sendError(res, e); }
+  });
+
+  // Called by the app as it signs someone out (themselves or the idle timer).
+  // Open to every signed-in user: someone without a patrol simply has none to end.
+  router.post('/patrols/end-mine', auth, async (req, res) => {
+    try {
+      const { rowCount } = await pool.query(
+        "UPDATE patrols SET ended_at=NOW(), end_reason='signed_out' WHERE officer_id=$1 AND ended_at IS NULL", [req.user.id]);
+      res.json({ ended: rowCount });
     } catch (e) { sendError(res, e); }
   });
 
@@ -934,7 +950,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
   router.get('/review/patrols', auth, allow(REVIEW_ROLES), async (req, res) => {
     try {
       const { rows } = await pool.query(`
-        SELECT p.id, p.started_at, p.ended_at, u.full_name AS officer_name,
+        SELECT p.id, p.started_at, p.ended_at, p.end_reason, u.full_name AS officer_name,
                COUNT(*) FILTER (WHERE pp.status = 'critical')::int AS critical,
                COUNT(*) FILTER (WHERE pp.status = 'medium')::int AS medium,
                COUNT(*) FILTER (WHERE pp.status = 'normal')::int AS normal
@@ -1084,6 +1100,32 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
     await event(db, id, uid, 'ticket_reopened', { comment });
   }));
 
+  // ── Ending forgotten patrols ──────────────────────────────
+  // A patrol ended automatically is given its last activity as the end time
+  // (its last pin, or its start), not the moment the sweep noticed, so its
+  // length is not inflated by the hours it sat forgotten.
+  const LAST_ACTIVITY_SQL = `GREATEST(p.started_at, COALESCE((SELECT MAX(pp.created_at) FROM patrol_pins pp WHERE pp.patrol_id = p.id), p.started_at))`;
+  const endRunningPatrols = async (reason, extraWhere = 'TRUE') => {
+    const { rowCount } = await pool.query(`
+      UPDATE patrols p SET ended_at = ${LAST_ACTIVITY_SQL}, end_reason = $1
+      WHERE p.ended_at IS NULL AND (${extraWhere})`, [reason]);
+    if (rowCount) console.log(`Patrols ended automatically (${reason}): ${rowCount}`);
+  };
+  const sweepPatrols = async () => {
+    try {
+      // Started on an earlier day (East Africa time) → ended at midnight.
+      await endRunningPatrols('midnight',
+        "(p.started_at AT TIME ZONE 'Africa/Nairobi')::date < (NOW() AT TIME ZONE 'Africa/Nairobi')::date");
+      await endRunningPatrols('inactive',
+        `${LAST_ACTIVITY_SQL} < NOW() - INTERVAL '${PATROL_IDLE_END_HOURS} hours'`);
+    } catch (e) { console.error('Patrol sweep failed:', e.message); }
+  };
+  setInterval(sweepPatrols, 10 * 60 * 1000);
+
+  // A OneHub restart signs everyone out (tokens from before it are refused),
+  // so any patrol still running at that moment ends with it.
+  const endPatrolsOnRestart = () => endRunningPatrols('restart').catch(e => console.error('Patrol restart end failed:', e.message));
+
   // ── Photo retention ───────────────────────────────────────
   // Daily: photos older than PHOTO_RETENTION_DAYS are deleted from storage and
   // marked removed. The pin and its details stay. Photos on a pin whose ticket
@@ -1111,5 +1153,5 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
   const msToNext = () => { const n = new Date(); const t = new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate() + 1)); return t - n; };
   setTimeout(() => { sweepOldPhotos(); setInterval(sweepOldPhotos, 24 * 3600 * 1000); }, msToNext());
 
-  return { router, setup, _internals: { readKmz, kmlToFeatures, distanceToLineM } };
+  return { router, setup, endPatrolsOnRestart, _internals: { readKmz, kmlToFeatures, distanceToLineM } };
 };

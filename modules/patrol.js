@@ -212,6 +212,28 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
         sort_order INTEGER
       )`);
     await client.query('CREATE INDEX IF NOT EXISTS idx_patrol_routes_cycle ON patrol_routes(cycle_id)');
+    // The areas a KMZ can be uploaded for, kept by the admin (Admin Panel).
+    // Routes refer to an area by its name; renaming an area renames it on every
+    // upload too, in one transaction (see PUT /areas/:id).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS patrol_areas (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name VARCHAR(80) NOT NULL,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )`);
+    await client.query('CREATE UNIQUE INDEX IF NOT EXISTS uniq_patrol_areas_name ON patrol_areas (LOWER(name))');
+    const { rows: [{ n }] } = await client.query('SELECT COUNT(*)::int AS n FROM patrol_areas');
+    if (n === 0) {
+      await client.query(`INSERT INTO patrol_areas (name, sort_order) VALUES ('Nairobi West', 1), ('Rift', 2)`);
+    }
+    // Before the list existed the area was typed in, suggested from the file
+    // name as NW / RIFT. Bring any such upload onto the listed names.
+    for (const [from, to] of [['NW', 'Nairobi West'], ['RIFT', 'Rift']]) {
+      await client.query('UPDATE patrol_route_files SET area=$2 WHERE area=$1', [from, to]);
+      await client.query('UPDATE patrol_routes SET area=$2 WHERE area=$1', [from, to]);
+    }
     // Cycles have no fixed length (about 3 months, sometimes more or less): one
     // runs until the next is started, so only a superseded cycle has an end
     // date. The first deploy stored a 3-month end on every cycle; undo that for
@@ -310,13 +332,85 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
     return { cycle: c };
   };
 
-  // ── Areas (one KMZ each) ──────────────────────────────────
+  // ── Area list (admin-kept) ────────────────────────────────
+  const ADMIN = ['admin'];
+  router.get('/areas', auth, allow(ROUTE_VIEW_ROLES), async (req, res) => {
+    try {
+      const all = req.query.all === '1' && patrolRoleOf(req.user) === 'admin';
+      const { rows } = await pool.query(`
+        SELECT a.id, a.name, a.is_active, a.sort_order,
+               (SELECT COUNT(*)::int FROM patrol_route_files f WHERE f.area = a.name) AS uploads
+        FROM patrol_areas a ${all ? '' : 'WHERE a.is_active'}
+        ORDER BY a.sort_order, a.name`);
+      res.json(rows);
+    } catch (e) { sendError(res, e); }
+  });
+
+  router.post('/areas', auth, allow(ADMIN), async (req, res) => {
+    const name = cleanArea(req.body?.name);
+    if (!name) return res.status(400).json({ error: 'Enter the area name.' });
+    try {
+      const { rows } = await pool.query(
+        `INSERT INTO patrol_areas (name, sort_order)
+         VALUES ($1, (SELECT COALESCE(MAX(sort_order),0)+1 FROM patrol_areas))
+         RETURNING id, name, is_active, sort_order, 0 AS uploads`, [name]);
+      res.status(201).json(rows[0]);
+    } catch (e) {
+      if (e.code === '23505') return res.status(409).json({ error: 'That area is already in the list.' });
+      sendError(res, e);
+    }
+  });
+
+  router.put('/areas/:id', auth, allow(ADMIN), async (req, res) => {
+    const name = cleanArea(req.body?.name);
+    if (!name) return res.status(400).json({ error: 'Enter the area name.' });
+    const active = req.body?.is_active !== false;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows: [cur] } = await client.query('SELECT name FROM patrol_areas WHERE id=$1 FOR UPDATE', [req.params.id]);
+      if (!cur) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Area not found.' }); }
+      await client.query('UPDATE patrol_areas SET name=$1, is_active=$2 WHERE id=$3', [name, active, req.params.id]);
+      if (cur.name !== name) {
+        await client.query('UPDATE patrol_route_files SET area=$1 WHERE area=$2', [name, cur.name]);
+        await client.query('UPDATE patrol_routes SET area=$1 WHERE area=$2', [name, cur.name]);
+      }
+      const { rows } = await client.query(`
+        SELECT a.id, a.name, a.is_active, a.sort_order,
+               (SELECT COUNT(*)::int FROM patrol_route_files f WHERE f.area = a.name) AS uploads
+        FROM patrol_areas a WHERE a.id=$1`, [req.params.id]);
+      await client.query('COMMIT');
+      res.json(rows[0]);
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      if (e.code === '23505') return res.status(409).json({ error: 'That area is already in the list.' });
+      sendError(res, e);
+    } finally { client.release(); }
+  });
+
+  // Only an area nothing was ever uploaded for can be deleted; otherwise it is
+  // deactivated, which keeps past cycles readable.
+  router.delete('/areas/:id', auth, allow(ADMIN), async (req, res) => {
+    try {
+      const { rows: [a] } = await pool.query(`
+        SELECT a.name, (SELECT COUNT(*)::int FROM patrol_route_files f WHERE f.area = a.name) AS uploads
+        FROM patrol_areas a WHERE a.id=$1`, [req.params.id]);
+      if (!a) return res.status(404).json({ error: 'Area not found.' });
+      if (a.uploads > 0) return res.status(400).json({ error: `${a.name} has routes uploaded, so it can only be deactivated.` });
+      await pool.query('DELETE FROM patrol_areas WHERE id=$1', [req.params.id]);
+      res.json({ ok: true });
+    } catch (e) { sendError(res, e); }
+  });
+
+  // ── Areas in a cycle (one KMZ each) ───────────────────────
   router.post('/cycles/:id/areas', auth, allow(ROUTE_EDIT_ROLES), (req, res) => {
     kmzUpload.single('kmz')(req, res, async (err) => {
       if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'The KMZ must be 10 MB or smaller.' : (err.message || 'Upload rejected') });
       if (!req.file) return res.status(400).json({ error: 'Choose a KMZ file to upload.' });
-      const area = cleanArea(req.body?.area);
-      if (!area) return res.status(400).json({ error: 'Give the area a name, for example NW or RIFT.' });
+      const { rows: [listed] } = await pool.query(
+        'SELECT name FROM patrol_areas WHERE is_active AND LOWER(name)=LOWER($1)', [cleanArea(req.body?.area)]);
+      if (!listed) return res.status(400).json({ error: 'Pick an area from the list.' });
+      const area = listed.name;
 
       let parsed;
       try { parsed = await readKmz(req.file.buffer); } catch (e) { return res.status(400).json({ error: e.message }); }

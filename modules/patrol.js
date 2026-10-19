@@ -1397,6 +1397,102 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
   scheduleDailyEAT('normal_summary_time', 'normal_summary', () => sendNormalSummary());
   scheduleDailyEAT('ticket_digest_time', 'ticket_digest', sendTicketDigest);
 
+  // ── Dashboard ─────────────────────────────────────────────
+  // One read for the whole page. Dates are East Africa days, inclusive.
+  // "Coverage" is measured by pins for now: a link with no pin in the period
+  // was not reported on. Live tracking will add the paths actually driven.
+  const DASHBOARD_ROLES = ['admin', 'field_supervisor', 'pm_coordinator', 'planner', 'director'];
+  const isDay = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) && !isNaN(Date.parse(v));
+  router.get('/dashboard', auth, allow(DASHBOARD_ROLES), async (req, res) => {
+    try {
+      const today = todayEAT();
+      const to = isDay(req.query.to) ? req.query.to : today;
+      const from = isDay(req.query.from) ? req.query.from : new Date(Date.parse(`${to}T00:00:00Z`) - 29 * 86400000).toISOString().slice(0, 10);
+      if (from > to) return res.status(400).json({ error: 'The start date is after the end date.' });
+      const area = String(req.query.area || '').trim() || null;
+      const pinIn = `(pp.created_at AT TIME ZONE 'Africa/Nairobi')::date BETWEEN $1::date AND $2::date AND ($3::text IS NULL OR pp.nearest_route_area = $3)`;
+      const P = [from, to, area];
+
+      const [{ rows: [tot] }, { rows: [pat] }, { rows: [now] }, { rows: [tk] }, { rows: perDay }, { rows: perOfficer }, { rows: obs }] = await Promise.all([
+        pool.query(`SELECT COUNT(*)::int AS pins,
+            COUNT(*) FILTER (WHERE status='critical')::int AS critical,
+            COUNT(*) FILTER (WHERE status='medium')::int AS medium,
+            COUNT(*) FILTER (WHERE status='normal')::int AS normal,
+            COUNT(*) FILTER (WHERE off_route)::int AS off_route
+          FROM patrol_pins pp WHERE ${pinIn}`, P),
+        pool.query(`SELECT COUNT(*)::int AS patrols, COUNT(DISTINCT officer_id)::int AS officers,
+            COALESCE(ROUND(SUM(EXTRACT(EPOCH FROM (COALESCE(ended_at, NOW()) - started_at))::numeric) / 3600.0, 1), 0)::float AS hours
+          FROM patrols p WHERE (p.started_at AT TIME ZONE 'Africa/Nairobi')::date BETWEEN $1::date AND $2::date
+            AND ($3::text IS NULL OR EXISTS (SELECT 1 FROM patrol_pins pp WHERE pp.patrol_id = p.id AND pp.nearest_route_area = $3))`, P),
+        // Right now, whatever the dates: what still needs someone.
+        pool.query(`SELECT
+            COUNT(*) FILTER (WHERE review_status='awaiting_review')::int AS awaiting,
+            COUNT(*) FILTER (WHERE ticket_status='open')::int AS open_tickets,
+            COUNT(*) FILTER (WHERE ticket_status='open' AND status='critical')::int AS open_critical,
+            MIN(ticket_opened_at) FILTER (WHERE ticket_status='open') AS oldest_open
+          FROM patrol_pins pp WHERE ($1::text IS NULL OR pp.nearest_route_area = $1)`, [area]),
+        pool.query(`SELECT
+            COUNT(*) FILTER (WHERE (ticket_opened_at AT TIME ZONE 'Africa/Nairobi')::date BETWEEN $1::date AND $2::date)::int AS opened,
+            COUNT(*) FILTER (WHERE ticket_status='closed' AND (ticket_closed_at AT TIME ZONE 'Africa/Nairobi')::date BETWEEN $1::date AND $2::date)::int AS closed,
+            ROUND(AVG(EXTRACT(EPOCH FROM (ticket_closed_at - ticket_opened_at))::numeric / 3600.0)
+              FILTER (WHERE ticket_status='closed' AND (ticket_closed_at AT TIME ZONE 'Africa/Nairobi')::date BETWEEN $1::date AND $2::date), 1)::float AS avg_hours_to_close
+          FROM patrol_pins pp WHERE ticket_opened_at IS NOT NULL AND ($3::text IS NULL OR pp.nearest_route_area = $3)`, P),
+        pool.query(`SELECT to_char((pp.created_at AT TIME ZONE 'Africa/Nairobi')::date, 'YYYY-MM-DD') AS day,
+            COUNT(*) FILTER (WHERE status='critical')::int AS critical,
+            COUNT(*) FILTER (WHERE status='medium')::int AS medium,
+            COUNT(*) FILTER (WHERE status='normal')::int AS normal
+          FROM patrol_pins pp WHERE ${pinIn} GROUP BY 1 ORDER BY 1`, P),
+        pool.query(`SELECT u.id, u.full_name,
+            (SELECT COUNT(*)::int FROM patrols p WHERE p.officer_id = u.id AND (p.started_at AT TIME ZONE 'Africa/Nairobi')::date BETWEEN $1::date AND $2::date) AS patrols,
+            (SELECT COALESCE(ROUND(SUM(EXTRACT(EPOCH FROM (COALESCE(p.ended_at, NOW()) - p.started_at))::numeric) / 3600.0, 1), 0)::float FROM patrols p
+               WHERE p.officer_id = u.id AND (p.started_at AT TIME ZONE 'Africa/Nairobi')::date BETWEEN $1::date AND $2::date) AS hours,
+            COUNT(pp.id)::int AS pins,
+            COUNT(pp.id) FILTER (WHERE pp.status='critical')::int AS critical,
+            COUNT(pp.id) FILTER (WHERE pp.status='medium')::int AS medium,
+            COUNT(pp.id) FILTER (WHERE pp.status='normal')::int AS normal,
+            COUNT(pp.id) FILTER (WHERE pp.off_route)::int AS off_route,
+            (SELECT MAX(p.started_at) FROM patrols p WHERE p.officer_id = u.id) AS last_patrol_at
+          FROM users u
+          LEFT JOIN patrol_pins pp ON pp.officer_id = u.id AND ${pinIn}
+          WHERE u.patrol_role = 'patrol_officer' OR EXISTS (SELECT 1 FROM patrols p WHERE p.officer_id = u.id)
+          GROUP BY u.id ORDER BY pins DESC, u.full_name`, P),
+        pool.query(`SELECT observation_label AS label, COUNT(*)::int AS pins,
+            COUNT(*) FILTER (WHERE status='critical')::int AS critical
+          FROM patrol_pins pp WHERE ${pinIn} GROUP BY 1 ORDER BY pins DESC LIMIT 12`, P),
+      ]);
+
+      // Links of the cycle in force at the end of the period, with what was
+      // reported on them in the period.
+      const cycles = await cycleRows();
+      const cycleId = cycles.find(c => c.starts_on <= to)?.id || null;
+      let links = [];
+      if (cycleId) {
+        const { rows } = await pool.query(`
+          SELECT r.name, r.area, ROUND(SUM(r.length_m) / 1000.0, 1)::float AS length_km,
+            (SELECT COUNT(*)::int FROM patrol_pins pp WHERE pp.nearest_route_name = r.name
+               AND (pp.created_at AT TIME ZONE 'Africa/Nairobi')::date BETWEEN $2::date AND $3::date) AS pins,
+            (SELECT COUNT(*)::int FROM patrol_pins pp WHERE pp.nearest_route_name = r.name AND pp.ticket_status = 'open') AS open_tickets,
+            (SELECT MAX(pp.created_at) FROM patrol_pins pp WHERE pp.nearest_route_name = r.name) AS last_pin_at
+          FROM patrol_routes r
+          WHERE r.cycle_id = $1 AND r.kind = 'line' AND ($4::text IS NULL OR r.area = $4)
+          GROUP BY r.name, r.area ORDER BY pins, r.area, r.name`, [cycleId, from, to, area]);
+        links = rows;
+      }
+      const { rows: areas } = await pool.query('SELECT name FROM patrol_areas WHERE is_active ORDER BY sort_order, name');
+
+      res.json({
+        from, to, area, today,
+        areas: areas.map(a => a.name),
+        totals: { ...tot, ...pat, ...tk },
+        now: now,
+        per_day: perDay,
+        per_officer: perOfficer,
+        observations: obs,
+        links,
+      });
+    } catch (e) { sendError(res, e); }
+  });
+
   // ── Settings (admin) ──────────────────────────────────────
   router.get('/settings', auth, allow(['admin']), async (req, res) => {
     try {

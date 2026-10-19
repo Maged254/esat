@@ -825,10 +825,18 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
              Math.round(fromOfficer * 10) / 10, nearest ? Math.round(nearest.d * 10) / 10 : null, nearest?.name || null, nearest?.area || null, offRoute,
              name, cleanLabel(b.location_note, 500) || null, type.id, type.label, status]);
 
-          const month = new Date().toISOString().slice(0, 7);
+          // Readable folders, like the training certificates:
+          //   photos/2026-10/19/Patrol Test/14-20 Shell Petrol Station (7776)/1.jpg
+          // in East Africa time. The pin id's last 4 characters keep two pins
+          // with the same name and minute apart. The full key is stored on the
+          // photo row, so the folder name never has to be worked out again.
+          const eat = new Date(Date.now() + 3 * 3600 * 1000).toISOString(); // YYYY-MM-DDTHH:MM
+          const keyPart = (v) => String(v || '').replace(/[\\/\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80) || '_';
+          const folder = `photos/${eat.slice(0, 7)}/${eat.slice(8, 10)}/${keyPart(req.user.name)}/`
+            + `${eat.slice(11, 13)}-${eat.slice(14, 16)} ${keyPart(name)} (${pin.id.slice(-4)})`;
           for (let i = 0; i < photos.length; i++) {
             const m = meta[i] || {};
-            const base = `photos/${month}/${pin.id}/${i + 1}`;
+            const base = `${folder}/${i + 1}`;
             await r2.send(new PutObjectCommand({ Bucket: PATROL_R2_BUCKET, Key: `${base}.jpg`, Body: photos[i].full.buffer, ContentType: 'image/jpeg' }));
             keys.push(`${base}.jpg`);
             let thumbKey = null;

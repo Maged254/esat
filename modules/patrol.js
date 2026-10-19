@@ -1173,7 +1173,22 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
     const testNote = EMAIL_TEST_TO
       ? `<p style="margin-top:18px;font-size:9pt;color:#888;">Testing: this email would go to ${people.map(p => escapeHtml(p.full_name)).join(', ')}.</p>`
       : '';
-    await sendMail({ to, subject, html: mailWrap(`${inner}${mailSignoff ? mailSignoff() : ''}${testNote}`) });
+    // Resend reports a refusal in its reply rather than by failing, so check
+    // it: a refused email is logged and shown to admins in the bell, with
+    // Resend's reason, instead of vanishing.
+    let reason = null;
+    try {
+      const result = await sendMail({ to, subject, html: mailWrap(`${inner}${mailSignoff ? mailSignoff() : ''}${testNote}`) });
+      if (result?.error) reason = result.error.message || result.error.name || JSON.stringify(result.error);
+    } catch (e) { reason = e.message; }
+    if (reason) {
+      console.error(`Patrol email not sent (${subject}):`, reason);
+      const { rows: admins } = await pool.query("SELECT id FROM users WHERE is_active AND role = 'admin'");
+      for (const a of admins) {
+        await pool.query("INSERT INTO patrol_notifications (user_id, kind, title, body) VALUES ($1, 'email_failed', $2, $3)",
+          [a.id, `Email not sent: ${subject.replace(/^OneHub Route Patrol: /, '')}`, String(reason).slice(0, 300)]);
+      }
+    }
   };
 
   const notifyInApp = async (people, pinId, kind, title, body) => {

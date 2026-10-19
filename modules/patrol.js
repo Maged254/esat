@@ -349,6 +349,14 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
       'ticket_opened_at TIMESTAMPTZ', 'ticket_closed_at TIMESTAMPTZ', 'ticket_closed_by UUID REFERENCES users(id)',
     ]) await client.query(`ALTER TABLE patrol_pins ADD COLUMN IF NOT EXISTS ${col}`);
     await client.query('CREATE INDEX IF NOT EXISTS idx_patrol_pins_review ON patrol_pins(review_status)');
+    // Nearest site, so pins can be found by site as well as by link.
+    await client.query('ALTER TABLE patrol_pins ADD COLUMN IF NOT EXISTS nearest_site_name TEXT');
+    await client.query('ALTER TABLE patrol_pins ADD COLUMN IF NOT EXISTS nearest_site_distance_m REAL');
+    const { rows: noSite } = await client.query('SELECT id, cycle_id, lat, lon FROM patrol_pins WHERE nearest_site_name IS NULL LIMIT 5000');
+    for (const pin of noSite) {
+      const { site } = await nearestTo(pin.cycle_id, [pin.lon, pin.lat], client);
+      if (site) await client.query('UPDATE patrol_pins SET nearest_site_name=$1, nearest_site_distance_m=$2 WHERE id=$3', [site.name, Math.round(site.d), pin.id]);
+    }
     await client.query('CREATE INDEX IF NOT EXISTS idx_patrol_pins_ticket ON patrol_pins(ticket_status)');
     await client.query('CREATE INDEX IF NOT EXISTS idx_patrol_pins_created ON patrol_pins(created_at)');
     await client.query(`
@@ -718,15 +726,24 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
   });
 
   // ── Patrols ───────────────────────────────────────────────
-  // The route lines of a cycle, kept in memory for the off-route check:
-  // ~120 lines, read once per cycle rather than on every pin.
-  const linesForCycle = async (cycleId) => {
+  // The route lines and sites of a cycle, kept in memory for the off-route
+  // check and the nearest link / site: ~200 features, read once per cycle
+  // rather than on every pin.
+  const featuresForCycle = async (cycleId, db = pool) => {
     if (!routeCache.has(cycleId)) {
-      const { rows } = await pool.query(
-        "SELECT name, area, coordinates FROM patrol_routes WHERE cycle_id=$1 AND kind='line'", [cycleId]);
-      routeCache.set(cycleId, rows);
+      const { rows } = await db.query(
+        "SELECT kind, name, area, coordinates FROM patrol_routes WHERE cycle_id=$1 AND kind IN ('line','point')", [cycleId]);
+      routeCache.set(cycleId, { lines: rows.filter(r => r.kind === 'line'), sites: rows.filter(r => r.kind === 'point') });
     }
     return routeCache.get(cycleId);
+  };
+  // Nearest link (route line) and nearest site to a point [lon, lat].
+  const nearestTo = async (cycleId, p, db) => {
+    const { lines, sites } = await featuresForCycle(cycleId, db);
+    let link = null, site = null;
+    for (const l of lines) { const d = distanceToLineM(p, l.coordinates); if (!link || d < link.d) link = { d, name: l.name, area: l.area }; }
+    for (const s of sites) { const d = haversineM(p, s.coordinates); if (!site || d < site.d) site = { d, name: s.name }; }
+    return { link, site };
   };
 
   const patrolSummary = async (patrolId) => {
@@ -841,11 +858,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
         const { rows: [type] } = await pool.query('SELECT id, label FROM patrol_observation_types WHERE id=$1 AND is_active', [b.observation_type_id || null]);
         if (!type) return res.status(400).json({ error: 'Pick an observation type.' });
 
-        let nearest = null;
-        for (const line of await linesForCycle(patrol.cycle_id)) {
-          const d = distanceToLineM([lon, lat], line.coordinates);
-          if (!nearest || d < nearest.d) nearest = { d, name: line.name, area: line.area };
-        }
+        const { link: nearest, site: nearestSite } = await nearestTo(patrol.cycle_id, [lon, lat]);
         const offRoute = !nearest || nearest.d > PIN_OFF_ROUTE_M;
 
         const client = await pool.connect();
@@ -854,11 +867,12 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
           const { rows: [pin] } = await client.query(`
             INSERT INTO patrol_pins (patrol_id, cycle_id, officer_id, lat, lon, officer_lat, officer_lon, gps_accuracy_m,
               distance_from_officer_m, distance_to_route_m, nearest_route_name, nearest_route_area, off_route,
-              name, location_note, observation_type_id, observation_label, status)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id, created_at`,
+              name, location_note, observation_type_id, observation_label, status, nearest_site_name, nearest_site_distance_m)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING id, created_at`,
             [patrol.id, patrol.cycle_id, req.user.id, lat, lon, oLat, oLon, Number.isFinite(num(b.accuracy)) ? num(b.accuracy) : null,
              Math.round(fromOfficer * 10) / 10, nearest ? Math.round(nearest.d * 10) / 10 : null, nearest?.name || null, nearest?.area || null, offRoute,
-             name, cleanLabel(b.location_note, 500) || null, type.id, type.label, status]);
+             name, cleanLabel(b.location_note, 500) || null, type.id, type.label, status,
+             nearestSite?.name || null, nearestSite ? Math.round(nearestSite.d) : null]);
 
           // Readable folders, like the training certificates:
           //   photos/2026-10/19/Patrol Test/14-20 Shell Petrol Station (7776)/1.jpg
@@ -911,6 +925,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
   const PIN_LIST_SQL = `
     SELECT pp.id, pp.patrol_id, pp.created_at, pp.lat, pp.lon, pp.name, pp.location_note, pp.observation_label,
            pp.status, pp.off_route, pp.distance_to_route_m, pp.nearest_route_name, pp.nearest_route_area,
+           pp.nearest_site_name, pp.nearest_site_distance_m,
            pp.review_status, pp.reviewed_at, pp.review_comment, pp.ticket_status, pp.ticket_opened_at, pp.ticket_closed_at,
            u.full_name AS officer_name, rv.full_name AS reviewed_by_name,
            (SELECT COUNT(*)::int FROM patrol_pin_photos ph WHERE ph.pin_id = pp.id) AS photos,
@@ -936,7 +951,10 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
       if (/^\d{4}-\d{2}-\d{2}$/.test(req.query.from || '')) add("(pp.created_at AT TIME ZONE 'Africa/Nairobi')::date >= ?::date", req.query.from);
       if (/^\d{4}-\d{2}-\d{2}$/.test(req.query.to || '')) add("(pp.created_at AT TIME ZONE 'Africa/Nairobi')::date <= ?::date", req.query.to);
       const q = String(req.query.q || '').trim();
-      if (q) add("(pp.name ILIKE ? OR pp.observation_label ILIKE $X OR u.full_name ILIKE $X OR pp.nearest_route_name ILIKE $X)".replace(/\$X/g, `$${params.length + 1}`), `%${q}%`);
+      if (q) add("(pp.name ILIKE ? OR pp.observation_label ILIKE $X OR u.full_name ILIKE $X OR pp.nearest_route_name ILIKE $X OR pp.nearest_site_name ILIKE $X)".replace(/\$X/g, `$${params.length + 1}`), `%${q}%`);
+      // A link or site picked from the list: pins whose nearest link or site it is.
+      const place = String(req.query.place || '').trim();
+      if (place) add('(pp.nearest_route_name = ? OR pp.nearest_site_name = $X)'.replace('$X', `$${params.length + 1}`), place);
       const limit = Math.min(Math.max(parseInt(req.query.limit) || 200, 1), 500);
       const { rows } = await pool.query(
         `${PIN_LIST_SQL} ${where.length ? 'WHERE ' + where.join(' AND ') : ''}

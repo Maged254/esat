@@ -721,7 +721,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
           await client.query(`INSERT INTO patrol_routes (file_id, cycle_id, area, kind, name, folder, coordinates, length_m, sort_order) VALUES ${values.join(',')}`, params);
         }
         await client.query('COMMIT');
-        routeCache.delete(cycle.id);
+        routeCache.delete(cycle.id); lineBoxes.delete(cycle.id);
         // The replaced file goes only once the new one is safely in.
         if (old[0]?.r2_key && R2_READY) r2.send(new DeleteObjectCommand({ Bucket: PATROL_R2_BUCKET, Key: old[0].r2_key })).catch(() => {});
 
@@ -746,7 +746,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
       if (check.error) return res.status(check.status).json({ error: check.error });
       const { rows } = await pool.query('DELETE FROM patrol_route_files WHERE id=$1 AND cycle_id=$2 RETURNING r2_key', [req.params.fileId, req.params.id]);
       if (!rows[0]) return res.status(404).json({ error: 'Area not found in this cycle.' });
-      routeCache.delete(req.params.id);
+      routeCache.delete(req.params.id); lineBoxes.delete(req.params.id);
       if (rows[0].r2_key && R2_READY) r2.send(new DeleteObjectCommand({ Bucket: PATROL_R2_BUCKET, Key: rows[0].r2_key })).catch(() => {});
       res.json({ ok: true });
     } catch (e) { sendError(res, e); }
@@ -1408,24 +1408,84 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
     } catch (e) { sendError(res, e); }
   });
 
-  // One patrol's path: positions in order, with the gaps longer than the
-  // "lost" limit marked so the map can draw them dashed.
+  // How far a point [lon, lat] is from the nearest route line of a cycle.
+  // Lines whose box is further away than `within` are skipped, which keeps a
+  // day's positions against ~120 lines quick.
+  const lineBoxes = new Map(); // cycle id → [{ coords, box }]
+  const boxesFor = async (cycleId) => {
+    if (!lineBoxes.has(cycleId)) {
+      const { lines } = await featuresForCycle(cycleId);
+      lineBoxes.set(cycleId, lines.map(l => {
+        let a = 180, b = 90, c = -180, d = -90;
+        for (const [lo, la] of l.coordinates) { a = Math.min(a, lo); b = Math.min(b, la); c = Math.max(c, lo); d = Math.max(d, la); }
+        return { coords: l.coordinates, box: [a, b, c, d] };
+      }));
+    }
+    return lineBoxes.get(cycleId);
+  };
+  const isOffRoute = (pt, boxes, within) => {
+    const padLat = within / 111000 * 1.2;                         // metres → degrees, with margin
+    const padLon = padLat / Math.max(0.2, Math.cos(pt[1] * Math.PI / 180));
+    for (const { coords, box } of boxes) {
+      if (pt[0] < box[0] - padLon || pt[0] > box[2] + padLon || pt[1] < box[1] - padLat || pt[1] > box[3] + padLat) continue;
+      if (distanceToLineM(pt, coords) <= within) return false;
+    }
+    return true;
+  };
+
+  // One patrol's path: positions in order, each marked off route (further
+  // than the off-route setting from every route line) and with gaps longer
+  // than the "lost" limit marked, plus the patrol's pins and a summary.
   router.get('/patrols/:id/path', auth, allow(ROUTE_VIEW_ROLES), async (req, res) => {
     try {
       const { rows: [p] } = await pool.query(`
-        SELECT p.id, p.officer_id, p.started_at, p.ended_at, p.end_reason, u.full_name AS officer_name
+        SELECT p.id, p.officer_id, p.cycle_id, p.started_at, p.ended_at, p.end_reason, u.full_name AS officer_name
         FROM patrols p JOIN users u ON u.id = p.officer_id WHERE p.id=$1`, [req.params.id]);
       if (!p) return res.status(404).json({ error: 'Patrol not found.' });
       if (patrolRoleOf(req.user) === 'patrol_officer' && p.officer_id !== req.user.id) return res.status(403).json({ error: 'Not authorized' });
       const { rows: pts } = await pool.query(
         'SELECT recorded_at, lat, lon, accuracy_m, speed_kmh FROM patrol_positions WHERE patrol_id=$1 ORDER BY recorded_at LIMIT 20000', [p.id]);
-      let km = 0, gaps = 0;
-      for (let i = 1; i < pts.length; i++) {
-        const gapMin = (new Date(pts[i].recorded_at) - new Date(pts[i - 1].recorded_at)) / 60000;
-        if (gapMin > S.tracker_lost_min) { pts[i].gap_before = true; gaps++; }
-        else km += haversineM([pts[i - 1].lon, pts[i - 1].lat], [pts[i].lon, pts[i].lat]) / 1000;
-      }
-      res.json({ ...p, positions: pts, km: Math.round(km * 10) / 10, gaps, lost_min: S.tracker_lost_min });
+      const boxes = await boxesFor(p.cycle_id);
+      let km = 0, kmOff = 0, gaps = 0, gapMin = 0;
+      pts.forEach((pt, i) => {
+        pt.off_route = boxes.length ? isOffRoute([pt.lon, pt.lat], boxes, S.pin_off_route_m) : false;
+        if (!i) return;
+        const mins = (new Date(pt.recorded_at) - new Date(pts[i - 1].recorded_at)) / 60000;
+        if (mins > S.tracker_lost_min) { pt.gap_before = true; gaps++; gapMin += mins; return; }
+        const d = haversineM([pts[i - 1].lon, pts[i - 1].lat], [pt.lon, pt.lat]) / 1000;
+        km += d;
+        if (pt.off_route && pts[i - 1].off_route) kmOff += d;
+      });
+      const { rows: pins } = await pool.query(`
+        SELECT id, created_at, lat, lon, name, observation_label, status, off_route, review_status, ticket_status, tracker_silent
+        FROM patrol_pins WHERE patrol_id=$1 ORDER BY created_at`, [p.id]);
+      res.json({
+        ...p, positions: pts, pins,
+        km: Math.round(km * 10) / 10, km_off_route: Math.round(kmOff * 10) / 10,
+        gaps, gap_minutes: Math.round(gapMin), lost_min: S.tracker_lost_min, off_route_m: S.pin_off_route_m,
+      });
+    } catch (e) { sendError(res, e); }
+  });
+
+  // History: every patrol that started on one East Africa day, optionally for
+  // one officer, with what the list needs before the paths are loaded.
+  router.get('/patrols', auth, allow(DASH_LIVE_ROLES), async (req, res) => {
+    try {
+      const day = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.date || '')) ? req.query.date : todayEAT();
+      const officer = req.query.officer || null;
+      const { rows } = await pool.query(`
+        SELECT p.id, p.started_at, p.ended_at, p.end_reason, u.id AS officer_id, u.full_name AS officer_name,
+               (SELECT COUNT(*)::int FROM patrol_pins pp WHERE pp.patrol_id = p.id) AS pins,
+               (SELECT COUNT(*)::int FROM patrol_positions pos WHERE pos.patrol_id = p.id) AS positions
+        FROM patrols p JOIN users u ON u.id = p.officer_id
+        WHERE (p.started_at AT TIME ZONE 'Africa/Nairobi')::date = $1::date
+          AND ($2::uuid IS NULL OR p.officer_id = $2::uuid)
+        ORDER BY p.started_at`, [day, officer]);
+      const { rows: officers } = await pool.query(`
+        SELECT DISTINCT u.id, u.full_name FROM users u
+        WHERE u.patrol_role = 'patrol_officer' OR EXISTS (SELECT 1 FROM patrols p WHERE p.officer_id = u.id)
+        ORDER BY u.full_name`);
+      res.json({ date: day, patrols: rows, officers });
     } catch (e) { sendError(res, e); }
   });
 
@@ -1868,5 +1928,5 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
   const msToNext = () => { const n = new Date(); const t = new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate() + 1)); return t - n; };
   setTimeout(() => { sweepOldPhotos(); setInterval(sweepOldPhotos, 24 * 3600 * 1000); }, msToNext());
 
-  return { router, trackerRouter, setup, endPatrolsOnRestart, _internals: { readKmz, kmlToFeatures, distanceToLineM, validSetting } };
+  return { router, trackerRouter, setup, endPatrolsOnRestart, _internals: { readKmz, kmlToFeatures, distanceToLineM, validSetting, isOffRoute } };
 };

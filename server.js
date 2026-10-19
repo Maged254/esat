@@ -5705,7 +5705,7 @@ function renderEmployeeChangesEmail(intro, rows) {
   const changeAfter = (r, field) => { const c = (r.changes || []).find(x => x.field === field); return c ? (c.after ?? null) : null; };
   let tableRows = '';
   rows.forEach(r => {
-    const when = new Date(r.changed_at).toLocaleDateString('en-GB', { timeZone: 'Africa/Nairobi', day: '2-digit', month: 'short' });
+    const when = new Date(r.changed_at).toLocaleDateString('en-GB', { timeZone: 'Africa/Nairobi', day: '2-digit', month: '2-digit', year: 'numeric' });
     const org  = r.current_org     || changeAfter(r, 'Organization') || '—';
     const proj = r.current_project || changeAfter(r, 'Project')      || '—';
     const cli  = r.current_client  || changeAfter(r, 'Client')       || '—';

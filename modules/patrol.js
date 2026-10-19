@@ -1,5 +1,5 @@
 // ── OneHub Operations: Route Patrol ──────────────────────────
-// Routes and 3-month cycles. A Planner starts a cycle and uploads one KMZ per
+// Routes and cycles. A Planner starts a cycle and uploads one KMZ per
 // area (NW, RIFT, ...); the KMZ is kept in the patrol R2 bucket and its lines
 // and points are stored as rows so the map, distance checks and coverage can
 // read them without re-parsing. Re-uploading an area inside a cycle replaces
@@ -16,8 +16,6 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 // Who may do what. Admin always may (see patrolRoleOf).
 const ROUTE_EDIT_ROLES = ['admin', 'planner'];
 const ROUTE_VIEW_ROLES = ['admin', 'patrol_officer', 'field_supervisor', 'pm_coordinator', 'planner', 'director'];
-// Settings (stage 7) will make this adjustable; until then a cycle is 3 months.
-const CYCLE_MONTHS = 3;
 const KMZ_MAX_BYTES = 10 * 1024 * 1024;
 
 // ── KML reading ───────────────────────────────────────────────
@@ -144,25 +142,10 @@ async function readKmz(buffer) {
 // ── Dates ─────────────────────────────────────────────────────
 const isDateStr = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || '')) && !isNaN(Date.parse(s));
 // Calendar arithmetic on YYYY-MM-DD in UTC so no timezone shifts a day.
-// Day before the same date N months on, clamped to the month's last day so
-// 30 Nov + 3 months ends 27 Feb rather than spilling into March.
-const addMonthsMinusDay = (ymd, months) => {
-  const [y, m, day] = ymd.split('-').map(Number);
-  const target = new Date(Date.UTC(y, m - 1 + months, 1));
-  const lastDay = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate();
-  target.setUTCDate(Math.min(day, lastDay) - 1);
-  return target.toISOString().slice(0, 10);
-};
 const dayBefore = (ymd) => {
   const d = new Date(`${ymd}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() - 1);
   return d.toISOString().slice(0, 10);
-};
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-const cycleLabel = (starts, ends) => {
-  const s = new Date(`${starts}T00:00:00Z`), e = new Date(`${ends}T00:00:00Z`);
-  const sm = `${MONTHS[s.getUTCMonth()]}${s.getUTCFullYear() !== e.getUTCFullYear() ? ' ' + s.getUTCFullYear() : ''}`;
-  return `${sm} – ${MONTHS[e.getUTCMonth()]} ${e.getUTCFullYear()}`;
 };
 // Today in East Africa, where every patrol happens.
 const todayEAT = () => new Date(Date.now() + 3 * 3600 * 1000).toISOString().slice(0, 10);
@@ -198,7 +181,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         name VARCHAR(120) NOT NULL,
         starts_on DATE NOT NULL UNIQUE,
-        ends_on DATE NOT NULL,
+        ends_on DATE,
         created_by UUID REFERENCES users(id),
         created_at TIMESTAMPTZ DEFAULT NOW(),
         CHECK (ends_on >= starts_on)
@@ -230,6 +213,13 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
         sort_order INTEGER
       )`);
     await client.query('CREATE INDEX IF NOT EXISTS idx_patrol_routes_cycle ON patrol_routes(cycle_id)');
+    // Cycles have no fixed length (about 3 months, sometimes more or less): one
+    // runs until the next is started, so only a superseded cycle has an end
+    // date. The first deploy stored a 3-month end on every cycle; undo that for
+    // the latest one, which by this rule is always open.
+    await client.query('ALTER TABLE patrol_cycles ALTER COLUMN ends_on DROP NOT NULL');
+    await client.query(`UPDATE patrol_cycles SET ends_on = NULL
+      WHERE ends_on IS NOT NULL AND starts_on = (SELECT MAX(starts_on) FROM patrol_cycles)`);
   };
 
   // ── Access ────────────────────────────────────────────────
@@ -281,8 +271,9 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
     } catch (e) { sendError(res, e); }
   });
 
-  // Starting a cycle closes the one before it the day before the new one
-  // starts, so cycles never overlap and every date belongs to exactly one.
+  // A cycle runs until the next one is started. Starting one closes the cycle
+  // before it on the day before, so cycles never overlap and every date
+  // belongs to exactly one.
   router.post('/cycles', auth, allow(ROUTE_EDIT_ROLES), async (req, res) => {
     const starts = req.body?.starts_on;
     if (!isDateStr(starts)) return res.status(400).json({ error: 'Pick a start date.' });
@@ -296,14 +287,13 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
         await client.query('ROLLBACK');
         return res.status(400).json({ error: `A new cycle has to start after the latest one (${latest.name}, from ${latest.starts_on}).` });
       }
-      const ends = addMonthsMinusDay(starts, CYCLE_MONTHS);
-      if (latest && latest.ends_on >= starts) {
+      if (latest) {
         await client.query('UPDATE patrol_cycles SET ends_on = $1 WHERE id = $2', [dayBefore(starts), latest.id]);
       }
-      const name = String(req.body?.name || '').trim().slice(0, 120) || cycleLabel(starts, ends);
+      const name = String(req.body?.name || '').trim().slice(0, 120) || `Cycle ${cycles.length + 1}`;
       const { rows } = await client.query(
-        'INSERT INTO patrol_cycles (name, starts_on, ends_on, created_by) VALUES ($1,$2,$3,$4) RETURNING id',
-        [name, starts, ends, req.user.id]);
+        'INSERT INTO patrol_cycles (name, starts_on, created_by) VALUES ($1,$2,$3) RETURNING id',
+        [name, starts, req.user.id]);
       await client.query('COMMIT');
       res.status(201).json({ id: rows[0].id });
     } catch (e) { await client.query('ROLLBACK').catch(() => {}); sendError(res, e); }
@@ -428,5 +418,5 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
     } catch (e) { sendError(res, e); }
   });
 
-  return { router, setup, _internals: { readKmz, kmlToFeatures, addMonthsMinusDay, cycleLabel } };
+  return { router, setup, _internals: { readKmz, kmlToFeatures } };
 };

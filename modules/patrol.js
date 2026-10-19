@@ -25,6 +25,15 @@ const PHOTOS_MIN = 1, PHOTOS_MAX = 3;
 const PHOTO_MAX_BYTES = 4 * 1024 * 1024;
 const PHOTO_RETENTION_DAYS = 60;     // ~2 months; photos on a pin with an open ticket are kept
 const PIN_STATUSES = ['critical', 'medium', 'normal'];
+// Review and tickets. Any supervisor can review any pin (no officer→supervisor
+// link for now); PM Coordinators work and close tickets; the Director watches.
+const REVIEW_ROLES = ['admin', 'field_supervisor'];
+const PIN_LIST_ROLES = ['admin', 'field_supervisor', 'pm_coordinator', 'planner', 'director'];
+const TICKET_VIEW_ROLES = ['admin', 'field_supervisor', 'pm_coordinator', 'director'];
+const TICKET_COMMENT_ROLES = ['admin', 'field_supervisor', 'pm_coordinator'];
+const TICKET_CLOSE_ROLES = ['admin', 'pm_coordinator'];
+const TICKET_REOPEN_ROLES = ['admin', 'field_supervisor', 'pm_coordinator'];
+const COMMENT_MAX = 1000;
 
 // ── KML reading ───────────────────────────────────────────────
 // KML is plain, regular XML. A small tokenizer is enough and avoids pulling in
@@ -325,6 +334,16 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
         ticket_status VARCHAR(10)
       )`);
     await client.query('CREATE INDEX IF NOT EXISTS idx_patrol_pins_patrol ON patrol_pins(patrol_id)');
+    // Review and ticket state. The full story is in patrol_pin_events; these
+    // columns hold the current position so lists do not have to replay it.
+    // review_status: awaiting_review | no_action | action_needed
+    // ticket_status: NULL (no ticket) | open | closed
+    for (const col of [
+      'reviewed_by UUID REFERENCES users(id)', 'reviewed_at TIMESTAMPTZ', 'review_comment TEXT',
+      'ticket_opened_at TIMESTAMPTZ', 'ticket_closed_at TIMESTAMPTZ', 'ticket_closed_by UUID REFERENCES users(id)',
+    ]) await client.query(`ALTER TABLE patrol_pins ADD COLUMN IF NOT EXISTS ${col}`);
+    await client.query('CREATE INDEX IF NOT EXISTS idx_patrol_pins_review ON patrol_pins(review_status)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_patrol_pins_ticket ON patrol_pins(ticket_status)');
     await client.query('CREATE INDEX IF NOT EXISTS idx_patrol_pins_created ON patrol_pins(created_at)');
     await client.query(`
       CREATE TABLE IF NOT EXISTS patrol_pin_photos (
@@ -872,27 +891,198 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
     });
   });
 
-  // One pin with short-lived photo links. An officer sees only their own pins;
-  // every other Operations role sees all of them.
-  router.get('/pins/:id', auth, allow(ROUTE_VIEW_ROLES), async (req, res) => {
+  // ── Pin lists, detail, review, tickets ──────────────────
+  const PIN_LIST_SQL = `
+    SELECT pp.id, pp.patrol_id, pp.created_at, pp.lat, pp.lon, pp.name, pp.location_note, pp.observation_label,
+           pp.status, pp.off_route, pp.distance_to_route_m, pp.nearest_route_name, pp.nearest_route_area,
+           pp.review_status, pp.reviewed_at, pp.review_comment, pp.ticket_status, pp.ticket_opened_at, pp.ticket_closed_at,
+           u.full_name AS officer_name, rv.full_name AS reviewed_by_name,
+           (SELECT COUNT(*)::int FROM patrol_pin_photos ph WHERE ph.pin_id = pp.id) AS photos,
+           (SELECT e.detail->>'comment' FROM patrol_pin_events e
+             WHERE e.pin_id = pp.id AND e.detail ? 'comment' ORDER BY e.created_at DESC LIMIT 1) AS last_comment,
+           (SELECT e.created_at FROM patrol_pin_events e WHERE e.pin_id = pp.id ORDER BY e.created_at DESC LIMIT 1) AS last_activity_at
+    FROM patrol_pins pp
+    JOIN users u ON u.id = pp.officer_id
+    LEFT JOIN users rv ON rv.id = pp.reviewed_by`;
+  // Critical first, then Medium, then Normal; newest first within each.
+  const STATUS_ORDER = `CASE pp.status WHEN 'critical' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END`;
+
+  // view: awaiting | reviewed | all. Officers see only their own pins.
+  router.get('/pins', auth, allow([...PIN_LIST_ROLES, 'patrol_officer']), async (req, res) => {
     try {
-      const { rows: [pin] } = await pool.query(`
-        SELECT pp.*, u.full_name AS officer_name FROM patrol_pins pp JOIN users u ON u.id = pp.officer_id WHERE pp.id=$1`, [req.params.id]);
-      if (!pin) return res.status(404).json({ error: 'Pin not found.' });
-      if (patrolRoleOf(req.user) === 'patrol_officer' && pin.officer_id !== req.user.id) return res.status(403).json({ error: 'Not authorized' });
-      const { rows: photos } = await pool.query(
-        'SELECT id, position, r2_key, thumb_key, captured_at, removed_at FROM patrol_pin_photos WHERE pin_id=$1 ORDER BY position', [pin.id]);
-      const sign = (key) => key && R2_READY ? getSignedUrl(r2, new GetObjectCommand({ Bucket: PATROL_R2_BUCKET, Key: key }), { expiresIn: 600 }) : null;
-      res.json({
-        ...pin,
-        photos: await Promise.all(photos.map(async ph => ({
-          id: ph.id, position: ph.position, captured_at: ph.captured_at, removed_at: ph.removed_at,
-          url: ph.removed_at ? null : await sign(ph.r2_key),
-          thumb_url: ph.removed_at ? null : await sign(ph.thumb_key || ph.r2_key),
-        }))),
-      });
+      const where = [], params = [];
+      const add = (sql, v) => { params.push(v); where.push(sql.replace('?', `$${params.length}`)); };
+      if (patrolRoleOf(req.user) === 'patrol_officer') add('pp.officer_id = ?', req.user.id);
+      if (req.query.view === 'awaiting') where.push("pp.review_status = 'awaiting_review'");
+      if (req.query.view === 'reviewed') where.push("pp.review_status <> 'awaiting_review'");
+      if (PIN_STATUSES.includes(req.query.status)) add('pp.status = ?', req.query.status);
+      if (req.query.patrol_id) add('pp.patrol_id = ?', req.query.patrol_id);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(req.query.from || '')) add("(pp.created_at AT TIME ZONE 'Africa/Nairobi')::date >= ?::date", req.query.from);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(req.query.to || '')) add("(pp.created_at AT TIME ZONE 'Africa/Nairobi')::date <= ?::date", req.query.to);
+      const q = String(req.query.q || '').trim();
+      if (q) add("(pp.name ILIKE ? OR pp.observation_label ILIKE $X OR u.full_name ILIKE $X OR pp.nearest_route_name ILIKE $X)".replace(/\$X/g, `$${params.length + 1}`), `%${q}%`);
+      const limit = Math.min(Math.max(parseInt(req.query.limit) || 200, 1), 500);
+      const { rows } = await pool.query(
+        `${PIN_LIST_SQL} ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+         ORDER BY ${req.query.view === 'awaiting' ? STATUS_ORDER + ',' : ''} pp.created_at DESC LIMIT ${limit}`, params);
+      res.json(rows);
     } catch (e) { sendError(res, e); }
   });
+
+  // Patrols that still have pins awaiting review, with counts by status, for
+  // the "Confirm all Normal" buttons.
+  router.get('/review/patrols', auth, allow(REVIEW_ROLES), async (req, res) => {
+    try {
+      const { rows } = await pool.query(`
+        SELECT p.id, p.started_at, p.ended_at, u.full_name AS officer_name,
+               COUNT(*) FILTER (WHERE pp.status = 'critical')::int AS critical,
+               COUNT(*) FILTER (WHERE pp.status = 'medium')::int AS medium,
+               COUNT(*) FILTER (WHERE pp.status = 'normal')::int AS normal
+        FROM patrols p
+        JOIN users u ON u.id = p.officer_id
+        JOIN patrol_pins pp ON pp.patrol_id = p.id AND pp.review_status = 'awaiting_review'
+        GROUP BY p.id, u.full_name
+        ORDER BY p.started_at DESC`);
+      res.json(rows);
+    } catch (e) { sendError(res, e); }
+  });
+
+  const pinDetail = async (pinId, user) => {
+    const { rows: [pin] } = await pool.query(`
+      SELECT pp.*, u.full_name AS officer_name, rv.full_name AS reviewed_by_name, cl.full_name AS ticket_closed_by_name
+      FROM patrol_pins pp
+      JOIN users u ON u.id = pp.officer_id
+      LEFT JOIN users rv ON rv.id = pp.reviewed_by
+      LEFT JOIN users cl ON cl.id = pp.ticket_closed_by
+      WHERE pp.id=$1`, [pinId]);
+    if (!pin) return null;
+    const { rows: photos } = await pool.query(
+      'SELECT id, position, r2_key, thumb_key, captured_at, removed_at FROM patrol_pin_photos WHERE pin_id=$1 ORDER BY position', [pin.id]);
+    const { rows: events } = await pool.query(`
+      SELECT e.id, e.action, e.detail, e.created_at, u.full_name AS user_name
+      FROM patrol_pin_events e LEFT JOIN users u ON u.id = e.user_id
+      WHERE e.pin_id=$1 ORDER BY e.created_at, e.id`, [pin.id]);
+    const sign = (key) => key && R2_READY ? getSignedUrl(r2, new GetObjectCommand({ Bucket: PATROL_R2_BUCKET, Key: key }), { expiresIn: 600 }) : null;
+    const role = patrolRoleOf(user);
+    return {
+      ...pin,
+      photos: await Promise.all(photos.map(async ph => ({
+        id: ph.id, position: ph.position, captured_at: ph.captured_at, removed_at: ph.removed_at,
+        url: ph.removed_at ? null : await sign(ph.r2_key),
+        thumb_url: ph.removed_at ? null : await sign(ph.thumb_key || ph.r2_key),
+      }))),
+      events,
+      // What this person may do with the pin right now, so the screen only
+      // offers buttons the server will accept.
+      can: {
+        review: REVIEW_ROLES.includes(role) && pin.review_status !== 'action_needed',
+        comment: TICKET_COMMENT_ROLES.includes(role) && pin.ticket_status === 'open',
+        close: TICKET_CLOSE_ROLES.includes(role) && pin.ticket_status === 'open',
+        reopen: TICKET_REOPEN_ROLES.includes(role) && pin.ticket_status === 'closed',
+      },
+    };
+  };
+
+  // One pin with photos and its full history. An officer sees only their own.
+  router.get('/pins/:id', auth, allow(ROUTE_VIEW_ROLES), async (req, res) => {
+    try {
+      const pin = await pinDetail(req.params.id, req.user);
+      if (!pin) return res.status(404).json({ error: 'Pin not found.' });
+      if (patrolRoleOf(req.user) === 'patrol_officer' && pin.officer_id !== req.user.id) return res.status(403).json({ error: 'Not authorized' });
+      res.json(pin);
+    } catch (e) { sendError(res, e); }
+  });
+
+  const commentOf = (req) => String(req.body?.comment || '').trim().slice(0, COMMENT_MAX);
+  const event = (db, pinId, userId, action, detail) =>
+    db.query('INSERT INTO patrol_pin_events (pin_id, user_id, action, detail) VALUES ($1,$2,$3,$4)', [pinId, userId, action, JSON.stringify(detail || {})]);
+
+  // Review: No action or Action needed. Any supervisor; a pin already
+  // decided "No action" can be changed to "Action needed" later. Action
+  // needed opens a ticket, which from then on is closed or reopened instead.
+  router.post('/pins/:id/review', auth, allow(REVIEW_ROLES), async (req, res) => {
+    const decision = req.body?.decision;
+    if (!['no_action', 'action_needed'].includes(decision)) return res.status(400).json({ error: 'Choose No action or Action needed.' });
+    const comment = commentOf(req);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows: [pin] } = await client.query('SELECT id, review_status FROM patrol_pins WHERE id=$1 FOR UPDATE', [req.params.id]);
+      if (!pin) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Pin not found.' }); }
+      if (pin.review_status === 'action_needed') { await client.query('ROLLBACK'); return res.status(400).json({ error: 'This pin already has a ticket. Close or reopen the ticket instead.' }); }
+      if (pin.review_status === decision) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'That is already the decision on this pin.' }); }
+      const changed = pin.review_status !== 'awaiting_review';
+      await client.query(
+        `UPDATE patrol_pins SET review_status=$1, reviewed_by=$2, reviewed_at=NOW(), review_comment=$3
+           ${decision === 'action_needed' ? ", ticket_status='open', ticket_opened_at=NOW(), ticket_closed_at=NULL, ticket_closed_by=NULL" : ''}
+         WHERE id=$4`, [decision, req.user.id, comment || null, pin.id]);
+      await event(client, pin.id, req.user.id, changed ? 'decision_changed' : 'reviewed',
+        { decision, ...(changed ? { from: pin.review_status } : {}), ...(comment ? { comment } : {}) });
+      if (decision === 'action_needed') await event(client, pin.id, req.user.id, 'ticket_opened', {});
+      await client.query('COMMIT');
+      res.json(await pinDetail(pin.id, req.user));
+    } catch (e) { await client.query('ROLLBACK').catch(() => {}); sendError(res, e); }
+    finally { client.release(); }
+  });
+
+  // Confirm every Normal pin still awaiting review on one patrol as No action.
+  router.post('/patrols/:id/confirm-normal', auth, allow(REVIEW_ROLES), async (req, res) => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(`
+        UPDATE patrol_pins SET review_status='no_action', reviewed_by=$1, reviewed_at=NOW(), review_comment=NULL
+        WHERE patrol_id=$2 AND status='normal' AND review_status='awaiting_review' RETURNING id`, [req.user.id, req.params.id]);
+      for (const r of rows) await event(client, r.id, req.user.id, 'reviewed', { decision: 'no_action', bulk: true });
+      await client.query('COMMIT');
+      res.json({ confirmed: rows.length });
+    } catch (e) { await client.query('ROLLBACK').catch(() => {}); sendError(res, e); }
+    finally { client.release(); }
+  });
+
+  // ── Tickets ──
+  router.get('/tickets', auth, allow(TICKET_VIEW_ROLES), async (req, res) => {
+    try {
+      const state = ['open', 'closed'].includes(req.query.state) ? req.query.state : null;
+      const { rows } = await pool.query(
+        `${PIN_LIST_SQL} WHERE pp.ticket_status ${state ? '= $1' : 'IS NOT NULL'}
+         ORDER BY ${state === 'closed' ? 'pp.ticket_closed_at DESC' : STATUS_ORDER + ', pp.ticket_opened_at'} LIMIT 500`,
+        state ? [state] : []);
+      res.json(rows);
+    } catch (e) { sendError(res, e); }
+  });
+
+  const ticketStep = (roles, needState, apply) => [auth, allow(roles), async (req, res) => {
+    const comment = commentOf(req);
+    if (!comment) return res.status(400).json({ error: 'Write a comment.' });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows: [pin] } = await client.query('SELECT id, ticket_status FROM patrol_pins WHERE id=$1 FOR UPDATE', [req.params.id]);
+      if (!pin) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Pin not found.' }); }
+      if (pin.ticket_status !== needState) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: needState === 'open' ? 'This ticket is not open.' : 'This ticket is not closed.' });
+      }
+      await apply(client, pin.id, req.user.id, comment);
+      await client.query('COMMIT');
+      res.json(await pinDetail(pin.id, req.user));
+    } catch (e) { await client.query('ROLLBACK').catch(() => {}); sendError(res, e); }
+    finally { client.release(); }
+  }];
+
+  router.post('/pins/:id/ticket/comment', ...ticketStep(TICKET_COMMENT_ROLES, 'open',
+    (db, id, uid, comment) => event(db, id, uid, 'ticket_comment', { comment })));
+
+  router.post('/pins/:id/ticket/close', ...ticketStep(TICKET_CLOSE_ROLES, 'open', async (db, id, uid, comment) => {
+    await db.query("UPDATE patrol_pins SET ticket_status='closed', ticket_closed_at=NOW(), ticket_closed_by=$1 WHERE id=$2", [uid, id]);
+    await event(db, id, uid, 'ticket_closed', { comment });
+  }));
+
+  router.post('/pins/:id/ticket/reopen', ...ticketStep(TICKET_REOPEN_ROLES, 'closed', async (db, id, uid, comment) => {
+    await db.query("UPDATE patrol_pins SET ticket_status='open', ticket_closed_at=NULL, ticket_closed_by=NULL WHERE id=$1", [id]);
+    await event(db, id, uid, 'ticket_reopened', { comment });
+  }));
 
   // ── Photo retention ───────────────────────────────────────
   // Daily: photos older than PHOTO_RETENTION_DAYS are deleted from storage and

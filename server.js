@@ -1189,6 +1189,9 @@ const patrol = require('./modules/patrol')({
   mailSignoff: () => MAIL_SIGNOFF,
 });
 app.use('/api/patrol', patrol.router);
+// Positions from the Traccar Client app on officers' phones (no sign-in;
+// the private device id identifies the officer).
+app.use('/api/tracker', patrol.trackerRouter);
 app.use('/api/mobile-line-requests', mobileLines.lineRequests);
 // The product-change workflow (change requests, operator email batches,
 // implementation confirmation) is retired: product changes are now made

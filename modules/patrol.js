@@ -40,6 +40,11 @@ const SETTING_DEFS = {
   // 'test' = every patrol email goes to email_test_to only; 'live' = to the real people.
   email_mode: { def: 'test', type: 'enum', values: ['test', 'live'] },
   email_test_to: { def: 'e.maged@outlook.com', type: 'email' },
+  // Tracker (Traccar Client on the phone).
+  tracker_delayed_min: { def: 2, type: 'int', min: 1, max: 60, unit: 'min' },
+  tracker_lost_min: { def: 10, type: 'int', min: 2, max: 120, unit: 'min' },
+  tracker_required_to_start: { def: 'on', type: 'enum', values: ['on', 'off'] },
+  tracker_alert: { def: 'on', type: 'enum', values: ['on', 'off'] },
 };
 const validSetting = (key, v) => {
   const d = SETTING_DEFS[key];
@@ -64,6 +69,7 @@ const TICKET_COMMENT_ROLES = ['admin', 'field_supervisor', 'pm_coordinator'];
 const TICKET_CLOSE_ROLES = ['admin', 'pm_coordinator'];
 const TICKET_REOPEN_ROLES = ['admin', 'field_supervisor', 'pm_coordinator'];
 const COMMENT_MAX = 1000;
+const DASH_LIVE_ROLES = ['admin', 'field_supervisor', 'pm_coordinator', 'planner', 'director'];
 // Who is told about pins and tickets (agreed: supervisors, PM Coordinators
 // and the Director all get the same notifications), plus admins.
 const NOTIFY_ROLES = ['field_supervisor', 'pm_coordinator', 'director'];
@@ -434,6 +440,43 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
     await loadSettings(client);
+
+    // ── Tracker ──
+    // Each officer's phone runs Traccar Client with a private device id that
+    // OneHub issues; the id is the only credential the app sends, so it is long
+    // and random. Positions are kept only while that officer has a patrol
+    // running; outside one, only "last seen" is updated.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS patrol_devices (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+        device_key VARCHAR(64) NOT NULL UNIQUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_seen_at TIMESTAMPTZ,
+        last_lat DOUBLE PRECISION,
+        last_lon DOUBLE PRECISION,
+        last_accuracy_m REAL,
+        last_battery REAL,
+        last_charging BOOLEAN
+      )`);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS patrol_positions (
+        id BIGSERIAL PRIMARY KEY,
+        patrol_id UUID NOT NULL REFERENCES patrols(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id),
+        recorded_at TIMESTAMPTZ NOT NULL,
+        received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        lat DOUBLE PRECISION NOT NULL,
+        lon DOUBLE PRECISION NOT NULL,
+        accuracy_m REAL,
+        speed_kmh REAL,
+        battery REAL
+      )`);
+    await client.query('CREATE INDEX IF NOT EXISTS idx_patrol_positions_patrol ON patrol_positions(patrol_id, recorded_at)');
+    // One "tracker stopped" alert per silence, cleared when positions resume.
+    await client.query('ALTER TABLE patrols ADD COLUMN IF NOT EXISTS tracker_alerted_at TIMESTAMPTZ');
+    // A pin dropped while the tracker had gone quiet.
+    await client.query('ALTER TABLE patrol_pins ADD COLUMN IF NOT EXISTS tracker_silent BOOLEAN NOT NULL DEFAULT FALSE');
 
     // In-app notifications (the bell in OneHub Operations).
     await client.query(`
@@ -839,6 +882,8 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
       const cycles = await cycleRows();
       res.json({
         patrol: run ? await patrolSummary(run.id) : null,
+        tracker: await trackerStatus(req.user.id),
+        tracker_required: S.tracker_required_to_start === 'on',
         current_cycle_id: currentCycleId(cycles),
         rules: { pin_max_from_officer_m: S.pin_max_from_officer_m, pin_off_route_m: S.pin_off_route_m, photos_min: S.photos_min, photos_max: S.photos_max },
         photo_storage: R2_READY,
@@ -852,6 +897,14 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
       if (!cycleId) return res.status(400).json({ error: 'No patrol cycle has started yet. A Planner needs to start one on Routes.' });
       const { rows: [run] } = await pool.query('SELECT id FROM patrols WHERE officer_id=$1 AND ended_at IS NULL', [req.user.id]);
       if (run) return res.json(await patrolSummary(run.id)); // already running: carry on with it
+      if (S.tracker_required_to_start === 'on') {
+        const t = await trackerStatus(req.user.id);
+        if (t.state !== 'tracking') {
+          return res.status(400).json({ error: t.state === 'not_set_up'
+            ? 'Set up the tracker app first: tap "Set up the tracker" below.'
+            : `Turn on the tracker app first. Its last position was ${t.last_seen_at ? 'more than ' + S.tracker_delayed_min + ' minutes ago' : 'never received'}.`, tracker: t });
+        }
+      }
       const { rows: [p] } = await pool.query('INSERT INTO patrols (officer_id, cycle_id) VALUES ($1,$2) RETURNING id', [req.user.id, cycleId]);
       res.status(201).json(await patrolSummary(p.id));
     } catch (e) {
@@ -933,6 +986,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
         if (!type) return res.status(400).json({ error: 'Pick an observation type.' });
 
         const { link: nearest, site: nearestSite } = await nearestTo(patrol.cycle_id, [lon, lat]);
+        const trackerSilent = (await trackerStatus(req.user.id)).state === 'lost';
         const offRoute = !nearest || nearest.d > S.pin_off_route_m;
 
         const client = await pool.connect();
@@ -941,12 +995,12 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
           const { rows: [pin] } = await client.query(`
             INSERT INTO patrol_pins (patrol_id, cycle_id, officer_id, lat, lon, officer_lat, officer_lon, gps_accuracy_m,
               distance_from_officer_m, distance_to_route_m, nearest_route_name, nearest_route_area, off_route,
-              name, location_note, observation_type_id, observation_label, status, nearest_site_name, nearest_site_distance_m)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING id, created_at`,
+              name, location_note, observation_type_id, observation_label, status, nearest_site_name, nearest_site_distance_m, tracker_silent)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21) RETURNING id, created_at`,
             [patrol.id, patrol.cycle_id, req.user.id, lat, lon, oLat, oLon, Number.isFinite(num(b.accuracy)) ? num(b.accuracy) : null,
              Math.round(fromOfficer * 10) / 10, nearest ? Math.round(nearest.d * 10) / 10 : null, nearest?.name || null, nearest?.area || null, offRoute,
              name, cleanLabel(b.location_note, 500) || null, type.id, type.label, status,
-             nearestSite?.name || null, nearestSite ? Math.round(nearestSite.d) : null]);
+             nearestSite?.name || null, nearestSite ? Math.round(nearestSite.d) : null, trackerSilent]);
 
           // Readable folders, like the training certificates:
           //   photos/2026-10/19/Patrol Test/14-20 Shell Petrol Station (7776)/1.jpg
@@ -1001,6 +1055,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
     SELECT pp.id, pp.patrol_id, pp.created_at, pp.lat, pp.lon, pp.name, pp.location_note, pp.observation_label,
            pp.status, pp.off_route, pp.distance_to_route_m, pp.nearest_route_name, pp.nearest_route_area,
            pp.nearest_site_name, pp.nearest_site_distance_m,
+           pp.tracker_silent,
            pp.review_status, pp.reviewed_at, pp.review_comment, pp.ticket_status, pp.ticket_opened_at, pp.ticket_closed_at,
            u.full_name AS officer_name, rv.full_name AS reviewed_by_name,
            (SELECT COUNT(*)::int FROM patrol_pin_photos ph WHERE ph.pin_id = pp.id) AS photos,
@@ -1194,6 +1249,171 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
     await db.query("UPDATE patrol_pins SET ticket_status='open', ticket_closed_at=NULL, ticket_closed_by=NULL WHERE id=$1", [id]);
     await event(db, id, uid, 'ticket_reopened', { comment });
   }, 'ticket_reopened'));
+
+  // ── Tracker ───────────────────────────────────────────────
+  const TRACKER_URL = `${process.env.PUBLIC_API_URL || 'https://esat-backend-drwm.onrender.com'}/api/tracker`;
+  const newKey = () => require('crypto').randomBytes(18).toString('base64').replace(/[+/=]/g, '').slice(0, 20).toUpperCase();
+
+  // tracking | delayed | lost | not_set_up, from how long ago the phone last
+  // reported, against the two limits in Settings.
+  const trackerStatus = async (userId) => {
+    const { rows: [d] } = await pool.query('SELECT device_key, last_seen_at, last_battery, last_charging, last_accuracy_m FROM patrol_devices WHERE user_id=$1', [userId]);
+    if (!d) return { state: 'not_set_up' };
+    const ageMin = d.last_seen_at ? (Date.now() - new Date(d.last_seen_at).getTime()) / 60000 : Infinity;
+    const state = ageMin <= S.tracker_delayed_min ? 'tracking' : ageMin <= S.tracker_lost_min ? 'delayed' : 'lost';
+    return { state, last_seen_at: d.last_seen_at, battery: d.last_battery, charging: d.last_charging, accuracy_m: d.last_accuracy_m,
+             age_min: Number.isFinite(ageMin) ? Math.round(ageMin * 10) / 10 : null };
+  };
+
+  // The officer's own setup details for the Traccar Client app. Creates the
+  // device id the first time; "new" issues a fresh one (an old phone stops).
+  router.get('/tracker/me', auth, allow(PATROL_ROLES), async (req, res) => {
+    try {
+      let { rows: [d] } = await pool.query('SELECT device_key FROM patrol_devices WHERE user_id=$1', [req.user.id]);
+      if (!d) ({ rows: [d] } = await pool.query('INSERT INTO patrol_devices (user_id, device_key) VALUES ($1,$2) RETURNING device_key', [req.user.id, newKey()]));
+      res.json({ device_id: d.device_key, server_url: TRACKER_URL, status: await trackerStatus(req.user.id), interval_s: 30 });
+    } catch (e) { sendError(res, e); }
+  });
+  router.post('/tracker/me/new', auth, allow(PATROL_ROLES), async (req, res) => {
+    try {
+      const key = newKey();
+      await pool.query(`INSERT INTO patrol_devices (user_id, device_key) VALUES ($1,$2)
+        ON CONFLICT (user_id) DO UPDATE SET device_key=EXCLUDED.device_key, last_seen_at=NULL`, [req.user.id, key]);
+      res.json({ device_id: key, server_url: TRACKER_URL });
+    } catch (e) { sendError(res, e); }
+  });
+
+  // Positions arrive here from Traccar Client, without a OneHub sign-in:
+  // the device id identifies the officer. Both formats the app uses are read:
+  // the classic one (query or form fields: id, lat, lon, timestamp, accuracy,
+  // speed in knots, batt) and the newer JSON one ({ device_id, location: {
+  // timestamp, coords: {...}, battery: {...} } }).
+  const trackerRouter = express.Router();
+  trackerRouter.use(express.urlencoded({ extended: false, limit: '64kb' }));
+  const lastHit = new Map(); // device id → ms of the last accepted report
+  const ipHits = new Map();  // ip → [window start ms, count]
+  const readReport = (req) => {
+    const q = { ...req.query, ...(typeof req.body === 'object' ? req.body : {}) };
+    const loc = q.location && typeof q.location === 'object' ? (Array.isArray(q.location) ? q.location[q.location.length - 1] : q.location) : null;
+    if (loc) {
+      const c = loc.coords || {};
+      return {
+        id: String(q.device_id || q.id || ''),
+        lat: Number(c.latitude), lon: Number(c.longitude), accuracy: Number(c.accuracy),
+        speedKmh: Number.isFinite(Number(c.speed)) && Number(c.speed) >= 0 ? Number(c.speed) * 3.6 : null,
+        at: loc.timestamp ? new Date(loc.timestamp) : new Date(),
+        battery: loc.battery && Number.isFinite(Number(loc.battery.level)) ? Number(loc.battery.level) * (Number(loc.battery.level) <= 1 ? 100 : 1) : null,
+        charging: loc.battery ? !!loc.battery.is_charging : null,
+      };
+    }
+    const ts = q.timestamp;
+    const at = ts == null ? new Date() : /^\d+$/.test(String(ts)) ? new Date(Number(ts) * (String(ts).length > 11 ? 1 : 1000)) : new Date(ts);
+    return {
+      id: String(q.id || q.deviceid || ''),
+      lat: Number(q.lat), lon: Number(q.lon), accuracy: Number(q.accuracy),
+      speedKmh: Number.isFinite(Number(q.speed)) ? Number(q.speed) * 1.852 : null, // knots
+      at, battery: Number.isFinite(Number(q.batt)) ? Number(q.batt) : null,
+      charging: q.charge != null ? String(q.charge) === 'true' : null,
+    };
+  };
+  const handleReport = async (req, res) => {
+    try {
+      // Light rate limit per address, since this endpoint has no sign-in.
+      const ip = req.ip || 'x', nowMs = Date.now();
+      const w = ipHits.get(ip);
+      if (!w || nowMs - w[0] > 60000) ipHits.set(ip, [nowMs, 1]);
+      else if (++w[1] > 240) return res.status(429).end();
+
+      const r = readReport(req);
+      if (!/^[A-Z0-9]{12,64}$/.test(r.id)) return res.status(400).end();
+      if (!Number.isFinite(r.lat) || !Number.isFinite(r.lon) || Math.abs(r.lat) > 90 || Math.abs(r.lon) > 180) return res.status(400).end();
+      const { rows: [dev] } = await pool.query('SELECT user_id FROM patrol_devices WHERE device_key=$1', [r.id]);
+      if (!dev) return res.status(404).end();
+      // A phone flushing its buffer can send many at once; keep one every 5 s.
+      if (nowMs - (lastHit.get(r.id) || 0) < 5000) return res.status(200).end();
+      lastHit.set(r.id, nowMs);
+      let at = isNaN(r.at.getTime()) ? new Date() : r.at;
+      if (at.getTime() > nowMs + 5 * 60000) at = new Date(); // clock ahead: use arrival time
+
+      await pool.query(`UPDATE patrol_devices SET last_seen_at=GREATEST(COALESCE(last_seen_at, $1), $1), last_lat=$2, last_lon=$3,
+          last_accuracy_m=$4, last_battery=COALESCE($5, last_battery), last_charging=COALESCE($6, last_charging) WHERE device_key=$7`,
+        [at, r.lat, r.lon, Number.isFinite(r.accuracy) ? r.accuracy : null, r.battery, r.charging, r.id]);
+      const { rows: [run] } = await pool.query('SELECT id FROM patrols WHERE officer_id=$1 AND ended_at IS NULL', [dev.user_id]);
+      if (run) {
+        await pool.query(`INSERT INTO patrol_positions (patrol_id, user_id, recorded_at, lat, lon, accuracy_m, speed_kmh, battery)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+          [run.id, dev.user_id, at, r.lat, r.lon, Number.isFinite(r.accuracy) ? r.accuracy : null, r.speedKmh, r.battery]);
+        await pool.query('UPDATE patrols SET tracker_alerted_at=NULL WHERE id=$1 AND tracker_alerted_at IS NOT NULL', [run.id]);
+      }
+      res.status(200).end();
+    } catch (e) { console.error('Tracker report failed:', e.message); res.status(500).end(); }
+  };
+  trackerRouter.get('/', handleReport);
+  trackerRouter.post('/', handleReport);
+
+  // Running patrols with each officer's tracker state, for the Live Map.
+  router.get('/live', auth, allow(DASH_LIVE_ROLES), async (req, res) => {
+    try {
+      const { rows } = await pool.query(`
+        SELECT p.id, p.started_at, u.id AS officer_id, u.full_name AS officer_name,
+               d.last_seen_at, d.last_lat, d.last_lon, d.last_battery, d.last_charging,
+               (SELECT COUNT(*)::int FROM patrol_pins pp WHERE pp.patrol_id = p.id) AS pins
+        FROM patrols p JOIN users u ON u.id = p.officer_id
+        LEFT JOIN patrol_devices d ON d.user_id = p.officer_id
+        WHERE p.ended_at IS NULL ORDER BY u.full_name`);
+      res.json({
+        delayed_min: S.tracker_delayed_min, lost_min: S.tracker_lost_min,
+        patrols: rows.map(r => {
+          const age = r.last_seen_at ? (Date.now() - new Date(r.last_seen_at).getTime()) / 60000 : Infinity;
+          return { ...r, tracker: !r.last_seen_at ? 'not_set_up' : age <= S.tracker_delayed_min ? 'tracking' : age <= S.tracker_lost_min ? 'delayed' : 'lost' };
+        }),
+      });
+    } catch (e) { sendError(res, e); }
+  });
+
+  // One patrol's path: positions in order, with the gaps longer than the
+  // "lost" limit marked so the map can draw them dashed.
+  router.get('/patrols/:id/path', auth, allow(ROUTE_VIEW_ROLES), async (req, res) => {
+    try {
+      const { rows: [p] } = await pool.query(`
+        SELECT p.id, p.officer_id, p.started_at, p.ended_at, p.end_reason, u.full_name AS officer_name
+        FROM patrols p JOIN users u ON u.id = p.officer_id WHERE p.id=$1`, [req.params.id]);
+      if (!p) return res.status(404).json({ error: 'Patrol not found.' });
+      if (patrolRoleOf(req.user) === 'patrol_officer' && p.officer_id !== req.user.id) return res.status(403).json({ error: 'Not authorized' });
+      const { rows: pts } = await pool.query(
+        'SELECT recorded_at, lat, lon, accuracy_m, speed_kmh FROM patrol_positions WHERE patrol_id=$1 ORDER BY recorded_at LIMIT 20000', [p.id]);
+      let km = 0, gaps = 0;
+      for (let i = 1; i < pts.length; i++) {
+        const gapMin = (new Date(pts[i].recorded_at) - new Date(pts[i - 1].recorded_at)) / 60000;
+        if (gapMin > S.tracker_lost_min) { pts[i].gap_before = true; gaps++; }
+        else km += haversineM([pts[i - 1].lon, pts[i - 1].lat], [pts[i].lon, pts[i].lat]) / 1000;
+      }
+      res.json({ ...p, positions: pts, km: Math.round(km * 10) / 10, gaps, lost_min: S.tracker_lost_min });
+    } catch (e) { sendError(res, e); }
+  });
+
+  // Every minute: a running patrol whose tracker has gone quiet for longer
+  // than the "lost" limit alerts the notified people once, until it resumes.
+  const sweepTrackers = async () => {
+    if (S.tracker_alert !== 'on') return;
+    try {
+      const { rows } = await pool.query(`
+        SELECT p.id, u.full_name, d.last_seen_at
+        FROM patrols p JOIN users u ON u.id = p.officer_id
+        JOIN patrol_devices d ON d.user_id = p.officer_id
+        WHERE p.ended_at IS NULL AND p.tracker_alerted_at IS NULL
+          AND COALESCE(d.last_seen_at, p.started_at) < NOW() - ($1 || ' minutes')::interval
+          AND p.started_at < NOW() - ($1 || ' minutes')::interval`, [String(S.tracker_lost_min)]);
+      if (!rows.length) return;
+      const people = await recipients();
+      for (const r of rows) {
+        await pool.query('UPDATE patrols SET tracker_alerted_at=NOW() WHERE id=$1', [r.id]);
+        const since = r.last_seen_at ? eatTime(r.last_seen_at).slice(-5) : 'the start of the patrol';
+        await notifyInApp(people, null, 'tracker_lost', `${r.full_name}'s tracker stopped`, `No position since ${since}. The patrol is still running.`);
+      }
+    } catch (e) { console.error('Tracker sweep failed:', e.message); }
+  };
+  setInterval(sweepTrackers, 60 * 1000);
 
   // ── Notifications ─────────────────────────────────────────
   const STATUS_WORD = { critical: 'Critical', medium: 'Medium', normal: 'Normal' };
@@ -1560,7 +1780,9 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
   // A patrol ended automatically is given its last activity as the end time
   // (its last pin, or its start), not the moment the sweep noticed, so its
   // length is not inflated by the hours it sat forgotten.
-  const LAST_ACTIVITY_SQL = `GREATEST(p.started_at, COALESCE((SELECT MAX(pp.created_at) FROM patrol_pins pp WHERE pp.patrol_id = p.id), p.started_at))`;
+  const LAST_ACTIVITY_SQL = `GREATEST(p.started_at,
+    COALESCE((SELECT MAX(pp.created_at) FROM patrol_pins pp WHERE pp.patrol_id = p.id), p.started_at),
+    COALESCE((SELECT MAX(pos.recorded_at) FROM patrol_positions pos WHERE pos.patrol_id = p.id), p.started_at))`;
   const endRunningPatrols = async (reason, extraWhere = 'TRUE') => {
     const { rowCount } = await pool.query(`
       UPDATE patrols p SET ended_at = ${LAST_ACTIVITY_SQL}, end_reason = $1
@@ -1609,5 +1831,5 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
   const msToNext = () => { const n = new Date(); const t = new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate() + 1)); return t - n; };
   setTimeout(() => { sweepOldPhotos(); setInterval(sweepOldPhotos, 24 * 3600 * 1000); }, msToNext());
 
-  return { router, setup, endPatrolsOnRestart, _internals: { readKmz, kmlToFeatures, distanceToLineM, validSetting } };
+  return { router, trackerRouter, setup, endPatrolsOnRestart, _internals: { readKmz, kmlToFeatures, distanceToLineM, validSetting } };
 };

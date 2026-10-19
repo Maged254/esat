@@ -140,7 +140,6 @@ async function readKmz(buffer) {
 }
 
 // ── Dates ─────────────────────────────────────────────────────
-const isDateStr = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || '')) && !isNaN(Date.parse(s));
 // Calendar arithmetic on YYYY-MM-DD in UTC so no timezone shifts a day.
 const dayBefore = (ymd) => {
   const d = new Date(`${ymd}T00:00:00Z`);
@@ -274,9 +273,10 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
   // A cycle runs until the next one is started. Starting one closes the cycle
   // before it on the day before, so cycles never overlap and every date
   // belongs to exactly one.
+  // The start date is always today (East Africa time). It is not taken from
+  // the request: nobody may back-date or pre-date a cycle.
   router.post('/cycles', auth, allow(ROUTE_EDIT_ROLES), async (req, res) => {
-    const starts = req.body?.starts_on;
-    if (!isDateStr(starts)) return res.status(400).json({ error: 'Pick a start date.' });
+    const starts = todayEAT();
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -285,7 +285,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
       const latest = cycles[0];
       if (latest && starts <= latest.starts_on) {
         await client.query('ROLLBACK');
-        return res.status(400).json({ error: `A new cycle has to start after the latest one (${latest.name}, from ${latest.starts_on}).` });
+        return res.status(400).json({ error: `${latest.name} already started today. A new cycle can be started from tomorrow.` });
       }
       if (latest) {
         await client.query('UPDATE patrol_cycles SET ends_on = $1 WHERE id = $2', [dayBefore(starts), latest.id]);

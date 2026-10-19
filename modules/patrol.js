@@ -17,6 +17,14 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const ROUTE_EDIT_ROLES = ['admin', 'planner'];
 const ROUTE_VIEW_ROLES = ['admin', 'patrol_officer', 'field_supervisor', 'pm_coordinator', 'planner', 'director'];
 const KMZ_MAX_BYTES = 10 * 1024 * 1024;
+// Patrol rules. Settings (a later stage) makes these adjustable.
+const PATROL_ROLES = ['admin', 'patrol_officer'];
+const PIN_MAX_FROM_OFFICER_M = 50;   // a pin may sit at most this far from the officer
+const PIN_OFF_ROUTE_M = 100;         // further than this from every route line = Off route (warning only)
+const PHOTOS_MIN = 1, PHOTOS_MAX = 3;
+const PHOTO_MAX_BYTES = 4 * 1024 * 1024;
+const PHOTO_RETENTION_DAYS = 60;     // ~2 months; photos on a pin with an open ticket are kept
+const PIN_STATUSES = ['critical', 'medium', 'normal'];
 
 // ── KML reading ───────────────────────────────────────────────
 // KML is plain, regular XML. A small tokenizer is enough and avoids pulling in
@@ -82,6 +90,25 @@ const haversineM = (a, b) => {
   return 2 * R * Math.asin(Math.sqrt(h));
 };
 const lineLengthM = (pts) => pts.reduce((sum, p, i) => i ? sum + haversineM(pts[i - 1], p) : 0, 0);
+
+// Shortest distance in metres from point p to the polyline pts ([lon, lat]).
+// Projects onto a flat plane around p, which is accurate to well under a
+// metre at the few-hundred-metre distances this is used for.
+const distanceToLineM = (p, pts) => {
+  const rad = Math.PI / 180, R = 6371000;
+  const kx = Math.cos(p[1] * rad) * rad * R, ky = rad * R;
+  let best = Infinity;
+  for (let i = 1; i < pts.length; i++) {
+    const ax = (pts[i - 1][0] - p[0]) * kx, ay = (pts[i - 1][1] - p[1]) * ky;
+    const bx = (pts[i][0] - p[0]) * kx, by = (pts[i][1] - p[1]) * ky;
+    const dx = bx - ax, dy = by - ay;
+    const len2 = dx * dx + dy * dy;
+    const t = len2 ? Math.max(0, Math.min(1, -(ax * dx + ay * dy) / len2)) : 0;
+    const cx = ax + t * dx, cy = ay + t * dy;
+    best = Math.min(best, Math.sqrt(cx * cx + cy * cy));
+  }
+  return best;
+};
 
 // Walks Document/Folder/Placemark and returns one feature per geometry. A
 // Placemark holding a MultiGeometry gives several features with the same name.
@@ -164,6 +191,9 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
     credentials: { accessKeyId: process.env.PATROL_R2_ACCESS_KEY_ID, secretAccessKey: process.env.PATROL_R2_SECRET_ACCESS_KEY },
   }) : null;
 
+  // cycle id → its route lines, for the off-route check. Cleared on upload/remove.
+  const routeCache = new Map();
+
   const kmzUpload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: KMZ_MAX_BYTES },
@@ -228,6 +258,100 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
     if (n === 0) {
       await client.query(`INSERT INTO patrol_areas (name, sort_order) VALUES ('Nairobi West', 1), ('Rift', 2)`);
     }
+    // ── Patrols, pins, photos ──
+    // What an officer reports. Observation types are an admin list, like areas;
+    // a pin keeps the label it was saved with, so renaming a type later does
+    // not rewrite what an officer reported.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS patrol_observation_types (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        label VARCHAR(120) NOT NULL,
+        category VARCHAR(60),
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )`);
+    await client.query('CREATE UNIQUE INDEX IF NOT EXISTS uniq_patrol_obs_label ON patrol_observation_types (LOWER(label))');
+    const { rows: [{ nt }] } = await client.query('SELECT COUNT(*)::int AS nt FROM patrol_observation_types');
+    if (nt === 0) {
+      const seed = [
+        ['Third-party works', ['Road construction', 'General construction', 'Excavation near the route', 'Heavy machinery on the route', 'Other utility works', 'Drilling or boring', 'Tree cutting or land clearing']],
+        ['Route infrastructure', ['Exposed cable', 'Damaged or cut cable', 'Manhole or handhole damaged or open', 'Route marker missing or damaged', 'Warning sign missing or damaged', 'Cabinet or pole damaged']],
+        ['Environment', ['Flooding or standing water', 'Soil erosion or washout', 'Ground collapse', 'Fire near the route', 'Vegetation overgrowth']],
+        ['Security and public', ['Demonstrations or crowds', 'Vandalism or theft', 'Unauthorised people on the route', 'Encroachment on the right-of-way', 'Dumping or debris on the route']],
+        ['Access', ['Route blocked', 'Checkpoint not reachable']],
+        ['General', ['Route clear, no issues', 'Other']],
+      ];
+      let order = 0;
+      for (const [category, labels] of seed) {
+        for (const label of labels) {
+          await client.query('INSERT INTO patrol_observation_types (label, category, sort_order) VALUES ($1,$2,$3)', [label, category, ++order]);
+        }
+      }
+    }
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS patrols (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        officer_id UUID NOT NULL REFERENCES users(id),
+        cycle_id UUID NOT NULL REFERENCES patrol_cycles(id),
+        started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        ended_at TIMESTAMPTZ
+      )`);
+    // One running patrol per officer at a time.
+    await client.query('CREATE UNIQUE INDEX IF NOT EXISTS uniq_patrols_running ON patrols (officer_id) WHERE ended_at IS NULL');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS patrol_pins (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        patrol_id UUID NOT NULL REFERENCES patrols(id),
+        cycle_id UUID NOT NULL REFERENCES patrol_cycles(id),
+        officer_id UUID NOT NULL REFERENCES users(id),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        lat DOUBLE PRECISION NOT NULL,
+        lon DOUBLE PRECISION NOT NULL,
+        officer_lat DOUBLE PRECISION NOT NULL,
+        officer_lon DOUBLE PRECISION NOT NULL,
+        gps_accuracy_m REAL,
+        distance_from_officer_m REAL NOT NULL,
+        distance_to_route_m REAL,
+        nearest_route_name TEXT,
+        nearest_route_area VARCHAR(80),
+        off_route BOOLEAN NOT NULL DEFAULT FALSE,
+        name VARCHAR(160) NOT NULL,
+        location_note TEXT,
+        observation_type_id UUID REFERENCES patrol_observation_types(id),
+        observation_label VARCHAR(120) NOT NULL,
+        status VARCHAR(10) NOT NULL CHECK (status IN ('critical','medium','normal')),
+        review_status VARCHAR(20) NOT NULL DEFAULT 'awaiting_review',
+        ticket_status VARCHAR(10)
+      )`);
+    await client.query('CREATE INDEX IF NOT EXISTS idx_patrol_pins_patrol ON patrol_pins(patrol_id)');
+    await client.query('CREATE INDEX IF NOT EXISTS idx_patrol_pins_created ON patrol_pins(created_at)');
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS patrol_pin_photos (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        pin_id UUID NOT NULL REFERENCES patrol_pins(id) ON DELETE CASCADE,
+        position SMALLINT NOT NULL,
+        r2_key TEXT,
+        thumb_key TEXT,
+        size_bytes INTEGER,
+        captured_at TIMESTAMPTZ,
+        lat DOUBLE PRECISION,
+        lon DOUBLE PRECISION,
+        removed_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )`);
+    // Who did what to a pin, when. Append-only; review and ticket steps join
+    // it in a later stage.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS patrol_pin_events (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        pin_id UUID NOT NULL REFERENCES patrol_pins(id) ON DELETE CASCADE,
+        user_id UUID REFERENCES users(id),
+        action VARCHAR(40) NOT NULL,
+        detail JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )`);
+
     // Before the list existed the area was typed in, suggested from the file
     // name as NW / RIFT. Bring any such upload onto the listed names.
     for (const [from, to] of [['NW', 'Nairobi West'], ['RIFT', 'Rift']]) {
@@ -448,6 +572,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
           await client.query(`INSERT INTO patrol_routes (file_id, cycle_id, area, kind, name, folder, coordinates, length_m, sort_order) VALUES ${values.join(',')}`, params);
         }
         await client.query('COMMIT');
+        routeCache.delete(cycle.id);
         // The replaced file goes only once the new one is safely in.
         if (old[0]?.r2_key && R2_READY) r2.send(new DeleteObjectCommand({ Bucket: PATROL_R2_BUCKET, Key: old[0].r2_key })).catch(() => {});
 
@@ -472,6 +597,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
       if (check.error) return res.status(check.status).json({ error: check.error });
       const { rows } = await pool.query('DELETE FROM patrol_route_files WHERE id=$1 AND cycle_id=$2 RETURNING r2_key', [req.params.fileId, req.params.id]);
       if (!rows[0]) return res.status(404).json({ error: 'Area not found in this cycle.' });
+      routeCache.delete(req.params.id);
       if (rows[0].r2_key && R2_READY) r2.send(new DeleteObjectCommand({ Bucket: PATROL_R2_BUCKET, Key: rows[0].r2_key })).catch(() => {});
       res.json({ ok: true });
     } catch (e) { sendError(res, e); }
@@ -512,5 +638,280 @@ module.exports = function patrolModule({ express, pool, auth, sendError }) {
     } catch (e) { sendError(res, e); }
   });
 
-  return { router, setup, _internals: { readKmz, kmlToFeatures } };
+
+  // ── Observation types (admin-kept) ────────────────────────
+  router.get('/observation-types', auth, allow(ROUTE_VIEW_ROLES), async (req, res) => {
+    try {
+      const all = req.query.all === '1' && patrolRoleOf(req.user) === 'admin';
+      const { rows } = await pool.query(`
+        SELECT id, label, category, is_active, sort_order FROM patrol_observation_types
+        ${all ? '' : 'WHERE is_active'} ORDER BY sort_order, label`);
+      res.json(rows);
+    } catch (e) { sendError(res, e); }
+  });
+
+  const cleanLabel = (v, max) => String(v || '').replace(/\s+/g, ' ').trim().slice(0, max);
+  router.post('/observation-types', auth, allow(ADMIN), async (req, res) => {
+    const label = cleanLabel(req.body?.label, 120);
+    if (!label) return res.status(400).json({ error: 'Enter the observation type.' });
+    try {
+      const { rows } = await pool.query(
+        `INSERT INTO patrol_observation_types (label, category, sort_order)
+         VALUES ($1, $2, (SELECT COALESCE(MAX(sort_order),0)+1 FROM patrol_observation_types))
+         RETURNING id, label, category, is_active, sort_order`,
+        [label, cleanLabel(req.body?.category, 60) || null]);
+      res.status(201).json(rows[0]);
+    } catch (e) {
+      if (e.code === '23505') return res.status(409).json({ error: 'That observation type is already in the list.' });
+      sendError(res, e);
+    }
+  });
+
+  router.put('/observation-types/:id', auth, allow(ADMIN), async (req, res) => {
+    const label = cleanLabel(req.body?.label, 120);
+    if (!label) return res.status(400).json({ error: 'Enter the observation type.' });
+    try {
+      const { rows } = await pool.query(
+        `UPDATE patrol_observation_types SET label=$1, category=$2, is_active=$3 WHERE id=$4
+         RETURNING id, label, category, is_active, sort_order`,
+        [label, cleanLabel(req.body?.category, 60) || null, req.body?.is_active !== false, req.params.id]);
+      if (!rows[0]) return res.status(404).json({ error: 'Observation type not found.' });
+      res.json(rows[0]);
+    } catch (e) {
+      if (e.code === '23505') return res.status(409).json({ error: 'That observation type is already in the list.' });
+      sendError(res, e);
+    }
+  });
+
+  router.delete('/observation-types/:id', auth, allow(ADMIN), async (req, res) => {
+    try {
+      const { rows: [{ used }] } = await pool.query('SELECT COUNT(*)::int AS used FROM patrol_pins WHERE observation_type_id=$1', [req.params.id]);
+      if (used) return res.status(400).json({ error: 'Pins already use this type, so it can only be deactivated.' });
+      await pool.query('DELETE FROM patrol_observation_types WHERE id=$1', [req.params.id]);
+      res.json({ ok: true });
+    } catch (e) { sendError(res, e); }
+  });
+
+  // ── Patrols ───────────────────────────────────────────────
+  // The route lines of a cycle, kept in memory for the off-route check:
+  // ~120 lines, read once per cycle rather than on every pin.
+  const linesForCycle = async (cycleId) => {
+    if (!routeCache.has(cycleId)) {
+      const { rows } = await pool.query(
+        "SELECT name, area, coordinates FROM patrol_routes WHERE cycle_id=$1 AND kind='line'", [cycleId]);
+      routeCache.set(cycleId, rows);
+    }
+    return routeCache.get(cycleId);
+  };
+
+  const patrolSummary = async (patrolId) => {
+    const { rows: [p] } = await pool.query(`
+      SELECT p.id, p.cycle_id, p.started_at, p.ended_at, c.name AS cycle_name
+      FROM patrols p JOIN patrol_cycles c ON c.id = p.cycle_id WHERE p.id=$1`, [patrolId]);
+    if (!p) return null;
+    const { rows: pins } = await pool.query(`
+      SELECT id, created_at, lat, lon, name, location_note, observation_label, status, off_route,
+             distance_to_route_m, nearest_route_name,
+             (SELECT COUNT(*)::int FROM patrol_pin_photos ph WHERE ph.pin_id = pp.id) AS photos
+      FROM patrol_pins pp WHERE patrol_id=$1 ORDER BY created_at`, [patrolId]);
+    return { ...p, pins };
+  };
+
+  // The officer's running patrol, if any, with its pins so far.
+  router.get('/patrols/mine', auth, allow(PATROL_ROLES), async (req, res) => {
+    try {
+      const { rows: [run] } = await pool.query('SELECT id FROM patrols WHERE officer_id=$1 AND ended_at IS NULL', [req.user.id]);
+      const cycles = await cycleRows();
+      res.json({
+        patrol: run ? await patrolSummary(run.id) : null,
+        current_cycle_id: currentCycleId(cycles),
+        rules: { pin_max_from_officer_m: PIN_MAX_FROM_OFFICER_M, pin_off_route_m: PIN_OFF_ROUTE_M, photos_min: PHOTOS_MIN, photos_max: PHOTOS_MAX },
+        photo_storage: R2_READY,
+      });
+    } catch (e) { sendError(res, e); }
+  });
+
+  router.post('/patrols', auth, allow(PATROL_ROLES), async (req, res) => {
+    try {
+      const cycleId = currentCycleId(await cycleRows());
+      if (!cycleId) return res.status(400).json({ error: 'No patrol cycle has started yet. A Planner needs to start one on Routes.' });
+      const { rows: [run] } = await pool.query('SELECT id FROM patrols WHERE officer_id=$1 AND ended_at IS NULL', [req.user.id]);
+      if (run) return res.json(await patrolSummary(run.id)); // already running: carry on with it
+      const { rows: [p] } = await pool.query('INSERT INTO patrols (officer_id, cycle_id) VALUES ($1,$2) RETURNING id', [req.user.id, cycleId]);
+      res.status(201).json(await patrolSummary(p.id));
+    } catch (e) {
+      if (e.code === '23505') { // a double tap raced the first start
+        const { rows: [run] } = await pool.query('SELECT id FROM patrols WHERE officer_id=$1 AND ended_at IS NULL', [req.user.id]);
+        if (run) return res.json(await patrolSummary(run.id));
+      }
+      sendError(res, e);
+    }
+  });
+
+  router.post('/patrols/:id/end', auth, allow(PATROL_ROLES), async (req, res) => {
+    try {
+      const { rows } = await pool.query(
+        'UPDATE patrols SET ended_at=NOW() WHERE id=$1 AND officer_id=$2 AND ended_at IS NULL RETURNING id', [req.params.id, req.user.id]);
+      if (!rows[0]) return res.status(404).json({ error: 'This patrol is not running.' });
+      res.json({ ok: true });
+    } catch (e) { sendError(res, e); }
+  });
+
+  // ── Pins ──────────────────────────────────────────────────
+  // One request carries the pin and its photos: full size (photo0..2) and the
+  // matching thumbnails (thumb0..2), both made and stamped on the phone.
+  const photoUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: PHOTO_MAX_BYTES, files: PHOTOS_MAX * 2 },
+    fileFilter: (req, file, cb) => {
+      if (file.mimetype === 'image/jpeg') cb(null, true);
+      else cb(new Error('Photos must be JPEG.'));
+    },
+  }).fields([...Array(PHOTOS_MAX)].flatMap((_, i) => [{ name: `photo${i}`, maxCount: 1 }, { name: `thumb${i}`, maxCount: 1 }]));
+
+  const num = (v) => (v === '' || v == null) ? NaN : Number(v);
+  const validLatLon = (lat, lon) => Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180;
+
+  router.post('/patrols/:id/pins', auth, allow(PATROL_ROLES), (req, res) => {
+    photoUpload(req, res, async (err) => {
+      if (err) return res.status(400).json({ error: err.code === 'LIMIT_FILE_SIZE' ? 'A photo is too large.' : (err.message || 'Upload rejected') });
+      const b = req.body || {};
+      const lat = num(b.lat), lon = num(b.lon), oLat = num(b.officer_lat), oLon = num(b.officer_lon);
+      if (!validLatLon(lat, lon) || !validLatLon(oLat, oLon)) return res.status(400).json({ error: 'Your location is missing. Turn on location and try again.' });
+      const name = cleanLabel(b.name, 160);
+      if (!name) return res.status(400).json({ error: 'Give the point a name.' });
+      const status = String(b.status || '');
+      if (!PIN_STATUSES.includes(status)) return res.status(400).json({ error: 'Pick a status: Critical, Medium or Normal.' });
+
+      const files = req.files || {};
+      const photos = [...Array(PHOTOS_MAX)].map((_, i) => ({ full: files[`photo${i}`]?.[0], thumb: files[`thumb${i}`]?.[0] })).filter(x => x.full);
+      if (photos.length < PHOTOS_MIN) return res.status(400).json({ error: `Take at least ${PHOTOS_MIN} photo.` });
+      let meta = [];
+      try { meta = JSON.parse(b.photos_meta || '[]'); } catch { meta = []; }
+
+      // The pin has to sit near the officer. Both positions come from the
+      // phone; this stops a pin being dropped across town from where they stand.
+      const fromOfficer = haversineM([oLon, oLat], [lon, lat]);
+      if (fromOfficer > PIN_MAX_FROM_OFFICER_M + 1) {
+        return res.status(400).json({ error: `The pin is ${Math.round(fromOfficer)} m from you. It must be within ${PIN_MAX_FROM_OFFICER_M} m.` });
+      }
+
+      const keys = [];
+      try {
+        const { rows: [patrol] } = await pool.query(
+          'SELECT id, cycle_id FROM patrols WHERE id=$1 AND officer_id=$2 AND ended_at IS NULL', [req.params.id, req.user.id]);
+        if (!patrol) return res.status(400).json({ error: 'This patrol has ended. Start a new patrol to add pins.' });
+        if (!R2_READY) return res.status(503).json({ error: 'Photo storage is not set up yet.' });
+
+        const { rows: [type] } = await pool.query('SELECT id, label FROM patrol_observation_types WHERE id=$1 AND is_active', [b.observation_type_id || null]);
+        if (!type) return res.status(400).json({ error: 'Pick an observation type.' });
+
+        let nearest = null;
+        for (const line of await linesForCycle(patrol.cycle_id)) {
+          const d = distanceToLineM([lon, lat], line.coordinates);
+          if (!nearest || d < nearest.d) nearest = { d, name: line.name, area: line.area };
+        }
+        const offRoute = !nearest || nearest.d > PIN_OFF_ROUTE_M;
+
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          const { rows: [pin] } = await client.query(`
+            INSERT INTO patrol_pins (patrol_id, cycle_id, officer_id, lat, lon, officer_lat, officer_lon, gps_accuracy_m,
+              distance_from_officer_m, distance_to_route_m, nearest_route_name, nearest_route_area, off_route,
+              name, location_note, observation_type_id, observation_label, status)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id, created_at`,
+            [patrol.id, patrol.cycle_id, req.user.id, lat, lon, oLat, oLon, Number.isFinite(num(b.accuracy)) ? num(b.accuracy) : null,
+             Math.round(fromOfficer * 10) / 10, nearest ? Math.round(nearest.d * 10) / 10 : null, nearest?.name || null, nearest?.area || null, offRoute,
+             name, cleanLabel(b.location_note, 500) || null, type.id, type.label, status]);
+
+          const month = new Date().toISOString().slice(0, 7);
+          for (let i = 0; i < photos.length; i++) {
+            const m = meta[i] || {};
+            const base = `photos/${month}/${pin.id}/${i + 1}`;
+            await r2.send(new PutObjectCommand({ Bucket: PATROL_R2_BUCKET, Key: `${base}.jpg`, Body: photos[i].full.buffer, ContentType: 'image/jpeg' }));
+            keys.push(`${base}.jpg`);
+            let thumbKey = null;
+            if (photos[i].thumb) {
+              await r2.send(new PutObjectCommand({ Bucket: PATROL_R2_BUCKET, Key: `${base}-thumb.jpg`, Body: photos[i].thumb.buffer, ContentType: 'image/jpeg' }));
+              keys.push(`${base}-thumb.jpg`);
+              thumbKey = `${base}-thumb.jpg`;
+            }
+            const captured = m.captured_at && !isNaN(Date.parse(m.captured_at)) ? m.captured_at : null;
+            const pLat = num(m.lat), pLon = num(m.lon);
+            await client.query(`
+              INSERT INTO patrol_pin_photos (pin_id, position, r2_key, thumb_key, size_bytes, captured_at, lat, lon)
+              VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+              [pin.id, i + 1, `${base}.jpg`, thumbKey, photos[i].full.size, captured,
+               validLatLon(pLat, pLon) ? pLat : null, validLatLon(pLat, pLon) ? pLon : null]);
+          }
+          await client.query(
+            "INSERT INTO patrol_pin_events (pin_id, user_id, action, detail) VALUES ($1,$2,'created',$3)",
+            [pin.id, req.user.id, JSON.stringify({ status, observation: type.label, off_route: offRoute })]);
+          await client.query('COMMIT');
+          res.status(201).json({
+            id: pin.id, created_at: pin.created_at, off_route: offRoute,
+            distance_to_route_m: nearest ? Math.round(nearest.d) : null, nearest_route_name: nearest?.name || null,
+          });
+        } catch (e) {
+          await client.query('ROLLBACK').catch(() => {});
+          throw e;
+        } finally { client.release(); }
+      } catch (e) {
+        for (const k of keys) r2.send(new DeleteObjectCommand({ Bucket: PATROL_R2_BUCKET, Key: k })).catch(() => {});
+        sendError(res, e);
+      }
+    });
+  });
+
+  // One pin with short-lived photo links. An officer sees only their own pins;
+  // every other Operations role sees all of them.
+  router.get('/pins/:id', auth, allow(ROUTE_VIEW_ROLES), async (req, res) => {
+    try {
+      const { rows: [pin] } = await pool.query(`
+        SELECT pp.*, u.full_name AS officer_name FROM patrol_pins pp JOIN users u ON u.id = pp.officer_id WHERE pp.id=$1`, [req.params.id]);
+      if (!pin) return res.status(404).json({ error: 'Pin not found.' });
+      if (patrolRoleOf(req.user) === 'patrol_officer' && pin.officer_id !== req.user.id) return res.status(403).json({ error: 'Not authorized' });
+      const { rows: photos } = await pool.query(
+        'SELECT id, position, r2_key, thumb_key, captured_at, removed_at FROM patrol_pin_photos WHERE pin_id=$1 ORDER BY position', [pin.id]);
+      const sign = (key) => key && R2_READY ? getSignedUrl(r2, new GetObjectCommand({ Bucket: PATROL_R2_BUCKET, Key: key }), { expiresIn: 600 }) : null;
+      res.json({
+        ...pin,
+        photos: await Promise.all(photos.map(async ph => ({
+          id: ph.id, position: ph.position, captured_at: ph.captured_at, removed_at: ph.removed_at,
+          url: ph.removed_at ? null : await sign(ph.r2_key),
+          thumb_url: ph.removed_at ? null : await sign(ph.thumb_key || ph.r2_key),
+        }))),
+      });
+    } catch (e) { sendError(res, e); }
+  });
+
+  // ── Photo retention ───────────────────────────────────────
+  // Daily: photos older than PHOTO_RETENTION_DAYS are deleted from storage and
+  // marked removed. The pin and its details stay. Photos on a pin whose ticket
+  // is still open are kept until the ticket closes.
+  const sweepOldPhotos = async () => {
+    if (!R2_READY) return;
+    try {
+      const { rows } = await pool.query(`
+        SELECT ph.id, ph.r2_key, ph.thumb_key FROM patrol_pin_photos ph
+        JOIN patrol_pins p ON p.id = ph.pin_id
+        WHERE ph.removed_at IS NULL
+          AND COALESCE(ph.captured_at, ph.created_at) < NOW() - ($1 || ' days')::interval
+          AND p.ticket_status IS DISTINCT FROM 'open'
+        LIMIT 2000`, [String(PHOTO_RETENTION_DAYS)]);
+      for (const ph of rows) {
+        for (const key of [ph.r2_key, ph.thumb_key].filter(Boolean)) {
+          await r2.send(new DeleteObjectCommand({ Bucket: PATROL_R2_BUCKET, Key: key })).catch(() => {});
+        }
+        await pool.query('UPDATE patrol_pin_photos SET removed_at=NOW() WHERE id=$1', [ph.id]);
+      }
+      if (rows.length) console.log(`Patrol photos removed after ${PHOTO_RETENTION_DAYS} days: ${rows.length}`);
+    } catch (e) { console.error('Patrol photo sweep failed:', e.message); }
+  };
+  // 03:00 East Africa time (00:00 UTC), then every 24 hours.
+  const msToNext = () => { const n = new Date(); const t = new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate() + 1)); return t - n; };
+  setTimeout(() => { sweepOldPhotos(); setInterval(sweepOldPhotos, 24 * 3600 * 1000); }, msToNext());
+
+  return { router, setup, _internals: { readKmz, kmlToFeatures, distanceToLineM } };
 };

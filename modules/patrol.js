@@ -19,7 +19,7 @@ const ROUTE_VIEW_ROLES = ['admin', 'patrol_officer', 'field_supervisor', 'pm_coo
 const KMZ_MAX_BYTES = 10 * 1024 * 1024;
 // Patrol rules. Settings (a later stage) makes these adjustable.
 const PATROL_ROLES = ['admin', 'patrol_officer'];
-const PIN_MAX_FROM_OFFICER_M = 50;   // a pin may sit at most this far from the officer
+const PIN_MAX_FROM_OFFICER_M = 100;  // a pin may sit at most this far from the officer
 const PIN_OFF_ROUTE_M = 100;         // further than this from every route line = Off route (warning only)
 const PHOTOS_MIN = 1, PHOTOS_MAX = 3;
 const PHOTO_MAX_BYTES = 4 * 1024 * 1024;

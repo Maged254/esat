@@ -934,6 +934,8 @@ async function setupDB() {
     // Mobile Lines owns its own schema (see modules/mobile-lines.js) but migrates
     // inside this same boot pass, so a deploy is still one migration step.
     await mobileLines.setup(client);
+    // Route Patrol (OneHub Operations) -- same arrangement, modules/patrol.js.
+    await patrol.setup(client);
 
     console.log("Database setup complete");
   } catch(e) {
@@ -1173,6 +1175,11 @@ const mobileLines = require('./modules/mobile-lines')({
   mailWrap: (html) => mailWrap(html),
 });
 app.use('/api/mobile-lines', mobileLines.router);
+
+// ── Route Patrol (OneHub Operations) ─────────────────────────
+// Routes and cycles for now; patrols, pins and tickets join in later stages.
+const patrol = require('./modules/patrol')({ express, pool, auth, sendError });
+app.use('/api/patrol', patrol.router);
 app.use('/api/mobile-line-requests', mobileLines.lineRequests);
 // The product-change workflow (change requests, operator email batches,
 // implementation confirmation) is retired: product changes are now made
@@ -2767,30 +2774,6 @@ app.delete('/api/audits/:id', auth, async (req, res) => {
   finally { client.release(); }
 });
 
-// No page calls this today. Same roles as Auditor Performance (/audits), so it
-// shows no one any more than that page would.
-const AUDIT_LEADERBOARD_ROLES = ['admin', 'ehs_officer', 'ehs_manager', 'supervisor', 'scm_officer', 'project_director'];
-app.get('/api/audits/leaderboard', auth, async (req, res) => {
-  if (!AUDIT_LEADERBOARD_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
-  try {
-    const { rows } = await pool.query(`
-      SELECT u.id, u.full_name, u.role, u.profile_picture,
-        COUNT(a.id) as total_audits,
-        COUNT(a.id) FILTER (WHERE date_trunc('month', a.audit_date) = date_trunc('month', NOW())) as this_month,
-        COUNT(a.id) FILTER (WHERE date_trunc('month', a.audit_date) = date_trunc('month', NOW()) - interval '1 month') as last_month
-      FROM users u
-      LEFT JOIN audits a ON a.audited_by = u.id AND a.is_deleted IS NOT TRUE AND a.employee_present = TRUE
-      WHERE u.is_active = true
-        AND u.email NOT IN ('admin@egypro.com', 'sync@egypro.com', 'eats-sync@egypro.app')
-        AND u.role != 'scm_officer'
-      GROUP BY u.id
-      HAVING COUNT(a.id) > 0
-      ORDER BY total_audits DESC
-    `);
-    res.json(rows);
-  } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
-});
-
 app.get('/api/audits/:id', auth, async (req, res) => {
   try {
     const { rows: [audit] } = await pool.query(`
@@ -3298,8 +3281,7 @@ app.put('/api/ncr/:id/status', auth, async (req, res) => {
 
 // The old NCR purchase-request list. Its page (/purchase-requests) is not in any
 // menu and nothing in the app creates a request any more -- PPE buying moved to
-// the PPE request pipeline -- but the endpoints were open to every signed-in
-// account, and the POST marks NCR items 'ordered'. Held to the purchasing roles.
+// the PPE request pipeline. Reading and sending are held to the purchasing roles.
 const PURCHASE_REQUEST_ROLES = ['admin', 'ehs_manager', 'scm_officer'];
 const canPurchaseRequests = (req, res) => {
   if (PURCHASE_REQUEST_ROLES.includes(req.user.role)) return true;
@@ -3311,23 +3293,6 @@ app.get('/api/ncr/purchase-requests', auth, async (req, res) => {
   if (!canPurchaseRequests(req, res)) return;
   const { rows } = await pool.query(`SELECT pr.*,u.full_name as created_by_name,COUNT(pri.id) as items_count FROM purchase_requests pr JOIN users u ON u.id=pr.created_by LEFT JOIN purchase_request_items pri ON pri.purchase_request_id=pr.id GROUP BY pr.id,u.full_name ORDER BY pr.created_at DESC`);
   res.json(rows);
-});
-
-app.post('/api/ncr/purchase-requests', auth, async (req, res) => {
-  if (!canPurchaseRequests(req, res)) return;
-  const { ncr_item_ids, notes } = req.body;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const year = new Date().getFullYear();
-    const { rows: [{ count }] } = await client.query(`SELECT COUNT(*) FROM purchase_requests WHERE pr_number LIKE $1`, [`PR-${year}-%`]);
-    const pr_number = `PR-${year}-${String(parseInt(count)+1).padStart(3,'0')}`;
-    const { rows: [pr] } = await client.query(`INSERT INTO purchase_requests (pr_number,created_by,notes) VALUES ($1,$2,$3) RETURNING *`, [pr_number, req.user.id, notes]);
-    await client.query(`UPDATE ncr_items SET status='ordered', updated_at=NOW() WHERE id=ANY($1::uuid[])`, [ncr_item_ids]);
-    await client.query('COMMIT');
-    res.status(201).json(pr);
-  } catch(e) { await client.query('ROLLBACK'); res.status(500).json({ error: 'Server error' }); }
-  finally { client.release(); }
 });
 
 app.put('/api/ncr/purchase-requests/:id/send', auth, async (req, res) => {
@@ -3744,16 +3709,6 @@ app.post('/api/admin/backfill-ppe-requests', auth, async (req, res) => {
 
 
 // Sync log
-// Written by the SharePoint sync flow, which is retired; nothing calls it now.
-// Admin only, so no other account can plant a fake "last synced" time on the
-// Dashboard (GET /latest below is still read there).
-app.post('/api/sync-log', auth, async (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-  const { triggered_by } = req.body;
-  await pool.query('INSERT INTO sync_log (triggered_by) VALUES ($1)', [triggered_by || 'power_automate']);
-  res.json({ ok: true });
-});
-
 app.get('/api/sync-log/latest', auth, async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM sync_log ORDER BY synced_at DESC LIMIT 1');
   res.json(rows[0] || null);

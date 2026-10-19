@@ -17,17 +17,43 @@ const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const ROUTE_EDIT_ROLES = ['admin', 'planner'];
 const ROUTE_VIEW_ROLES = ['admin', 'patrol_officer', 'field_supervisor', 'pm_coordinator', 'planner', 'director'];
 const KMZ_MAX_BYTES = 10 * 1024 * 1024;
-// Patrol rules. Settings (a later stage) makes these adjustable.
 const PATROL_ROLES = ['admin', 'patrol_officer'];
-const PIN_MAX_FROM_OFFICER_M = 100;  // a pin may sit at most this far from the officer
-const PIN_OFF_ROUTE_M = 100;         // further than this from every route line = Off route (warning only)
-const PHOTOS_MIN = 1, PHOTOS_MAX = 3;
 const PHOTO_MAX_BYTES = 4 * 1024 * 1024;
-const PHOTO_RETENTION_DAYS = 60;
-// A patrol left running ends by itself after this long with no new pin, and
-// always at midnight (East Africa time). It also ends whenever the officer is
-// signed out, by themselves, by the idle timer, or by a OneHub restart.
-const PATROL_IDLE_END_HOURS = 2;     // ~2 months; photos on a pin with an open ticket are kept
+const PHOTOS_HARD_MAX = 6; // the upload accepts up to this many; the setting decides how many count
+
+// The patrol rules the admin can change on Operations → Settings, with their
+// starting values and allowed ranges. Read through S (below) everywhere, never
+// copied into constants, so a change applies straight away.
+//  - A patrol left running ends by itself after patrol_idle_end_hours with no
+//    new pin, and always at midnight; also whenever the officer is signed out.
+//  - Photos older than photo_retention_days are removed, except on a pin whose
+//    ticket is still open.
+const SETTING_DEFS = {
+  pin_max_from_officer_m: { def: 100, type: 'int', min: 10, max: 1000, unit: 'm' },
+  pin_off_route_m: { def: 100, type: 'int', min: 10, max: 5000, unit: 'm' },
+  photos_min: { def: 1, type: 'int', min: 0, max: PHOTOS_HARD_MAX },
+  photos_max: { def: 3, type: 'int', min: 1, max: PHOTOS_HARD_MAX },
+  patrol_idle_end_hours: { def: 2, type: 'int', min: 1, max: 24, unit: 'hours' },
+  photo_retention_days: { def: 60, type: 'int', min: 7, max: 3650, unit: 'days' },
+  normal_summary_time: { def: '16:00', type: 'time' },
+  ticket_digest_time: { def: '16:15', type: 'time' },
+  // 'test' = every patrol email goes to email_test_to only; 'live' = to the real people.
+  email_mode: { def: 'test', type: 'enum', values: ['test', 'live'] },
+  email_test_to: { def: 'e.maged@outlook.com', type: 'email' },
+};
+const validSetting = (key, v) => {
+  const d = SETTING_DEFS[key];
+  if (!d) return { error: 'Unknown setting.' };
+  if (d.type === 'int') {
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < d.min || n > d.max) return { error: `Must be a whole number from ${d.min} to ${d.max}.` };
+    return { value: n };
+  }
+  if (d.type === 'time') return /^([01]\d|2[0-3]):[0-5]\d$/.test(String(v)) ? { value: String(v) } : { error: 'Use a 24-hour time like 16:00.' };
+  if (d.type === 'enum') return d.values.includes(v) ? { value: v } : { error: 'Not an allowed choice.' };
+  if (d.type === 'email') return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(v || '')) ? { value: String(v).trim() } : { error: 'Enter a valid email address.' };
+  return { error: 'Unknown setting.' };
+};
 const PIN_STATUSES = ['critical', 'medium', 'normal'];
 // Review and tickets. Any supervisor can review any pin (no officer→supervisor
 // link for now); PM Coordinators work and close tickets; the Director watches.
@@ -41,10 +67,6 @@ const COMMENT_MAX = 1000;
 // Who is told about pins and tickets (agreed: supervisors, PM Coordinators
 // and the Director all get the same notifications), plus admins.
 const NOTIFY_ROLES = ['field_supervisor', 'pm_coordinator', 'director'];
-// While OneHub is being tested every email goes to the admin only, as all of
-// OneHub's other emails do; each one lists who it would have gone to. Set this
-// to null to send to the real recipients.
-const EMAIL_TEST_TO = 'e.maged@outlook.com';
 const APP_URL = 'https://onehub.egypro.app';
 
 // ── KML reading ───────────────────────────────────────────────
@@ -211,6 +233,16 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
     endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
     credentials: { accessKeyId: process.env.PATROL_R2_ACCESS_KEY_ID, secretAccessKey: process.env.PATROL_R2_SECRET_ACCESS_KEY },
   }) : null;
+
+  // The current settings (see SETTING_DEFS), loaded at start-up and on save.
+  const S = Object.fromEntries(Object.entries(SETTING_DEFS).map(([k, d]) => [k, d.def]));
+  const loadSettings = async (db = pool) => {
+    const { rows } = await db.query('SELECT key, value FROM patrol_settings');
+    for (const r of rows) {
+      const ok = validSetting(r.key, r.value);
+      if (!ok.error) S[r.key] = ok.value;
+    }
+  };
 
   // cycle id → its route lines, for the off-route check. Cleared on upload/remove.
   const routeCache = new Map();
@@ -392,6 +424,16 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
         detail JSONB,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
+
+    // Patrol rules changed on Operations → Settings (defaults in SETTING_DEFS).
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS patrol_settings (
+        key VARCHAR(60) PRIMARY KEY,
+        value JSONB NOT NULL,
+        updated_by UUID REFERENCES users(id),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )`);
+    await loadSettings(client);
 
     // In-app notifications (the bell in OneHub Operations).
     await client.query(`
@@ -798,7 +840,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
       res.json({
         patrol: run ? await patrolSummary(run.id) : null,
         current_cycle_id: currentCycleId(cycles),
-        rules: { pin_max_from_officer_m: PIN_MAX_FROM_OFFICER_M, pin_off_route_m: PIN_OFF_ROUTE_M, photos_min: PHOTOS_MIN, photos_max: PHOTOS_MAX },
+        rules: { pin_max_from_officer_m: S.pin_max_from_officer_m, pin_off_route_m: S.pin_off_route_m, photos_min: S.photos_min, photos_max: S.photos_max },
         photo_storage: R2_READY,
       });
     } catch (e) { sendError(res, e); }
@@ -845,12 +887,12 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
   // matching thumbnails (thumb0..2), both made and stamped on the phone.
   const photoUpload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: PHOTO_MAX_BYTES, files: PHOTOS_MAX * 2 },
+    limits: { fileSize: PHOTO_MAX_BYTES, files: PHOTOS_HARD_MAX * 2 },
     fileFilter: (req, file, cb) => {
       if (file.mimetype === 'image/jpeg') cb(null, true);
       else cb(new Error('Photos must be JPEG.'));
     },
-  }).fields([...Array(PHOTOS_MAX)].flatMap((_, i) => [{ name: `photo${i}`, maxCount: 1 }, { name: `thumb${i}`, maxCount: 1 }]));
+  }).fields([...Array(PHOTOS_HARD_MAX)].flatMap((_, i) => [{ name: `photo${i}`, maxCount: 1 }, { name: `thumb${i}`, maxCount: 1 }]));
 
   const num = (v) => (v === '' || v == null) ? NaN : Number(v);
   const validLatLon = (lat, lon) => Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat) <= 90 && Math.abs(lon) <= 180;
@@ -867,16 +909,17 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
       if (!PIN_STATUSES.includes(status)) return res.status(400).json({ error: 'Pick a status: Critical, Medium or Normal.' });
 
       const files = req.files || {};
-      const photos = [...Array(PHOTOS_MAX)].map((_, i) => ({ full: files[`photo${i}`]?.[0], thumb: files[`thumb${i}`]?.[0] })).filter(x => x.full);
-      if (photos.length < PHOTOS_MIN) return res.status(400).json({ error: `Take at least ${PHOTOS_MIN} photo.` });
+      const photos = [...Array(PHOTOS_HARD_MAX)].map((_, i) => ({ full: files[`photo${i}`]?.[0], thumb: files[`thumb${i}`]?.[0] })).filter(x => x.full);
+      if (photos.length < S.photos_min) return res.status(400).json({ error: `Take at least ${S.photos_min} photo${S.photos_min === 1 ? '' : 's'}.` });
+      if (photos.length > S.photos_max) return res.status(400).json({ error: `At most ${S.photos_max} photos per pin.` });
       let meta = [];
       try { meta = JSON.parse(b.photos_meta || '[]'); } catch { meta = []; }
 
       // The pin has to sit near the officer. Both positions come from the
       // phone; this stops a pin being dropped across town from where they stand.
       const fromOfficer = haversineM([oLon, oLat], [lon, lat]);
-      if (fromOfficer > PIN_MAX_FROM_OFFICER_M + 1) {
-        return res.status(400).json({ error: `The pin is ${Math.round(fromOfficer)} m from you. It must be within ${PIN_MAX_FROM_OFFICER_M} m.` });
+      if (fromOfficer > S.pin_max_from_officer_m + 1) {
+        return res.status(400).json({ error: `The pin is ${Math.round(fromOfficer)} m from you. It must be within ${S.pin_max_from_officer_m} m.` });
       }
 
       const keys = [];
@@ -890,7 +933,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
         if (!type) return res.status(400).json({ error: 'Pick an observation type.' });
 
         const { link: nearest, site: nearestSite } = await nearestTo(patrol.cycle_id, [lon, lat]);
-        const offRoute = !nearest || nearest.d > PIN_OFF_ROUTE_M;
+        const offRoute = !nearest || nearest.d > S.pin_off_route_m;
 
         const client = await pool.connect();
         try {
@@ -1169,8 +1212,9 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
 
   const email = async (people, subject, inner) => {
     if (!sendMail || !people.length) return;
-    const to = EMAIL_TEST_TO ? [EMAIL_TEST_TO] : people.map(p => p.email).filter(Boolean);
-    const testNote = EMAIL_TEST_TO
+    const testing = S.email_mode !== 'live';
+    const to = testing ? [S.email_test_to] : people.map(p => p.email).filter(Boolean);
+    const testNote = testing
       ? `<p style="margin-top:18px;font-size:9pt;color:#888;">Testing: this email would go to ${people.map(p => escapeHtml(p.full_name)).join(', ')}.</p>`
       : '';
     // Resend reports a refusal in its reply rather than by failing, so check
@@ -1245,8 +1289,12 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
   // Runs a daily job once per day at hh:mm East Africa time. The window it
   // covers starts where the last run ended, kept in patrol_jobs.
   const EAT_OFFSET_MS = 3 * 3600 * 1000;
-  const scheduleDailyEAT = (hh, mm, name, fn) => {
+  // The time comes from a setting and is read each time the next run is
+  // planned; saving Settings re-plans it (see reschedule).
+  const timers = {};
+  const scheduleDailyEAT = (timeKey, name, fn) => {
     const next = () => {
+      const [hh, mm] = String(S[timeKey]).split(':').map(Number);
       const now = Date.now();
       const eatNow = new Date(now + EAT_OFFSET_MS);
       const target = Date.UTC(eatNow.getUTCFullYear(), eatNow.getUTCMonth(), eatNow.getUTCDate(), hh, mm) - EAT_OFFSET_MS;
@@ -1261,10 +1309,13 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
         await pool.query(`INSERT INTO patrol_jobs (name, last_run_at) VALUES ($1,$2)
           ON CONFLICT (name) DO UPDATE SET last_run_at = EXCLUDED.last_run_at`, [name, until]);
       } catch (e) { console.error(`Patrol ${name} failed:`, e.message); }
-      setTimeout(run, next());
+      plan();
     };
-    setTimeout(run, next());
+    const plan = () => { clearTimeout(timers[name]); timers[name] = setTimeout(run, next()); };
+    timers[name + ':plan'] = plan;
+    plan();
   };
+  const reschedule = () => Object.keys(timers).filter(k => k.endsWith(':plan')).forEach(k => timers[k]());
 
   // 4:15 pm: every ticket opened, closed or reopened since the last digest.
   const sendTicketDigest = async (since, until) => {
@@ -1342,8 +1393,48 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
     } catch (e) { console.error('Patrol Normal summary failed:', e.message); }
   };
   // Agreed times (East Africa): Normal pins at 4:00 pm, tickets at 4:15 pm.
-  scheduleDailyEAT(16, 0, 'normal_summary', () => sendNormalSummary());
-  scheduleDailyEAT(16, 15, 'ticket_digest', sendTicketDigest);
+  // Times from Settings (defaults 16:00 and 16:15, East Africa).
+  scheduleDailyEAT('normal_summary_time', 'normal_summary', () => sendNormalSummary());
+  scheduleDailyEAT('ticket_digest_time', 'ticket_digest', sendTicketDigest);
+
+  // ── Settings (admin) ──────────────────────────────────────
+  router.get('/settings', auth, allow(['admin']), async (req, res) => {
+    try {
+      const { rows } = await pool.query(`
+        SELECT s.key, s.updated_at, u.full_name AS updated_by_name
+        FROM patrol_settings s LEFT JOIN users u ON u.id = s.updated_by`);
+      const meta = Object.fromEntries(rows.map(r => [r.key, { updated_at: r.updated_at, updated_by_name: r.updated_by_name }]));
+      res.json({
+        values: { ...S },
+        defs: Object.fromEntries(Object.entries(SETTING_DEFS).map(([k, d]) => [k, { ...d }])),
+        meta,
+      });
+    } catch (e) { sendError(res, e); }
+  });
+
+  // Saves any number of settings at once; nothing is saved if one is invalid.
+  router.put('/settings', auth, allow(['admin']), async (req, res) => {
+    const input = req.body?.values || {};
+    const clean = {};
+    for (const [k, v] of Object.entries(input)) {
+      const r = validSetting(k, v);
+      if (r.error) return res.status(400).json({ error: r.error, key: k });
+      clean[k] = r.value;
+    }
+    const minP = clean.photos_min ?? S.photos_min, maxP = clean.photos_max ?? S.photos_max;
+    if (minP > maxP) return res.status(400).json({ error: 'The minimum number of photos cannot be more than the maximum.', key: 'photos_min' });
+    try {
+      for (const [k, v] of Object.entries(clean)) {
+        if (S[k] === v) continue;
+        await pool.query(`INSERT INTO patrol_settings (key, value, updated_by, updated_at) VALUES ($1, $2, $3, NOW())
+          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = NOW()`,
+          [k, JSON.stringify(v), req.user.id]);
+        S[k] = v;
+      }
+      reschedule();
+      res.json({ values: { ...S } });
+    } catch (e) { sendError(res, e); }
+  });
 
   // The bell: the signed-in person's latest notifications.
   router.get('/notifications', auth, async (req, res) => {
@@ -1386,7 +1477,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
       await endRunningPatrols('midnight',
         "(p.started_at AT TIME ZONE 'Africa/Nairobi')::date < (NOW() AT TIME ZONE 'Africa/Nairobi')::date");
       await endRunningPatrols('inactive',
-        `${LAST_ACTIVITY_SQL} < NOW() - INTERVAL '${PATROL_IDLE_END_HOURS} hours'`);
+        `${LAST_ACTIVITY_SQL} < NOW() - INTERVAL '${Number(S.patrol_idle_end_hours)} hours'`);
     } catch (e) { console.error('Patrol sweep failed:', e.message); }
   };
   setInterval(sweepPatrols, 10 * 60 * 1000);
@@ -1396,7 +1487,7 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
   const endPatrolsOnRestart = () => endRunningPatrols('restart').catch(e => console.error('Patrol restart end failed:', e.message));
 
   // ── Photo retention ───────────────────────────────────────
-  // Daily: photos older than PHOTO_RETENTION_DAYS are deleted from storage and
+  // Daily: photos older than the retention setting are deleted from storage and
   // marked removed. The pin and its details stay. Photos on a pin whose ticket
   // is still open are kept until the ticket closes.
   const sweepOldPhotos = async () => {
@@ -1408,19 +1499,19 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
         WHERE ph.removed_at IS NULL
           AND COALESCE(ph.captured_at, ph.created_at) < NOW() - ($1 || ' days')::interval
           AND p.ticket_status IS DISTINCT FROM 'open'
-        LIMIT 2000`, [String(PHOTO_RETENTION_DAYS)]);
+        LIMIT 2000`, [String(S.photo_retention_days)]);
       for (const ph of rows) {
         for (const key of [ph.r2_key, ph.thumb_key].filter(Boolean)) {
           await r2.send(new DeleteObjectCommand({ Bucket: PATROL_R2_BUCKET, Key: key })).catch(() => {});
         }
         await pool.query('UPDATE patrol_pin_photos SET removed_at=NOW() WHERE id=$1', [ph.id]);
       }
-      if (rows.length) console.log(`Patrol photos removed after ${PHOTO_RETENTION_DAYS} days: ${rows.length}`);
+      if (rows.length) console.log(`Patrol photos removed after ${S.photo_retention_days} days: ${rows.length}`);
     } catch (e) { console.error('Patrol photo sweep failed:', e.message); }
   };
   // 03:00 East Africa time (00:00 UTC), then every 24 hours.
   const msToNext = () => { const n = new Date(); const t = new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate() + 1)); return t - n; };
   setTimeout(() => { sweepOldPhotos(); setInterval(sweepOldPhotos, 24 * 3600 * 1000); }, msToNext());
 
-  return { router, setup, endPatrolsOnRestart, _internals: { readKmz, kmlToFeatures, distanceToLineM } };
+  return { router, setup, endPatrolsOnRestart, _internals: { readKmz, kmlToFeatures, distanceToLineM, validSetting } };
 };

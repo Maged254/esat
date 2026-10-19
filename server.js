@@ -1173,7 +1173,7 @@ const inScope = async (user, project, client) => {
 // evaluated when a mail is actually sent, not when the module is constructed.
 const mobileLines = require('./modules/mobile-lines')({
   express, pool, auth, inScope, getProjectFilter, getClientFilter, sendError,
-  sendMail: (opts) => resend.emails.send({ from: 'OneHub <esat@egypro.app>', to: 'e.maged@outlook.com', ...opts }),
+  sendMail: (opts) => resend.emails.send({ from: 'OneHub <onehub@egypro.app>', to: 'e.maged@outlook.com', ...opts }),
   mailWrap: (html) => mailWrap(html),
 });
 app.use('/api/mobile-lines', mobileLines.router);
@@ -1184,7 +1184,7 @@ app.use('/api/mobile-lines', mobileLines.router);
 // mail is actually sent (same arrangement as Mobile Lines).
 const patrol = require('./modules/patrol')({
   express, pool, auth, sendError,
-  sendMail: (opts) => resend.emails.send({ from: 'OneHub <esat@egypro.app>', ...opts }),
+  sendMail: (opts) => resend.emails.send({ from: 'OneHub <onehub@egypro.app>', ...opts }),
   mailWrap: (html) => mailWrap(html),
   mailSignoff: () => MAIL_SIGNOFF,
 });
@@ -5493,7 +5493,7 @@ async function sendDailySCMDigest() {
     if (oldestDays <= 0 && orderedOldestDays <= 0) return;
 
     await resend.emails.send({
-        from: 'OneHub <esat@egypro.app>',
+        from: 'OneHub <onehub@egypro.app>',
         to: 'e.maged@outlook.com',
         subject: `OneHub Daily SCM — ${count + orderedCount} Pending PPE/Tool Item${(count + orderedCount) > 1 ? 's' : ''} Awaiting Action`,
         html: mailWrap(`
@@ -5530,7 +5530,7 @@ async function sendDailyPMDigest() {
     if (oldestDays <= 0) return;
 
     await resend.emails.send({
-        from: 'OneHub <esat@egypro.app>',
+        from: 'OneHub <onehub@egypro.app>',
         to: 'e.maged@outlook.com',
         subject: `OneHub Daily PM — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Your Approval`,
         html: mailWrap(`
@@ -5581,7 +5581,7 @@ async function sendDailyBTSDigest() {
       </tr>`).join('');
 
     await resend.emails.send({
-      from: 'OneHub <esat@egypro.app>',
+      from: 'OneHub <onehub@egypro.app>',
       to: 'e.maged@outlook.com',
       subject: `OneHub Daily BTS Projects — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
       html: mailWrap(`
@@ -5639,7 +5639,7 @@ async function sendDailyFibreDigest() {
       </tr>`).join('');
 
     await resend.emails.send({
-      from: 'OneHub <esat@egypro.app>',
+      from: 'OneHub <onehub@egypro.app>',
       to: 'e.maged@outlook.com',
       subject: `OneHub Daily Fibre Projects — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
       html: mailWrap(`
@@ -5676,7 +5676,7 @@ async function sendDailyEHSDigest() {
     if (oldestDays <= 0) return;
 
     await resend.emails.send({
-      from: 'OneHub <esat@egypro.app>',
+      from: 'OneHub <onehub@egypro.app>',
       to: 'e.maged@outlook.com',
       subject: `OneHub Daily EHS — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
       html: mailWrap(`
@@ -5771,7 +5771,7 @@ async function sendDailyEmployeeChangesDigest() {
     if (rows.length === 0) return; // nothing changed yesterday — no email
 
     await resend.emails.send({
-      from: 'OneHub <esat@egypro.app>',
+      from: 'OneHub <onehub@egypro.app>',
       to: 'e.maged@outlook.com',
       subject: `OneHub Daily HR In-house Updates — ${rows.length} Change${rows.length > 1 ? 's' : ''}`,
       html: renderEmployeeChangesEmail(
@@ -5802,7 +5802,7 @@ async function sendDailyFleetDriverChangesDigest() {
     if (rows.length === 0) return; // nothing changed yesterday — no email
 
     await resend.emails.send({
-      from: 'OneHub <esat@egypro.app>',
+      from: 'OneHub <onehub@egypro.app>',
       to: 'e.maged@outlook.com',
       subject: `OneHub Daily Fleet Drivers Updates — ${rows.length} Change${rows.length > 1 ? 's' : ''}`,
       html: renderEmployeeChangesEmail(
@@ -5833,7 +5833,7 @@ async function sendDailyOutsourceServicesChangesDigest() {
     if (rows.length === 0) return; // nothing changed yesterday — no email
 
     await resend.emails.send({
-      from: 'OneHub <esat@egypro.app>',
+      from: 'OneHub <onehub@egypro.app>',
       to: 'e.maged@outlook.com',
       subject: `OneHub Daily Outsourced Services Updates — ${rows.length} Change${rows.length > 1 ? 's' : ''}`,
       html: renderEmployeeChangesEmail(
@@ -5902,7 +5902,7 @@ async function sendDailyNewCertificatesDigest() {
       </tr>`).join('');
 
     await resend.emails.send({
-      from: 'OneHub <esat@egypro.app>',
+      from: 'OneHub <onehub@egypro.app>',
       to: 'e.maged@outlook.com',
       subject: `OneHub Daily New Certificates — ${N} Recorded`,
       html: mailWrap(`
@@ -5985,7 +5985,7 @@ async function sendCourierDigest(label, projects) {
       </tr>`).join('');
 
     await resend.emails.send({
-      from: 'OneHub <esat@egypro.app>',
+      from: 'OneHub <onehub@egypro.app>',
       to: 'e.maged@outlook.com',
       subject: `OneHub Daily ${label} Courier Distributions — ${N} Item${N > 1 ? 's' : ''}`,
       html: mailWrap(`
@@ -6036,7 +6036,7 @@ async function sendHourlyCasualDigest() {
       count: r.count, by: r.actor_name, date: r.last_date,
     }));
     await resend.emails.send({
-      from: 'OneHub <esat@egypro.app>',
+      from: 'OneHub <onehub@egypro.app>',
       to: 'e.maged@outlook.com',
       subject: 'OneHub Casual Resources Updates',
       html: renderCasualUpdateTable(groups),
@@ -6136,7 +6136,7 @@ async function sendDailyOverdueDigest() {
     });
 
     await resend.emails.send({
-      from: 'OneHub <esat@egypro.app>',
+      from: 'OneHub <onehub@egypro.app>',
       to: 'e.maged@outlook.com',
       subject: `OneHub Weekly Audit — ${totalOverdue} Overdue Audit${totalOverdue > 1 ? 's' : ''} Across Projects`,
       html: mailWrap(`
@@ -6303,7 +6303,7 @@ async function sendOperationsTrainingDigest(label, projects, greeting) {
     };
 
     await resend.emails.send({
-      from: 'OneHub <esat@egypro.app>',
+      from: 'OneHub <onehub@egypro.app>',
       to: 'e.maged@outlook.com',
       subject: `OneHub Weekly (${label}): ${rows.length} Training${rows.length > 1 ? 's' : ''} Pending with Operations`,
       attachments: sheet ? [{
@@ -6398,7 +6398,7 @@ app.post('/api/admin/test-ehs-digest', auth, async (req, res) => {
     if (count === 0) return res.json({ success: true, count, message: 'No pending items, email not sent' });
     if (oldestDays <= 0) return res.json({ success: true, count, oldestDays, message: 'Nothing waiting more than 0 days, email not sent' });
     await resend.emails.send({
-      from: 'OneHub <esat@egypro.app>',
+      from: 'OneHub <onehub@egypro.app>',
       to: 'e.maged@outlook.com',
       subject: `OneHub Daily EHS — ${count} Pending PPE/Tool Item${count > 1 ? 's' : ''} Awaiting Action`,
       html: mailWrap(`
@@ -6430,7 +6430,7 @@ app.post('/api/admin/test-scm-digest', auth, async (req, res) => {
     if (count === 0 && orderedCount === 0) return res.json({ success: true, count, orderedCount, message: 'No pending items, email not sent' });
     if (oldestDays <= 0 && orderedOldestDays <= 0) return res.json({ success: true, count, orderedCount, message: 'Nothing waiting more than 0 days, email not sent' });
     await resend.emails.send({
-      from: 'OneHub <esat@egypro.app>',
+      from: 'OneHub <onehub@egypro.app>',
       to: 'e.maged@outlook.com',
       subject: `OneHub Daily SCM — ${count + orderedCount} Pending PPE/Tool Item${(count + orderedCount) > 1 ? 's' : ''} Awaiting Action`,
       html: mailWrap(`

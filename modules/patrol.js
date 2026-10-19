@@ -1265,6 +1265,43 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
              age_min: Number.isFinite(ageMin) ? Math.round(ageMin * 10) / 10 : null };
   };
 
+  // What Traccar Client reads from a scanned QR code: an https link sets the
+  // server URL to the link without its query, and the query sets the rest
+  // (names from the app's own preferences: id, accuracy, distance, heartbeat,
+  // buffer, stop_detection). A heartbeat keeps positions coming while the
+  // officer stands still to take photos.
+  const qrTextFor = (key) => `${TRACKER_URL}?id=${encodeURIComponent(key)}&accuracy=high&distance=50&heartbeat=60&buffer=true&stop_detection=true`;
+
+  // Admin: every patrol officer's tracker, issuing a device id where missing,
+  // so company phones can be set up before they are handed out.
+  router.get('/tracker/devices', auth, allow(['admin']), async (req, res) => {
+    try {
+      const { rows: officers } = await pool.query(`
+        SELECT u.id, u.full_name, u.email FROM users u
+        WHERE u.is_active AND u.patrol_role = 'patrol_officer' ORDER BY u.full_name`);
+      for (const o of officers) {
+        await pool.query('INSERT INTO patrol_devices (user_id, device_key) VALUES ($1,$2) ON CONFLICT (user_id) DO NOTHING', [o.id, newKey()]);
+      }
+      const { rows } = await pool.query(`
+        SELECT u.id AS user_id, u.full_name, d.device_key, d.last_seen_at, d.last_battery, d.last_charging
+        FROM users u JOIN patrol_devices d ON d.user_id = u.id
+        WHERE u.is_active AND u.patrol_role = 'patrol_officer' ORDER BY u.full_name`);
+      const out = [];
+      for (const r of rows) out.push({ ...r, qr_text: qrTextFor(r.device_key), status: (await trackerStatus(r.user_id)).state });
+      res.json({ server_url: TRACKER_URL, devices: out });
+    } catch (e) { sendError(res, e); }
+  });
+
+  // Admin: a fresh device id for one officer (a lost phone stops reporting).
+  router.post('/tracker/devices/:userId/new', auth, allow(['admin']), async (req, res) => {
+    try {
+      const key = newKey();
+      const { rowCount } = await pool.query('UPDATE patrol_devices SET device_key=$1, last_seen_at=NULL WHERE user_id=$2', [key, req.params.userId]);
+      if (!rowCount) return res.status(404).json({ error: 'No tracker for this person.' });
+      res.json({ device_key: key, qr_text: qrTextFor(key) });
+    } catch (e) { sendError(res, e); }
+  });
+
   // The officer's own setup details for the Traccar Client app. Creates the
   // device id the first time; "new" issues a fresh one (an old phone stops).
   router.get('/tracker/me', auth, allow(PATROL_ROLES), async (req, res) => {

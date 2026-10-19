@@ -221,6 +221,11 @@ async function setupDB() {
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS project_access TEXT[] DEFAULT '{}'")
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS client_access TEXT[] DEFAULT '{}'");
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS page_access TEXT[] DEFAULT '{}'");
+    // OneHub Operations has its own role, separate from `role` (which is the
+    // OneHub People role). A person can hold one of each -- a People supervisor
+    // can also be a patrol Field Supervisor -- so it is a second column rather
+    // than more values crowded into the first. NULL = no Operations access.
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS patrol_role VARCHAR(30)");
 
     // The Graphs page was split into separate Audits/Requests pages -- carry
     // forward access for anyone who had '/graphs' so they aren't locked out.
@@ -974,6 +979,14 @@ const auth = (req, res, next) => {
     if (!req.user.sync && req.user.iat < SERVER_BOOT_TIME) {
       return res.status(401).json({ error: 'Session expired, please log in again' });
     }
+    // Someone with no OneHub People role (an Operations-only account) is held
+    // to their own session endpoints and the Operations API. Several People
+    // endpoints check only that the caller is signed in, so without this a
+    // patrol officer's token could read them; failing closed here covers every
+    // such endpoint, including ones added later.
+    if (req.user.role === 'none' && !/^\/api\/(auth|patrol)\//.test(req.originalUrl)) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
     next();
   } catch { res.status(401).json({ error: 'Invalid token' }); }
 };
@@ -1028,7 +1041,14 @@ const escapeHtml = (s) => String(s || '').replace(/[&<>"']/g, (c) => ({
 }[c]));
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const VALID_ROLES = ['admin', 'ehs_manager', 'ehs_officer', 'supervisor', 'scm_officer', 'project_director', 'hr', 'fleet'];
+// 'none' = no OneHub People access at all: someone who only works in OneHub
+// Operations (a patrol officer, say). It is listed in RESTRICTED_ROLES below
+// with no projects, so anything scoped by project returns nothing for them.
+const VALID_ROLES = ['admin', 'ehs_manager', 'ehs_officer', 'supervisor', 'scm_officer', 'project_director', 'hr', 'fleet', 'none'];
+const VALID_PATROL_ROLES = ['patrol_officer', 'field_supervisor', 'pm_coordinator', 'planner', 'director'];
+// '' and null both clear it; anything else must be a known patrol role.
+const normalisePatrolRole = (v) => (v === '' || v === null) ? null : v;
+const isValidPatrolRole = (v) => v === null || VALID_PATROL_ROLES.includes(v);
 // Data-URL profile pictures only, capped just under the 10mb JSON body limit
 // (no client-side resize happens before upload, so this must stay generous).
 const isValidProfilePicture = (s) => typeof s === 'string' && s.startsWith('data:image/') && s.length <= 9 * 1024 * 1024;
@@ -1076,7 +1096,7 @@ const validateRequiredPpeComments = async (items) => {
     : null;
 };
 
-const RESTRICTED_ROLES = ['ehs_officer', 'supervisor', 'scm_officer', 'project_director', 'ehs_manager'];
+const RESTRICTED_ROLES = ['ehs_officer', 'supervisor', 'scm_officer', 'project_director', 'ehs_manager', 'none'];
 
 // getProjectFilter/getClientFilter run on nearly every authenticated request
 // (list endpoints + all the by-id scope checks). The "does this user's access
@@ -1220,14 +1240,14 @@ app.post('/api/auth/login', async (req, res) => {
     await pool.query('UPDATE users SET last_login=NOW() WHERE id=$1', [user.id]);
     const isSync = user.email === 'sync@egypro.com';
     const tokenOptions = isSync ? {} : { expiresIn: '8h' };
-    const token = jwt.sign({ id: user.id, email: user.email, role: user.role, name: user.full_name, project_access: user.project_access || [], client_access: user.client_access || [], page_access: user.page_access || [], hr_task_access: user.hr_task_access || [], outsource_access: user.outsource_access || [], sync: isSync }, JWT_SECRET, tokenOptions);
-    res.json({ token, user: { id: user.id, name: user.full_name, email: user.email, role: user.role, project_access: user.project_access || [], client_access: user.client_access || [], page_access: user.page_access || [], hr_task_access: user.hr_task_access || [], outsource_access: user.outsource_access || [], must_reset_password: user.must_reset_password || false } });
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role, patrol_role: user.patrol_role || null, name: user.full_name, project_access: user.project_access || [], client_access: user.client_access || [], page_access: user.page_access || [], hr_task_access: user.hr_task_access || [], outsource_access: user.outsource_access || [], sync: isSync }, JWT_SECRET, tokenOptions);
+    res.json({ token, user: { id: user.id, name: user.full_name, email: user.email, role: user.role, patrol_role: user.patrol_role || null, project_access: user.project_access || [], client_access: user.client_access || [], page_access: user.page_access || [], hr_task_access: user.hr_task_access || [], outsource_access: user.outsource_access || [], must_reset_password: user.must_reset_password || false } });
   } catch(e) { console.error(e); res.status(500).json({ error: 'Server error' }); }
 });
 
 // Me
 app.get('/api/auth/me', auth, async (req, res) => {
-  const { rows } = await pool.query('SELECT id,full_name,email,role,profile_picture,project_access,page_access,client_access,hr_task_access,outsource_access,must_reset_password FROM users WHERE id=$1', [req.user.id]);
+  const { rows } = await pool.query('SELECT id,full_name,email,role,patrol_role,profile_picture,project_access,page_access,client_access,hr_task_access,outsource_access,must_reset_password FROM users WHERE id=$1', [req.user.id]);
   const u = rows[0];
   if (!u) return res.status(401).json({ error: 'Session no longer valid, please sign in again' });
   // A token carries the role and access rights it was issued with, but this
@@ -1242,6 +1262,9 @@ app.get('/api/auth/me', auth, async (req, res) => {
   // Automate flow and must not be invalidated from here.
   const sameList = (a, b) => JSON.stringify([...(a || [])].sort()) === JSON.stringify([...(b || [])].sort());
   const stale = u.role !== req.user.role
+    // Tokens minted before patrol_role existed carry no such key; only an
+    // actual difference counts, so those sessions are not thrown out on deploy.
+    || (u.patrol_role || null) !== (req.user.patrol_role || null)
     || !sameList(u.project_access, req.user.project_access)
     || !sameList(u.client_access, req.user.client_access)
     || !sameList(u.hr_task_access, req.user.hr_task_access)
@@ -2744,7 +2767,11 @@ app.delete('/api/audits/:id', auth, async (req, res) => {
   finally { client.release(); }
 });
 
+// No page calls this today. Same roles as Auditor Performance (/audits), so it
+// shows no one any more than that page would.
+const AUDIT_LEADERBOARD_ROLES = ['admin', 'ehs_officer', 'ehs_manager', 'supervisor', 'scm_officer', 'project_director'];
 app.get('/api/audits/leaderboard', auth, async (req, res) => {
+  if (!AUDIT_LEADERBOARD_ROLES.includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
   try {
     const { rows } = await pool.query(`
       SELECT u.id, u.full_name, u.role, u.profile_picture,
@@ -3269,12 +3296,25 @@ app.put('/api/ncr/:id/status', auth, async (req, res) => {
   finally { client.release(); }
 });
 
+// The old NCR purchase-request list. Its page (/purchase-requests) is not in any
+// menu and nothing in the app creates a request any more -- PPE buying moved to
+// the PPE request pipeline -- but the endpoints were open to every signed-in
+// account, and the POST marks NCR items 'ordered'. Held to the purchasing roles.
+const PURCHASE_REQUEST_ROLES = ['admin', 'ehs_manager', 'scm_officer'];
+const canPurchaseRequests = (req, res) => {
+  if (PURCHASE_REQUEST_ROLES.includes(req.user.role)) return true;
+  res.status(403).json({ error: 'Not authorized' });
+  return false;
+};
+
 app.get('/api/ncr/purchase-requests', auth, async (req, res) => {
+  if (!canPurchaseRequests(req, res)) return;
   const { rows } = await pool.query(`SELECT pr.*,u.full_name as created_by_name,COUNT(pri.id) as items_count FROM purchase_requests pr JOIN users u ON u.id=pr.created_by LEFT JOIN purchase_request_items pri ON pri.purchase_request_id=pr.id GROUP BY pr.id,u.full_name ORDER BY pr.created_at DESC`);
   res.json(rows);
 });
 
 app.post('/api/ncr/purchase-requests', auth, async (req, res) => {
+  if (!canPurchaseRequests(req, res)) return;
   const { ncr_item_ids, notes } = req.body;
   const client = await pool.connect();
   try {
@@ -3291,6 +3331,7 @@ app.post('/api/ncr/purchase-requests', auth, async (req, res) => {
 });
 
 app.put('/api/ncr/purchase-requests/:id/send', auth, async (req, res) => {
+  if (!canPurchaseRequests(req, res)) return;
   const { rows } = await pool.query(`UPDATE purchase_requests SET status='sent', updated_at=NOW() WHERE id=$1 RETURNING *`, [req.params.id]);
   res.json(rows[0]);
 });
@@ -3703,7 +3744,11 @@ app.post('/api/admin/backfill-ppe-requests', auth, async (req, res) => {
 
 
 // Sync log
+// Written by the SharePoint sync flow, which is retired; nothing calls it now.
+// Admin only, so no other account can plant a fake "last synced" time on the
+// Dashboard (GET /latest below is still read there).
 app.post('/api/sync-log', auth, async (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
   const { triggered_by } = req.body;
   await pool.query('INSERT INTO sync_log (triggered_by) VALUES ($1)', [triggered_by || 'power_automate']);
   res.json({ ok: true });
@@ -7295,7 +7340,7 @@ app.get('/api/graphs', auth, async (req, res) => {
 
 app.get('/api/users', auth, async (req, res) => {
   if (!['admin','ehs_manager','ehs_officer','supervisor'].includes(req.user.role)) return res.status(403).json({ error: 'Not authorized' });
-  const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access, training_course_access, hr_task_access, outsource_access, must_reset_password, failed_login_attempts, locked_until, last_login, created_at FROM users ORDER BY created_at DESC');
+  const { rows } = await pool.query('SELECT id, full_name, email, role, patrol_role, is_active, profile_picture, project_access, page_access, client_access, training_course_access, hr_task_access, outsource_access, must_reset_password, failed_login_attempts, locked_until, last_login, created_at FROM users ORDER BY created_at DESC');
   res.json(rows);
 });
 
@@ -7356,13 +7401,15 @@ app.post('/api/users', auth, async (req, res) => {
   if (!full_name || !email || !password || !role) return res.status(400).json({ error: 'All fields required' });
   if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'Invalid email format' });
   if (!VALID_ROLES.includes(role)) return res.status(400).json({ error: 'Invalid role' });
+  const patrolRole = normalisePatrolRole(req.body.patrol_role ?? null);
+  if (!isValidPatrolRole(patrolRole)) return res.status(400).json({ error: 'Invalid Operations role' });
   const pwError = validatePassword(password);
   if (pwError) return res.status(400).json({ error: pwError });
   try {
     const hash = await bcrypt.hash(password, 10);
     const { rows } = await pool.query(
-      'INSERT INTO users (full_name, email, password_hash, role, project_access, page_access, client_access) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, full_name, email, role, is_active, project_access, page_access, client_access',
-      [full_name, email, hash, role, project_access || [], page_access || [], req.body.client_access || []]
+      'INSERT INTO users (full_name, email, password_hash, role, patrol_role, project_access, page_access, client_access) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, full_name, email, role, patrol_role, is_active, project_access, page_access, client_access',
+      [full_name, email, hash, role, patrolRole, project_access || [], page_access || [], req.body.client_access || []]
     );
     res.status(201).json(rows[0]);
   } catch(e) {
@@ -7382,7 +7429,13 @@ app.put('/api/users/:id', auth, async (req, res) => {
     if (pwError) return res.status(400).json({ error: pwError });
   }
   if (profile_picture && !isValidProfilePicture(profile_picture)) return res.status(400).json({ error: 'Invalid profile picture' });
+  // Only touched when the caller sends it, so an older client (or any PUT that
+  // predates OneHub Operations) cannot wipe someone's Operations role by omission.
+  const setsPatrolRole = Object.prototype.hasOwnProperty.call(req.body, 'patrol_role');
+  const patrolRole = setsPatrolRole ? normalisePatrolRole(req.body.patrol_role) : undefined;
+  if (setsPatrolRole && !isValidPatrolRole(patrolRole)) return res.status(400).json({ error: 'Invalid Operations role' });
   try {
+    if (setsPatrolRole) await pool.query('UPDATE users SET patrol_role=$1 WHERE id=$2', [patrolRole, req.params.id]);
     if (password) {
       const hash = await bcrypt.hash(password, 10);
       await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, password_hash=$5, profile_picture=$6, project_access=$7, page_access=$8, client_access=$9, must_reset_password=$10, updated_at=NOW() WHERE id=$11',
@@ -7391,7 +7444,7 @@ app.put('/api/users/:id', auth, async (req, res) => {
       await pool.query('UPDATE users SET full_name=$1, email=$2, role=$3, is_active=$4, profile_picture=$5, project_access=$6, page_access=$7, client_access=$8, must_reset_password=$9, updated_at=NOW() WHERE id=$10',
         [full_name, email, role, is_active, profile_picture || null, project_access || [], page_access || [], req.body.client_access || [], must_reset_password || false, req.params.id]);
     }
-    const { rows } = await pool.query('SELECT id, full_name, email, role, is_active, profile_picture, project_access, page_access, client_access, must_reset_password FROM users WHERE id=$1', [req.params.id]);
+    const { rows } = await pool.query('SELECT id, full_name, email, role, patrol_role, is_active, profile_picture, project_access, page_access, client_access, must_reset_password FROM users WHERE id=$1', [req.params.id]);
     res.json(rows[0]);
   } catch(e) { sendError(res, e); }
 });

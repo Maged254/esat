@@ -899,10 +899,13 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
       if (run) return res.json(await patrolSummary(run.id)); // already running: carry on with it
       if (S.tracker_required_to_start === 'on') {
         const t = await trackerStatus(req.user.id);
-        if (t.state !== 'tracking') {
+        // Tracking or Delayed both pass: a phone standing still sends little
+        // (iPhones especially pause the app), so up to the "Not tracking"
+        // limit is accepted. That still proves the app is set up and on.
+        if (t.state !== 'tracking' && t.state !== 'delayed') {
           return res.status(400).json({ error: t.state === 'not_set_up'
             ? 'Set up the tracker app first: tap "Set up the tracker" below.'
-            : `Turn on the tracker app first. Its last position was ${t.last_seen_at ? 'more than ' + S.tracker_delayed_min + ' minutes ago' : 'never received'}.`, tracker: t });
+            : `Turn on the tracker app first. Its last position was ${t.last_seen_at ? 'more than ' + S.tracker_lost_min + ' minutes ago' : 'never received'}.`, tracker: t });
         }
       }
       const { rows: [p] } = await pool.query('INSERT INTO patrols (officer_id, cycle_id) VALUES ($1,$2) RETURNING id', [req.user.id, cycleId]);

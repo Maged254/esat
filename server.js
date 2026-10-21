@@ -2015,6 +2015,18 @@ app.post('/api/employees', auth, async (req, res) => {
   // interns or outsource (word-boundary \bintern\b so "International" is safe).
   const noEmpId = ['outsource', 'intern'].includes(resource_type) || /\bintern\b/i.test(job_title || '');
 
+  // A row that says "intern" in the job title AND carries an Employment ID is
+  // contradicting itself, and silently dropping the ID is the worst of the
+  // three options: it produced an in-house employee with no ID who then looked
+  // like a normal technician the moment somebody edited the title (Tony Murandi
+  // Wanjiru, imported 03/07/2026, found 21/10/2026). Refuse the row and say
+  // which half to fix.
+  if (noEmpId && String(employee_number || '').trim() && /\bintern\b/i.test(job_title || '')) {
+    return res.status(400).json({
+      error: `"${squish(full_name) || 'This row'}" has the job title "${job_title}" and an Employment ID (${squish(employee_number)}). Interns do not carry one. Either drop the Employment ID, or give a job title that is not an intern role.`,
+    });
+  }
+
   const dbClient = await pool.connect();
   try {
     // Upsert: if national_id exists, update instead of insert

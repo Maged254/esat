@@ -1330,31 +1330,36 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
   // timestamp, coords: {...}, battery: {...} } }).
   const trackerRouter = express.Router();
   trackerRouter.use(express.urlencoded({ extended: false, limit: '64kb' }));
-  const lastHit = new Map(); // device id → ms of the last accepted report
+  const lastAt = new Map();  // device id → recorded time (ms) of the last position stored
   const ipHits = new Map();  // ip → [window start ms, count]
-  const readReport = (req) => {
+  // One report can carry several positions: the newer app sends a phone's
+  // offline buffer as a list once the connection is back.
+  const readReports = (req) => {
     const q = { ...req.query, ...(typeof req.body === 'object' ? req.body : {}) };
-    const loc = q.location && typeof q.location === 'object' ? (Array.isArray(q.location) ? q.location[q.location.length - 1] : q.location) : null;
-    if (loc) {
-      const c = loc.coords || {};
-      return {
-        id: String(q.device_id || q.id || ''),
-        lat: Number(c.latitude), lon: Number(c.longitude), accuracy: Number(c.accuracy),
-        speedKmh: Number.isFinite(Number(c.speed)) && Number(c.speed) >= 0 ? Number(c.speed) * 3.6 : null,
-        at: loc.timestamp ? new Date(loc.timestamp) : new Date(),
-        battery: loc.battery && Number.isFinite(Number(loc.battery.level)) ? Number(loc.battery.level) * (Number(loc.battery.level) <= 1 ? 100 : 1) : null,
-        charging: loc.battery ? !!loc.battery.is_charging : null,
-      };
+    const id = String(q.device_id || q.id || q.deviceid || '');
+    const locs = Array.isArray(q.location) ? q.location : (q.location && typeof q.location === 'object' ? [q.location] : null);
+    if (locs) {
+      return locs.map(loc => {
+        const c = loc.coords || {};
+        return {
+          id,
+          lat: Number(c.latitude), lon: Number(c.longitude), accuracy: Number(c.accuracy),
+          speedKmh: Number.isFinite(Number(c.speed)) && Number(c.speed) >= 0 ? Number(c.speed) * 3.6 : null,
+          at: loc.timestamp ? new Date(loc.timestamp) : new Date(),
+          battery: loc.battery && Number.isFinite(Number(loc.battery.level)) ? Number(loc.battery.level) * (Number(loc.battery.level) <= 1 ? 100 : 1) : null,
+          charging: loc.battery ? !!loc.battery.is_charging : null,
+        };
+      });
     }
     const ts = q.timestamp;
     const at = ts == null ? new Date() : /^\d+$/.test(String(ts)) ? new Date(Number(ts) * (String(ts).length > 11 ? 1 : 1000)) : new Date(ts);
-    return {
-      id: String(q.id || q.deviceid || ''),
+    return [{
+      id,
       lat: Number(q.lat), lon: Number(q.lon), accuracy: Number(q.accuracy),
       speedKmh: Number.isFinite(Number(q.speed)) ? Number(q.speed) * 1.852 : null, // knots
       at, battery: Number.isFinite(Number(q.batt)) ? Number(q.batt) : null,
       charging: q.charge != null ? String(q.charge) === 'true' : null,
-    };
+    }];
   };
   const handleReport = async (req, res) => {
     try {
@@ -1364,26 +1369,52 @@ module.exports = function patrolModule({ express, pool, auth, sendError, sendMai
       if (!w || nowMs - w[0] > 60000) ipHits.set(ip, [nowMs, 1]);
       else if (++w[1] > 240) return res.status(429).end();
 
-      const r = readReport(req);
-      if (!/^[A-Z0-9]{12,64}$/.test(r.id)) return res.status(400).end();
-      if (!Number.isFinite(r.lat) || !Number.isFinite(r.lon) || Math.abs(r.lat) > 90 || Math.abs(r.lon) > 180) return res.status(400).end();
-      const { rows: [dev] } = await pool.query('SELECT user_id FROM patrol_devices WHERE device_key=$1', [r.id]);
+      const reports = readReports(req)
+        .filter(r => Number.isFinite(r.lat) && Number.isFinite(r.lon) && Math.abs(r.lat) <= 90 && Math.abs(r.lon) <= 180)
+        .map(r => {
+          let at = isNaN(r.at.getTime()) ? new Date(nowMs) : r.at;
+          if (at.getTime() > nowMs + 5 * 60000) at = new Date(nowMs); // phone clock ahead: use arrival time
+          return { ...r, at };
+        })
+        .sort((a, b) => a.at - b.at);
+      const id = reports[0]?.id || String(req.query.id || req.query.device_id || '');
+      if (!/^[A-Z0-9]{12,64}$/.test(id)) return res.status(400).end();
+      if (!reports.length) return res.status(400).end();
+      const { rows: [dev] } = await pool.query('SELECT user_id FROM patrol_devices WHERE device_key=$1', [id]);
       if (!dev) return res.status(404).end();
-      // A phone flushing its buffer can send many at once; keep one every 5 s.
-      if (nowMs - (lastHit.get(r.id) || 0) < 5000) return res.status(200).end();
-      lastHit.set(r.id, nowMs);
-      let at = isNaN(r.at.getTime()) ? new Date() : r.at;
-      if (at.getTime() > nowMs + 5 * 60000) at = new Date(); // clock ahead: use arrival time
 
-      await pool.query(`UPDATE patrol_devices SET last_seen_at=GREATEST(COALESCE(last_seen_at, $1), $1), last_lat=$2, last_lon=$3,
-          last_accuracy_m=$4, last_battery=COALESCE($5, last_battery), last_charging=COALESCE($6, last_charging) WHERE device_key=$7`,
-        [at, r.lat, r.lon, Number.isFinite(r.accuracy) ? r.accuracy : null, r.battery, r.charging, r.id]);
-      const { rows: [run] } = await pool.query('SELECT id FROM patrols WHERE officer_id=$1 AND ended_at IS NULL', [dev.user_id]);
-      if (run) {
+      const newest = reports[reports.length - 1];
+      await pool.query(`UPDATE patrol_devices SET
+          last_seen_at = GREATEST(COALESCE(last_seen_at, $1), $1),
+          last_lat = CASE WHEN last_seen_at IS NULL OR $1 >= last_seen_at THEN $2 ELSE last_lat END,
+          last_lon = CASE WHEN last_seen_at IS NULL OR $1 >= last_seen_at THEN $3 ELSE last_lon END,
+          last_accuracy_m = $4, last_battery = COALESCE($5, last_battery), last_charging = COALESCE($6, last_charging)
+        WHERE device_key = $7`,
+        [newest.at, newest.lat, newest.lon, Number.isFinite(newest.accuracy) ? newest.accuracy : null, newest.battery, newest.charging, id]);
+
+      // Each position goes to the patrol that was running when it was
+      // recorded, so a buffer sent late (after a call, a dead zone, the phone
+      // off and on) still lands on the right patrol, even one that has ended
+      // since. Positions are thinned to one per 5 s by the time recorded, not
+      // the time received, so a burst of buffered positions is kept.
+      const { rows: patrols } = await pool.query(`
+        SELECT id, started_at, ended_at FROM patrols
+        WHERE officer_id = $1 AND started_at <= $3 AND (ended_at IS NULL OR ended_at >= $2)
+        ORDER BY started_at`, [dev.user_id, reports[0].at, newest.at]);
+      let stored = 0;
+      for (const r of reports) {
+        const p = patrols.find(x => new Date(x.started_at) <= r.at && (!x.ended_at || new Date(x.ended_at) >= r.at));
+        if (!p) continue; // not on patrol at that moment: nothing is kept
+        const t = r.at.getTime();
+        if (Math.abs(t - (lastAt.get(id) || 0)) < 5000) continue;
+        lastAt.set(id, t);
         await pool.query(`INSERT INTO patrol_positions (patrol_id, user_id, recorded_at, lat, lon, accuracy_m, speed_kmh, battery)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-          [run.id, dev.user_id, at, r.lat, r.lon, Number.isFinite(r.accuracy) ? r.accuracy : null, r.speedKmh, r.battery]);
-        await pool.query('UPDATE patrols SET tracker_alerted_at=NULL WHERE id=$1 AND tracker_alerted_at IS NOT NULL', [run.id]);
+          [p.id, dev.user_id, r.at, r.lat, r.lon, Number.isFinite(r.accuracy) ? r.accuracy : null, r.speedKmh, r.battery]);
+        stored++;
+      }
+      if (stored) {
+        await pool.query('UPDATE patrols SET tracker_alerted_at=NULL WHERE officer_id=$1 AND ended_at IS NULL AND tracker_alerted_at IS NOT NULL', [dev.user_id]);
       }
       res.status(200).end();
     } catch (e) { console.error('Tracker report failed:', e.message); res.status(500).end(); }
